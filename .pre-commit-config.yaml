@@ -12,7 +12,15 @@ ci:
 
     Signed-off-by: pre-commit-ci[bot] <pre-commit-ci@users.noreply.github.com>
 
-exclude: "^docs/conf.py"
+exclude: |
+  (?x)^(docs/conf.py|
+        \.mypy_cache/|
+        \.pytest_cache/|
+        \.ruff_cache/|
+        dist/|
+        build/|
+        coverage_html_report/|
+        \.venv/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -53,21 +61,33 @@ repos:
     rev: f298305809c552671cc47e0fec0ba43e96c146a2  # frozen: v0.13.2
     hooks:
       - id: ruff
-        files: ^(scripts|tests|custom_components)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
-        files: ^(scripts|tests|custom_components)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: 9f70dc58c23dfcca1b97af99eaeee3140a807c7e  # frozen: v1.18.2
     hooks:
       - id: mypy
+        files: ^src/.+\.py$
+        additional_dependencies:
+          - types-PyYAML
+          - types-requests
+
+  # Doesn't seem to run reliably inside pre-commit.ci
+  # - repo: https://github.com/RobertCraigie/pyright-python
+  #   rev: d393df1703a808473b84bd14a2702f4793014031  # frozen: v1.1.404
+  #   hooks:
+  #     - id: pyright
+  #       files: ^(src|scripts|tests)/.+\.py$
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
     hooks:
       - id: write-good
         files: "\\.(rst|md|markdown|mdown|mkdn)$"
+        exclude: "GERRIT_URL_CENTRALIZATION.md"
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: 745eface02aef23e168a8afb6b5737818efbea95  # frozen: v0.11.0.1
@@ -78,7 +98,8 @@ repos:
     rev: 192ad822316c3a22fb3d3cc8aa6eafa0b8488360  # frozen: v0.45.0
     hooks:
       - id: markdownlint
-        args: ["--fix"]
+        args: ["--fix", "--config", ".markdownlint.yaml"]
+        exclude: "GERRIT_URL_CENTRALIZATION.md"
 
   - repo: https://github.com/fsfe/reuse-tool
     rev: 8b8bbd873b2af6b2a2521ab2b1ff07b2ab624840  # frozen: v5.1.1
