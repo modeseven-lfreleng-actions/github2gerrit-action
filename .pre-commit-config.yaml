@@ -12,7 +12,15 @@ ci:
 
     Signed-off-by: pre-commit-ci[bot] <pre-commit-ci@users.noreply.github.com>
 
-exclude: "^docs/conf.py"
+exclude: |
+  (?x)^(docs/conf.py|
+        \.mypy_cache/|
+        \.pytest_cache/|
+        \.ruff_cache/|
+        dist/|
+        build/|
+        coverage_html_report/|
+        \.venv/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -53,15 +61,18 @@ repos:
     rev: 54a455f7ce629598b7535ff828fd5fb796f4b83f  # frozen: v0.12.9
     hooks:
       - id: ruff
-        files: ^(scripts|tests|custom_components)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
-        files: ^(scripts|tests|custom_components)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: 412de98d50e846f31ea6f4b0ad036f2c24a7a024  # frozen: v1.17.1
     hooks:
       - id: mypy
+        additional_dependencies:
+          - types-PyYAML
+          - types-requests
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
