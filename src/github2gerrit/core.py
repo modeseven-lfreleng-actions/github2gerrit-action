@@ -69,7 +69,7 @@ from .reconcile_matcher import LocalCommit
 from .reconcile_matcher import create_local_commit
 from .ssh_common import merge_known_hosts_content
 from .utils import env_bool
-from .utils import log_exception_conditionally
+from .utils import is_verbose_mode
 
 
 try:
@@ -1111,9 +1111,14 @@ class Orchestrator:
 
         Does not modify user files.
         """
+        log.debug(
+            "Starting SSH setup for Gerrit %s:%d", gerrit.host, gerrit.port
+        )
         if not inputs.gerrit_ssh_privkey_g2g:
             log.debug("SSH private key not provided, skipping SSH setup")
             return
+
+        log.debug("SSH private key provided, proceeding with SSH configuration")
 
         # Check for ssh-keyscan availability early if auto-discovery needed
         if (
@@ -1259,16 +1264,25 @@ class Orchestrator:
 
         # Check if SSH agent authentication is preferred
         use_ssh_agent = env_bool("G2G_USE_SSH_AGENT", default=True)
+        log.debug(
+            "SSH agent preference: use_ssh_agent=%s, "
+            "setup_ssh_agent_auth available=%s",
+            use_ssh_agent,
+            setup_ssh_agent_auth is not None,
+        )
 
         if use_ssh_agent and setup_ssh_agent_auth is not None:
             # Try SSH agent first as it's more secure and avoids file
             # permission issues
+            log.debug("Attempting SSH agent-based authentication")
             if self._try_ssh_agent_setup(inputs, effective_known_hosts):
+                log.debug("SSH agent setup successful")
                 return
 
             # Fall back to file-based SSH if agent setup fails
             log.info("Falling back to file-based SSH authentication")
 
+        log.debug("Using file-based SSH authentication")
         self._setup_file_based_ssh(inputs, effective_known_hosts)
 
     def _try_ssh_agent_setup(
@@ -1288,6 +1302,15 @@ class Orchestrator:
 
         try:
             log.debug("Setting up SSH agent-based authentication (more secure)")
+            log.debug("Workspace: %s", self.workspace)
+            log.debug(
+                "Private key length: %d characters",
+                len(inputs.gerrit_ssh_privkey_g2g),
+            )
+            log.debug(
+                "Known hosts length: %d characters", len(effective_known_hosts)
+            )
+
             self._ssh_agent_manager = setup_ssh_agent_auth(
                 workspace=self.workspace,
                 private_key_content=inputs.gerrit_ssh_privkey_g2g,
@@ -1297,6 +1320,7 @@ class Orchestrator:
             log.debug("SSH agent authentication configured successfully")
 
         except Exception as exc:
+            log.debug("SSH agent setup failed: %s", exc)
             log.warning(
                 "SSH agent setup failed, falling back to file-based SSH: %s",
                 exc,
@@ -1319,6 +1343,13 @@ class Orchestrator:
         """
         log.info("Setting up file-based SSH configuration for Gerrit")
         log.debug("Using workspace-specific SSH files to avoid user changes")
+        log.debug(
+            "Private key length: %d characters",
+            len(inputs.gerrit_ssh_privkey_g2g),
+        )
+        log.debug(
+            "Known hosts length: %d characters", len(effective_known_hosts)
+        )
 
         # Create tool-specific SSH directory in workspace to avoid touching
         # user files
@@ -1328,17 +1359,22 @@ class Orchestrator:
         # Write SSH private key to tool-specific location with secure
         # permissions
         key_path = tool_ssh_dir / "gerrit_key"
+        log.debug("SSH key file path: %s", key_path)
 
         # Use a more robust approach for creating the file with secure
         # permissions
         key_content = inputs.gerrit_ssh_privkey_g2g.strip() + "\n"
 
         # Multiple strategies to create secure key file
+        log.debug("Attempting to create secure key file")
         success = self._create_secure_key_file(key_path, key_content)
+        log.debug("Secure key file creation success: %s", success)
 
         if not success:
             # If all permission strategies fail, create in memory directory
+            log.debug("Falling back to memory-based key file creation")
             success = self._create_key_in_memory_fs(key_path, key_content)
+            log.debug("Memory-based key file creation success: %s", success)
 
         if not success:
             msg = (
@@ -1347,7 +1383,10 @@ class Orchestrator:
                 "Consider using G2G_USE_SSH_AGENT=true (default) for SSH "
                 "agent authentication."
             )
+            log.error("SSH key file creation failed: %s", msg)
             raise RuntimeError(msg)
+
+        log.debug("SSH key file created successfully: %s", key_path)
 
         # Write known hosts to tool-specific location
         known_hosts_path = tool_ssh_dir / "known_hosts"
@@ -1360,6 +1399,7 @@ class Orchestrator:
         # Store paths for later use in git commands
         self._ssh_key_path = key_path
         self._ssh_known_hosts_path = known_hosts_path
+        log.debug("File-based SSH setup completed successfully")
 
     def _create_secure_key_file(self, key_path: Path, key_content: str) -> bool:
         """Try multiple strategies to create a secure SSH key file.
@@ -1564,22 +1604,39 @@ class Orchestrator:
         """Centralized non-interactive SSH/Git environment."""
         from .ssh_common import build_non_interactive_ssh_env
 
+        log.debug("Building SSH environment for git operations")
         env = build_non_interactive_ssh_env()
 
         # Set GIT_SSH_COMMAND based on available configuration
         cmd = self._build_git_ssh_command
         if cmd:
+            log.debug("Using custom GIT_SSH_COMMAND: %s", cmd)
             env["GIT_SSH_COMMAND"] = cmd
         else:
             # Fallback to basic non-interactive SSH command
             from .ssh_common import build_git_ssh_command
 
-            env["GIT_SSH_COMMAND"] = build_git_ssh_command()
+            fallback_cmd = build_git_ssh_command()
+            log.debug("Using fallback GIT_SSH_COMMAND: %s", fallback_cmd)
+            env["GIT_SSH_COMMAND"] = fallback_cmd
 
         # Override SSH agent settings if using SSH agent
         if self._use_ssh_agent and self._ssh_agent_manager:
-            env.update(self._ssh_agent_manager.get_ssh_env())
+            log.debug("Applying SSH agent environment variables")
+            agent_env = self._ssh_agent_manager.get_ssh_env()
+            log.debug(
+                "SSH agent environment: %s",
+                {k: v for k, v in agent_env.items() if "SSH" in k},
+            )
+            env.update(agent_env)
+        else:
+            log.debug(
+                "Not using SSH agent (use_ssh_agent=%s, manager=%s)",
+                self._use_ssh_agent,
+                self._ssh_agent_manager is not None,
+            )
 
+        log.debug("Final SSH environment contains %d variables", len(env))
         return env
 
     def _cleanup_ssh(self) -> None:
@@ -1821,8 +1878,8 @@ class Orchestrator:
                     cur_msg = _clean_ellipses_from_message(cur_msg)
                     needed = [m for m in meta if m not in cur_msg]
                     if needed:
-                        new_msg = (
-                            cur_msg.rstrip() + "\n" + "\n".join(needed) + "\n"
+                        new_msg = Orchestrator._append_missing_trailers(
+                            cur_msg, needed
                         )
                         git_commit_amend(
                             message=new_msg,
@@ -2113,7 +2170,9 @@ class Orchestrator:
             if meta:
                 needed = [m for m in meta if m not in commit_msg]
                 if needed:
-                    commit_msg = commit_msg.rstrip() + "\n" + "\n".join(needed)
+                    commit_msg = Orchestrator._append_missing_trailers(
+                        commit_msg, needed
+                    )
         except Exception as meta_exc:
             log.debug(
                 "Skipping metadata trailer injection (squash path): %s",
@@ -2314,7 +2373,9 @@ class Orchestrator:
                 ).stdout
                 needed = [m for m in meta if m not in cur_msg]
                 if needed:
-                    new_msg = cur_msg.rstrip() + "\n" + "\n".join(needed) + "\n"
+                    new_msg = Orchestrator._append_missing_trailers(
+                        cur_msg, needed
+                    )
                     git_commit_amend(
                         cwd=self.workspace,
                         no_edit=False,
@@ -2326,6 +2387,32 @@ class Orchestrator:
             log.debug(
                 "Skipping post-apply metadata trailer ensure: %s", meta_exc
             )
+
+    @staticmethod
+    def _append_missing_trailers(
+        message: str, trailers: list[str], *, ensure_final_newline: bool = True
+    ) -> str:
+        """Append missing trailers to a commit message with proper formatting.
+
+        Args:
+            message: The base commit message
+            trailers: List of trailer lines to potentially append
+            ensure_final_newline: Whether to ensure the message ends with a
+                newline
+
+        Returns:
+            The message with missing trailers appended, properly formatted
+        """
+        needed = [trailer for trailer in trailers if trailer not in message]
+        if not needed:
+            return message
+
+        result = message.rstrip() + "\n\n" + "\n".join(needed)
+
+        if ensure_final_newline:
+            result = result.rstrip("\n") + "\n"
+
+        return result
 
     def _push_to_gerrit(
         self,
@@ -2369,6 +2456,7 @@ class Orchestrator:
                 "-t",
                 topic,
             ]
+            log.debug("Building git review command with topic: %s", topic)
             collected_change_ids: list[str] = []
             if prepared:
                 collected_change_ids.extend(prepared.all_change_ids())
@@ -2396,7 +2484,15 @@ class Orchestrator:
                     gerrit, repo, branch, reviewers, topic, env
                 )
                 return
-            log.debug("Executing git review command: %s", " ".join(args))
+
+            log.debug("Final git review command: %s", " ".join(args))
+            log.debug(
+                "Git review environment variables: %s",
+                {k: v for k, v in env.items() if "SSH" in k or "GIT" in k},
+            )
+            log.debug("Working directory: %s", self.workspace)
+
+            # Execute the git review command
             run_cmd(args, cwd=self.workspace, env=env)
             log.debug("Successfully pushed changes to Gerrit")
         except CommandError as exc:
@@ -2498,9 +2594,33 @@ class Orchestrator:
 
             # Analyze the specific failure reason from git review output
             error_details = self._analyze_gerrit_push_failure(exc)
-            log_exception_conditionally(
-                log, "Gerrit push failed: %s", error_details
-            )
+
+            # Always log the error details, even if not in verbose mode
+            log.exception("Gerrit push failed: %s", error_details)
+
+            # In debug mode, also show the raw command output
+            if is_verbose_mode():
+                log.debug("Git review command: %s", " ".join(exc.cmd or []))
+                log.debug("Return code: %s", exc.returncode)
+                if exc.stdout:
+                    log.debug("Command stdout:\n%s", exc.stdout)
+                if exc.stderr:
+                    log.debug("Command stderr:\n%s", exc.stderr)
+
+            # Include raw output in error message if analysis didn't provide
+            # useful info
+            has_raw_output = exc.stdout or exc.stderr
+            if error_details.startswith("Unknown error") and has_raw_output:
+                raw_output = ""
+                if exc.stdout:
+                    raw_output += f"stdout: {exc.stdout.strip()}\n"
+                if exc.stderr:
+                    raw_output += f"stderr: {exc.stderr.strip()}"
+                if raw_output:
+                    error_details = (
+                        f"{error_details}\nRaw output:\n{raw_output}"
+                    )
+
             msg = (
                 f"Failed to push changes to Gerrit with git-review: "
                 f"{error_details}"
@@ -2968,7 +3088,15 @@ class Orchestrator:
                     return f"Gerrit rejected the push: {line.strip()}"
             return "Gerrit rejected the push for an unknown reason"
         else:
-            return f"Unknown error: {exc}"
+            # For unknown errors, include more context
+            context_parts = []
+            if exc.returncode is not None:
+                context_parts.append(f"exit code {exc.returncode}")
+            if exc.cmd:
+                context_parts.append(f"command: {' '.join(exc.cmd)}")
+
+            context = f" ({', '.join(context_parts)})" if context_parts else ""
+            return f"Unknown error{context}: {exc}"
 
     def _query_gerrit_for_results(
         self,

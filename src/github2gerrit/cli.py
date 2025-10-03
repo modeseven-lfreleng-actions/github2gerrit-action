@@ -51,6 +51,7 @@ from .ssh_common import build_non_interactive_ssh_env
 from .utils import append_github_output
 from .utils import env_bool
 from .utils import env_str
+from .utils import is_verbose_mode
 from .utils import log_exception_conditionally
 from .utils import parse_bool_env
 
@@ -989,9 +990,19 @@ def _process_single(
                 else:
                     progress_tracker.change_updated()
         except Exception as exc:
+            error_msg = str(exc)
             log.debug("Execution failed; continuing to write outputs: %s", exc)
+
+            # Always show the actual error to the user, not just in debug mode
             if progress_tracker:
-                progress_tracker.add_error("Execution failed")
+                progress_tracker.add_error(f"Execution failed: {error_msg}")
+            else:
+                # If no progress tracker, show error directly
+                safe_console_print(f"❌ Error: {error_msg}", style="red")
+
+            # In verbose mode, also log the full exception with traceback
+            if is_verbose_mode():
+                log.exception("Full exception details:")
 
             result = SubmissionResult(
                 change_urls=[], change_numbers=[], commit_shas=[]
