@@ -89,7 +89,7 @@ def minimal_inputs() -> Inputs:
 def test_ssh_setup_creates_workspace_specific_files(
     tmp_path: Path, minimal_inputs: Inputs
 ) -> None:
-    """SSH setup should create files in workspace, not user SSH directory."""
+    """SSH setup should create files in secure temp directory, not user SSH directory."""
     # Arrange
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -107,22 +107,29 @@ def test_ssh_setup_creates_workspace_specific_files(
     )
     orch._setup_ssh(minimal_inputs, gerrit_info)
 
-    # Assert: tool-specific SSH directory is created
-    tool_ssh_dir = workspace / ".ssh-g2g"
-    assert tool_ssh_dir.exists()
-    assert tool_ssh_dir.is_dir()
-    assert oct(tool_ssh_dir.stat().st_mode)[-3:] == "700"
+    # Assert: secure SSH temporary directory is created (outside workspace)
+    assert orch._ssh_temp_dir is not None
+    assert orch._ssh_temp_dir.exists()
+    assert orch._ssh_temp_dir.is_dir()
+    assert oct(orch._ssh_temp_dir.stat().st_mode)[-3:] == "700"
 
-    # Assert: SSH key is created in tool directory
-    key_path = tool_ssh_dir / "gerrit_key"
+    # Assert: temp directory is outside workspace
+    assert not orch._ssh_temp_dir.is_relative_to(workspace)
+
+    # Assert: SSH key is created in secure temp directory
+    key_path = orch._ssh_temp_dir / "gerrit_key"
     assert key_path.exists()
     assert key_path.is_file()
     assert oct(key_path.stat().st_mode)[-3:] == "600"
 
-    # Assert: known hosts is created in tool directory
-    known_hosts_path = tool_ssh_dir / "known_hosts"
+    # Assert: known hosts is created in secure temp directory
+    known_hosts_path = orch._ssh_temp_dir / "known_hosts"
     assert known_hosts_path.exists()
     assert known_hosts_path.is_file()
+
+    # Assert: no SSH files are created in workspace
+    workspace_ssh_files = list(workspace.glob("**/.ssh*"))
+    assert len(workspace_ssh_files) == 0, "No SSH files should be in workspace"
 
     # Assert: user SSH directory is not modified
     user_ssh_modified = user_ssh_dir.exists() != original_user_ssh_exists
@@ -176,9 +183,8 @@ def test_ssh_setup_skips_when_credentials_missing(tmp_path: Path) -> None:
     )
     orch._setup_ssh(inputs_no_key, gerrit_info)
 
-    # Assert: no SSH directory is created
-    tool_ssh_dir = workspace / ".ssh-g2g"
-    assert not tool_ssh_dir.exists()
+    # Assert: no SSH temp directory is created when no credentials
+    assert orch._ssh_temp_dir is None
 
     # Assert: SSH command is None
     assert orch._build_git_ssh_command is None
@@ -209,9 +215,10 @@ def test_git_ssh_command_prevents_agent_scanning(
     assert "-o StrictHostKeyChecking=yes" in ssh_cmd
     assert "-o PasswordAuthentication=no" in ssh_cmd
 
-    # Assert: tool-specific files are referenced
-    assert str(workspace / ".ssh-g2g" / "gerrit_key") in ssh_cmd
-    assert str(workspace / ".ssh-g2g" / "known_hosts") in ssh_cmd
+    # Assert: secure temp directory files are referenced
+    assert orch._ssh_temp_dir is not None
+    assert str(orch._ssh_temp_dir / "gerrit_key") in ssh_cmd
+    assert str(orch._ssh_temp_dir / "known_hosts") in ssh_cmd
 
 
 def test_ssh_cleanup_removes_temporary_files(
@@ -228,14 +235,17 @@ def test_ssh_cleanup_removes_temporary_files(
         host="gerrit.example.org", port=29418, project="test/repo"
     )
     orch._setup_ssh(minimal_inputs, gerrit_info)
-    tool_ssh_dir = workspace / ".ssh-g2g"
-    assert tool_ssh_dir.exists()
+
+    # Assert SSH temp directory exists
+    assert orch._ssh_temp_dir is not None
+    assert orch._ssh_temp_dir.exists()
+    ssh_temp_dir = orch._ssh_temp_dir
 
     # Act
     orch._cleanup_ssh()
 
-    # Assert: temporary directory is removed
-    assert not tool_ssh_dir.exists()
+    # Assert: SSH temp directory is removed
+    assert not ssh_temp_dir.exists()
 
 
 def test_ssh_cleanup_handles_missing_files_gracefully(tmp_path: Path) -> None:
@@ -338,10 +348,10 @@ def test_ssh_auto_discovery_integration(tmp_path: Path) -> None:
         )
 
         # Assert: SSH setup completed with auto-discovered keys
-        tool_ssh_dir = workspace / ".ssh-g2g"
-        assert tool_ssh_dir.exists()
+        assert orch._ssh_temp_dir is not None
+        assert orch._ssh_temp_dir.exists()
 
-        known_hosts_path = tool_ssh_dir / "known_hosts"
+        known_hosts_path = orch._ssh_temp_dir / "known_hosts"
         assert known_hosts_path.exists()
 
         # Verify auto-discovered keys were used
@@ -398,8 +408,7 @@ def test_ssh_auto_discovery_fallback_when_discovery_fails(
         mock_autodiscover.assert_called_once()
 
         # Assert: SSH setup was skipped due to no host keys
-        tool_ssh_dir = workspace / ".ssh-g2g"
-        assert not tool_ssh_dir.exists()
+        assert orch._ssh_temp_dir is None
 
         # Assert: SSH command is None
         assert orch._build_git_ssh_command is None
@@ -465,10 +474,10 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
         )
 
         # Assert: both provided and discovered keys were used
-        tool_ssh_dir = workspace / ".ssh-g2g"
-        assert tool_ssh_dir.exists()
+        assert orch._ssh_temp_dir is not None
+        assert orch._ssh_temp_dir.exists()
 
-        known_hosts_path = tool_ssh_dir / "known_hosts"
+        known_hosts_path = orch._ssh_temp_dir / "known_hosts"
         assert known_hosts_path.exists()
 
         known_hosts_content = known_hosts_path.read_text()

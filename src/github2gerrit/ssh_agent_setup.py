@@ -53,7 +53,8 @@ class SSHAgentManager:
         """Initialize SSH agent manager.
 
         Args:
-            workspace: The workspace directory for storing temporary files
+            workspace: Secure temporary directory for storing SSH files (outside
+                git workspace)
         """
         self.workspace = workspace
         self.agent_pid: int | None = None
@@ -160,7 +161,9 @@ class SSHAgentManager:
             known_hosts_content: The known hosts content
         """
         try:
-            # Create tool-specific SSH directory
+            # Create tool-specific SSH directory in secure temp location
+            # Note: workspace is now a separate secure temp directory outside
+            # git workspace
             tool_ssh_dir = self.workspace / ".ssh-g2g"
             tool_ssh_dir.mkdir(mode=0o700, exist_ok=True)
 
@@ -259,7 +262,7 @@ class SSHAgentManager:
             return result.stdout
 
     def cleanup(self) -> None:
-        """Clean up SSH agent and temporary files."""
+        """Securely clean up SSH agent and temporary files."""
         try:
             # Kill SSH agent if we started it
             if self.agent_pid:
@@ -276,14 +279,44 @@ class SSHAgentManager:
                 elif key in os.environ:
                     del os.environ[key]
 
-            # Clean up temporary files
+            # Securely clean up temporary files
             tool_ssh_dir = self.workspace / ".ssh-g2g"
             if tool_ssh_dir.exists():
                 import shutil
 
+                # First, overwrite any key files to prevent recovery
+                try:
+                    for root, _dirs, files in os.walk(tool_ssh_dir):
+                        for file in files:
+                            file_path = Path(root) / file
+                            if file_path.exists() and file_path.is_file():
+                                # Overwrite file with random data
+                                try:
+                                    size = file_path.stat().st_size
+                                    if size > 0:
+                                        import secrets
+
+                                        with open(file_path, "wb") as f:
+                                            f.write(secrets.token_bytes(size))
+                                            # Sync to ensure write completes
+                                            os.fsync(f.fileno())
+                                except Exception as overwrite_exc:
+                                    log.debug(
+                                        "Failed to overwrite %s: %s",
+                                        file_path,
+                                        overwrite_exc,
+                                    )
+                except Exception as walk_exc:
+                    log.debug(
+                        "Failed to walk SSH temp directory for secure "
+                        "cleanup: %s",
+                        walk_exc,
+                    )
+
                 shutil.rmtree(tool_ssh_dir)
                 log.debug(
-                    "Cleaned up temporary SSH directory: %s", tool_ssh_dir
+                    "Securely cleaned up temporary SSH directory: %s",
+                    tool_ssh_dir,
                 )
 
         except Exception as exc:
@@ -300,7 +333,8 @@ def setup_ssh_agent_auth(
     """Setup SSH agent-based authentication.
 
     Args:
-        workspace: The workspace directory
+        workspace: Secure temporary directory for SSH files (outside git
+            workspace)
         private_key_content: SSH private key content
         known_hosts_content: Known hosts content
 
