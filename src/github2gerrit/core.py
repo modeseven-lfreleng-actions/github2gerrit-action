@@ -708,6 +708,8 @@ class Orchestrator:
         self._ssh_known_hosts_path: Path | None = None
         self._ssh_agent_manager: SSHAgentManager | None = None
         self._use_ssh_agent: bool = False
+        # Secure temporary directory for SSH files (outside workspace)
+        self._ssh_temp_dir: Path | None = None
         # Store inputs for access by helper methods
         self._inputs: Inputs | None = None
 
@@ -864,6 +866,9 @@ class Orchestrator:
         )
 
         self._comment_on_pull_request(gh, gerrit, result)
+
+        # Validate that no unexpected files were committed
+        self._validate_committed_files(gh, result)
 
         self._close_pull_request_if_required(gh)
 
@@ -1311,8 +1316,27 @@ class Orchestrator:
                 "Known hosts length: %d characters", len(effective_known_hosts)
             )
 
+            # Create secure separate temp directory for SSH agent if needed
+            import secrets
+            import tempfile
+
+            if not self._ssh_temp_dir:
+                # Use secure random suffix to prevent predictable paths
+                secure_suffix = secrets.token_hex(8)
+                self._ssh_temp_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f"g2g_ssh_{secure_suffix}_",
+                        dir=tempfile.gettempdir(),
+                    )
+                )
+                # Ensure directory has restrictive permissions
+                self._ssh_temp_dir.chmod(0o700)
+                log.debug(
+                    "Created secure SSH temp directory: %s", self._ssh_temp_dir
+                )
+
             self._ssh_agent_manager = setup_ssh_agent_auth(
-                workspace=self.workspace,
+                workspace=self._ssh_temp_dir,
                 private_key_content=inputs.gerrit_ssh_privkey_g2g,
                 known_hosts_content=effective_known_hosts,
             )
@@ -1341,8 +1365,11 @@ class Orchestrator:
             inputs: Validated input configuration
             effective_known_hosts: Known hosts content
         """
-        log.info("Setting up file-based SSH configuration for Gerrit")
-        log.debug("Using workspace-specific SSH files to avoid user changes")
+        log.debug("Using file-based SSH configuration for Gerrit")
+        log.debug(
+            "Using secure temporary SSH files outside workspace to prevent "
+            "artifacts"
+        )
         log.debug(
             "Private key length: %d characters",
             len(inputs.gerrit_ssh_privkey_g2g),
@@ -1351,9 +1378,26 @@ class Orchestrator:
             "Known hosts length: %d characters", len(effective_known_hosts)
         )
 
-        # Create tool-specific SSH directory in workspace to avoid touching
-        # user files
-        tool_ssh_dir = self.workspace / ".ssh-g2g"
+        # Create secure tool-specific SSH directory outside workspace to prevent
+        # SSH artifacts from being accidentally committed
+        import secrets
+        import tempfile
+
+        if not self._ssh_temp_dir:
+            # Use secure random suffix to prevent predictable paths
+            secure_suffix = secrets.token_hex(8)
+            self._ssh_temp_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f"g2g_ssh_{secure_suffix}_",
+                    dir=tempfile.gettempdir(),
+                )
+            )
+            # Ensure directory has restrictive permissions
+            self._ssh_temp_dir.chmod(0o700)
+            log.debug(
+                "Created secure SSH temp directory: %s", self._ssh_temp_dir
+            )
+        tool_ssh_dir = self._ssh_temp_dir
         tool_ssh_dir.mkdir(mode=0o700, exist_ok=True)
 
         # Write SSH private key to tool-specific location with secure
@@ -1642,8 +1686,8 @@ class Orchestrator:
     def _cleanup_ssh(self) -> None:
         """Clean up temporary SSH files created by this tool.
 
-        Removes the workspace-specific .ssh-g2g directory and all contents.
-        This ensures no temporary files are left behind.
+        Securely removes the separate SSH temporary directory and all contents.
+        This ensures no temporary files or credentials are left behind.
         """
         log.debug("Cleaning up temporary SSH configuration files")
 
@@ -1654,15 +1698,47 @@ class Orchestrator:
                 self._ssh_agent_manager = None
                 self._use_ssh_agent = False
 
-            # Remove temporary SSH directory and all contents
-            tool_ssh_dir = self.workspace / ".ssh-g2g"
-            if tool_ssh_dir.exists():
+            # Securely remove separate SSH temporary directory and all contents
+            if self._ssh_temp_dir and self._ssh_temp_dir.exists():
+                import os
                 import shutil
 
-                shutil.rmtree(tool_ssh_dir)
+                # First, overwrite any key files to prevent recovery
+                try:
+                    for root, _dirs, files in os.walk(self._ssh_temp_dir):
+                        for file in files:
+                            file_path = Path(root) / file
+                            if file_path.exists() and file_path.is_file():
+                                # Overwrite file with random data
+                                try:
+                                    size = file_path.stat().st_size
+                                    if size > 0:
+                                        import secrets
+
+                                        with open(file_path, "wb") as f:
+                                            f.write(secrets.token_bytes(size))
+                                            # Sync to ensure write completes
+                                            os.fsync(f.fileno())
+                                except Exception as overwrite_exc:
+                                    log.debug(
+                                        "Failed to overwrite %s: %s",
+                                        file_path,
+                                        overwrite_exc,
+                                    )
+                except Exception as walk_exc:
+                    log.debug(
+                        "Failed to walk SSH temp directory for secure "
+                        "cleanup: %s",
+                        walk_exc,
+                    )
+
+                # Remove the directory tree
+                shutil.rmtree(self._ssh_temp_dir)
                 log.debug(
-                    "Cleaned up temporary SSH directory: %s", tool_ssh_dir
+                    "Securely cleaned up temporary SSH directory: %s",
+                    self._ssh_temp_dir,
                 )
+                self._ssh_temp_dir = None
         except Exception as exc:
             log.warning("Failed to clean up temporary SSH files: %s", exc)
 
@@ -2878,9 +2954,10 @@ class Orchestrator:
                 env=env,
                 check=False,
             )
-            # 2) Clean untracked files/dirs (preserve our SSH known_hosts dir)
+            # 2) Clean untracked files/dirs (SSH files are now outside
+            # workspace)
             run_cmd(
-                ["git", "clean", "-fdx", "-e", ".ssh-g2g", "-e", ".ssh-g2g/**"],
+                ["git", "clean", "-fdx"],
                 cwd=self.workspace,
                 env=env,
                 check=False,
@@ -4060,6 +4137,128 @@ class Orchestrator:
                 continue
             out.append(c)
         return out
+
+    def _validate_committed_files(
+        self, gh: GitHubContext, result: SubmissionResult
+    ) -> None:
+        """Validate that only expected files from the GitHub PR were
+        committed to Gerrit.
+
+        This is a safety check to ensure no tool artifacts (like SSH keys) were
+        accidentally included in the Gerrit change.
+        """
+        if not gh.pr_number or not result.commit_shas:
+            log.debug("Skipping file validation - no PR number or commit SHAs")
+            return
+
+        try:
+            # Get files changed in the GitHub PR
+            from .github_api import build_client
+            from .github_api import get_pull
+            from .github_api import get_repo_from_env
+
+            client = build_client()
+            repo = get_repo_from_env(client)
+            pr_obj = get_pull(repo, int(gh.pr_number))
+
+            # Get list of files changed in the PR
+            github_files = set()
+            for file in pr_obj.get_files():  # type: ignore[attr-defined]
+                github_files.add(file.filename)
+
+            log.debug(
+                "GitHub PR files (%d): %s",
+                len(github_files),
+                sorted(github_files),
+            )
+
+            # Check files in each commit SHA that was pushed to Gerrit
+            for commit_sha in result.commit_shas:
+                try:
+                    # Get files changed in the Gerrit commit
+                    from .gitutils import run_cmd
+
+                    files_output = run_cmd(
+                        [
+                            "git",
+                            "show",
+                            "--name-only",
+                            "--pretty=format:",
+                            commit_sha,
+                        ],
+                        cwd=self.workspace,
+                    ).stdout.strip()
+
+                    if not files_output:
+                        continue
+
+                    gerrit_files = {
+                        f.strip() for f in files_output.split("\n") if f.strip()
+                    }
+                    log.debug(
+                        "Gerrit commit %s files (%d): %s",
+                        commit_sha[:8],
+                        len(gerrit_files),
+                        sorted(gerrit_files),
+                    )
+
+                    # Check for unexpected files
+                    unexpected_files = gerrit_files - github_files
+                    if unexpected_files:
+                        # Filter out known safe files that might legitimately
+                        # differ
+                        suspicious_files = []
+                        for f in unexpected_files:
+                            # Skip files that are legitimately different
+                            if f in [".gitreview", ".gitignore"]:
+                                continue
+                            # Flag SSH artifacts and other suspicious files
+                            if (
+                                ".ssh" in f
+                                or "known_hosts" in f
+                                or f.startswith("gerrit_key")
+                            ):
+                                suspicious_files.append(f)
+                            else:
+                                # Other unexpected files - log but don't error
+                                log.warning(
+                                    "Unexpected file in Gerrit commit: %s", f
+                                )
+
+                        if suspicious_files:
+                            log.error(
+                                "❌ CRITICAL: SSH artifacts detected in Gerrit "
+                                "commit %s: %s",
+                                commit_sha[:8],
+                                suspicious_files,
+                            )
+                            log.error(
+                                "This indicates a serious bug where tool "
+                                "artifacts were committed. The Gerrit change "
+                                "may need manual cleanup."
+                            )
+                            # Don't fail the pipeline, but log prominently for
+                            # monitoring
+
+                    # Also check if we're missing expected files
+                    missing_files = github_files - gerrit_files
+                    if missing_files:
+                        log.warning(
+                            "Files in GitHub PR but not in Gerrit commit "
+                            "%s: %s",
+                            commit_sha[:8],
+                            sorted(missing_files),
+                        )
+
+                except Exception as commit_exc:
+                    log.debug(
+                        "Failed to validate files for commit %s: %s",
+                        commit_sha[:8],
+                        commit_exc,
+                    )
+
+        except Exception as exc:
+            log.debug("File validation failed (non-critical): %s", exc)
 
 
 # ---------------------
