@@ -50,6 +50,7 @@ def _inputs(*, use_pr_as_commit: bool = True) -> Inputs:
         gerrit_ssh_privkey_g2g="",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="acme",
         reviewers_email="",
         preserve_github_prs=True,

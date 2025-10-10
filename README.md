@@ -92,7 +92,7 @@ Use `--allow-duplicates` or set `ALLOW_DUPLICATES=true` to override:
 github2gerrit --allow-duplicates https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   ALLOW_DUPLICATES: 'true'
 ```
@@ -113,7 +113,7 @@ github2gerrit --duplicate-types=open,merged https://github.com/org/repo
 DUPLICATE_TYPES=open,merged,abandoned github2gerrit https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   DUPLICATE_TYPES: 'open,merged'
 ```
@@ -178,7 +178,7 @@ NORMALISE_COMMIT=true github2gerrit https://github.com/org/repo
 NORMALISE_COMMIT=false github2gerrit https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   NORMALISE_COMMIT: 'true'  # default
   # or

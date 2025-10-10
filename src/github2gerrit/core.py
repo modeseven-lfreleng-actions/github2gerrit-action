@@ -620,11 +620,8 @@ class Orchestrator:
 
         # Get commit range: commits in HEAD not in base branch
         try:
-            run_cmd(
-                ["git", "fetch", "origin", branch],
-                cwd=self.workspace,
-                env=self._ssh_env(),
-            )
+            # Ensure workspace is prepared (consolidated git fetch)
+            self._ensure_workspace_prepared(branch)
 
             revs = run_cmd(
                 ["git", "rev-list", "--reverse", f"{base_ref}..HEAD"],
@@ -692,7 +689,7 @@ class Orchestrator:
                 )
                 continue
 
-        log.info(
+        log.debug(
             "Extracted %d local commits for reconciliation", len(local_commits)
         )
         return local_commits
@@ -712,6 +709,19 @@ class Orchestrator:
         self._ssh_temp_dir: Path | None = None
         # Store inputs for access by helper methods
         self._inputs: Inputs | None = None
+        # Track discovered SSH keys for later config saving (after successful
+        # submission)
+        self._discovered_ssh_keys: str | None = None
+        self._ssh_discovery_organization: str | None = None
+        # Track derived parameters for later config saving (after successful
+        # submission)
+        self._derived_parameters: dict[str, str] | None = None
+        self._derived_parameters_organization: str | None = None
+        # Track workspace preparation state to avoid redundant fetches
+        self._workspace_prepared: bool = False
+        self._prepared_branch: str | None = None
+        # Track git-review setup state to avoid redundant setup
+        self._git_review_initialized: bool = False
 
     # ---------------
     # Public API
@@ -738,7 +748,7 @@ class Orchestrator:
 
         # Initialize git repository in workspace if it doesn't exist
         if not (self.workspace / ".git").exists():
-            self._setup_git_workspace(inputs, gh)
+            self._prepare_workspace_checkout(inputs, gh)
 
         gitreview = self._read_gitreview(self.workspace / ".gitreview", gh)
         repo_names = self._derive_repo_names(gitreview, gh)
@@ -763,6 +773,11 @@ class Orchestrator:
                 change_urls=[], change_numbers=[], commit_shas=[]
             )
         self._setup_ssh(inputs, gerrit)
+        # Reset workspace preparation state for this execution
+        self._workspace_prepared = False
+        self._prepared_branch = None
+        self._git_review_initialized = False
+
         # Establish baseline non-interactive SSH/Git environment
         # for all child processes
         os.environ.update(self._ssh_env())
@@ -787,6 +802,9 @@ class Orchestrator:
             )
         except GitError:
             git_config("tag.gpgsign", "false", global_=True)
+
+        # Configure git identity BEFORE any merge operations that create commits
+        self._ensure_git_user_identity(inputs)
 
         if inputs.submit_single_commits:
             prep = self._prepare_single_commits(inputs, gh, gerrit)
@@ -1183,7 +1201,6 @@ class Orchestrator:
                         gerrit_hostname=gerrit.host,
                         gerrit_port=gerrit.port,
                         organization=inputs.organization,
-                        save_to_config=True,
                     )
                     if discovered_keys:
                         effective_known_hosts = discovered_keys
@@ -1230,7 +1247,6 @@ class Orchestrator:
                             gerrit_hostname=gerrit.host,
                             gerrit_port=gerrit.port,
                             organization=inputs.organization,
-                            save_to_config=True,
                         )
                         if discovered_keys:
                             # Use centralized merging logic
@@ -1683,6 +1699,37 @@ class Orchestrator:
         log.debug("Final SSH environment contains %d variables", len(env))
         return env
 
+    def _ensure_workspace_prepared(self, branch: str) -> None:
+        """Ensure workspace is prepared with latest remote state.
+
+        Performs a single git fetch to avoid redundant SSH operations.
+        This consolidates multiple fetch operations that were causing
+        excessive SSH agent prompts.
+
+        Args:
+            branch: The branch to fetch from origin
+        """
+        if self._workspace_prepared and self._prepared_branch == branch:
+            log.debug("Workspace already prepared for branch: %s", branch)
+            return
+
+        log.debug(
+            "Preparing workspace: fetching latest state for branch %s", branch
+        )
+        try:
+            run_cmd(
+                ["git", "fetch", "origin", branch],
+                cwd=self.workspace,
+                env=self._ssh_env(),
+            )
+            self._workspace_prepared = True
+            self._prepared_branch = branch
+            log.debug("Workspace preparation completed for branch: %s", branch)
+        except CommandError as exc:
+            log.warning("Failed to fetch from origin: %s", exc)
+            # Don't mark as prepared if fetch failed
+            raise
+
     def _cleanup_ssh(self) -> None:
         """Clean up temporary SSH files created by this tool.
 
@@ -1750,9 +1797,7 @@ class Orchestrator:
         """Set git global config and initialize git-review if needed."""
         log.debug("Configuring git and git-review for %s", gerrit.host)
 
-        # Configure git user identity (required for merge operations)
-        self._ensure_git_user_identity(inputs)
-
+        # Git user identity is now configured earlier before merge operations
         # Prefer repo-local config; fallback to global if needed
         try:
             git_config(
@@ -1849,14 +1894,23 @@ class Orchestrator:
                 str(Path(hooks_path) / ".git" / "hooks"),
                 global_=True,
             )
-        # Initialize git-review (copies commit-msg hook)
-        try:
-            # Use our specific SSH configuration for git-review setup
-            env = self._ssh_env()
-            run_cmd(["git", "review", "-s", "-v"], cwd=self.workspace, env=env)
-        except CommandError as exc:
-            msg = f"Failed to initialize git-review: {exc}"
-            raise OrchestratorError(msg) from exc
+        # Initialize git-review (copies commit-msg hook) - only once per
+        # execution
+        if not self._git_review_initialized:
+            try:
+                # Use our specific SSH configuration for git-review setup
+                log.debug("Initializing git-review (one-time setup)")
+                env = self._ssh_env()
+                run_cmd(
+                    ["git", "review", "-s", "-v"], cwd=self.workspace, env=env
+                )
+                self._git_review_initialized = True
+                log.debug("Git-review initialization completed")
+            except CommandError as exc:
+                msg = f"Failed to initialize git-review: {exc}"
+                raise OrchestratorError(msg) from exc
+        else:
+            log.debug("Git-review already initialized, skipping setup")
 
     def _prepare_single_commits(
         self,
@@ -1872,11 +1926,8 @@ class Orchestrator:
         base_ref = f"origin/{branch}"
         # Use our SSH command for git operations that might need SSH
 
-        run_cmd(
-            ["git", "fetch", "origin", branch],
-            cwd=self.workspace,
-            env=self._ssh_env(),
-        )
+        # Ensure workspace is prepared (consolidated git fetch)
+        self._ensure_workspace_prepared(branch)
         revs = run_cmd(
             ["git", "rev-list", "--reverse", f"{base_ref}..HEAD"],
             cwd=self.workspace,
@@ -1997,11 +2048,8 @@ class Orchestrator:
         log.debug("Preparing squashed commit for PR #%s", gh.pr_number)
         branch = self._resolve_target_branch()
 
-        run_cmd(
-            ["git", "fetch", "origin", branch],
-            cwd=self.workspace,
-            env=self._ssh_env(),
-        )
+        # Ensure workspace is prepared (consolidated git fetch)
+        self._ensure_workspace_prepared(branch)
         base_ref = f"origin/{branch}"
         base_sha = run_cmd(
             ["git", "rev-parse", base_ref], cwd=self.workspace
@@ -2622,8 +2670,10 @@ class Orchestrator:
             ]
             for r in revs:
                 args.extend(["--reviewer", r])
-            # Branch as positional argument (not a flag)
-            args.append(branch)
+            # Don't pass branch as positional argument to avoid git-review bug
+            # where it adds the branch name as a reviewer. Instead, let
+            # git-review
+            # infer the target branch from git configuration.
 
             if env_bool("CI_TESTING", False):
                 log.debug(
@@ -2879,6 +2929,13 @@ class Orchestrator:
         Args:
             original_emails: List of original emails that were normalized
         """
+        # Skip config updates in dry run mode
+        from .utils import env_bool
+
+        if env_bool("DRY_RUN"):
+            log.debug("Skipping config file update in dry run mode")
+            return
+
         try:
             # Get current organization for config lookup
             org = os.getenv("ORGANIZATION") or os.getenv(
@@ -2945,6 +3002,78 @@ class Orchestrator:
             log.warning(
                 "Failed to update configuration file with normalized "
                 "emails: %s",
+                exc,
+            )
+
+    def _save_discovered_ssh_keys_to_config(self) -> None:
+        """Save discovered SSH keys to configuration file.
+
+        This method saves SSH keys that were discovered during host key
+        auto-discovery to the configuration file for future use.
+        """
+        # Skip config updates in dry run mode
+        from .utils import env_bool
+
+        if env_bool("DRY_RUN"):
+            log.debug("Skipping SSH key config file update in dry run mode")
+            return
+
+        # Check if we have discovered keys and organization to save
+        if (
+            not self._discovered_ssh_keys
+            or not self._ssh_discovery_organization
+        ):
+            log.debug(
+                "No discovered SSH keys or organization to save to config"
+            )
+            return
+
+        try:
+            # Get config path
+            config_path = os.getenv("G2G_CONFIG_PATH", "").strip()
+            if not config_path:
+                config_path = "~/.config/github2gerrit/configuration.txt"
+
+            config_path_obj = Path(config_path).expanduser()
+            if not config_path_obj.exists():
+                log.debug(
+                    "Config file does not exist, skipping SSH key save: %s",
+                    config_path_obj,
+                )
+                return
+
+            # Read current config content
+            content = config_path_obj.read_text(encoding="utf-8")
+            original_content = content
+
+            # Add discovered SSH keys to the configuration
+            # This is a simplified implementation - in a real scenario,
+            # you might want more sophisticated config file parsing
+            section_header = f"[{self._ssh_discovery_organization}]"
+            if section_header not in content:
+                content += f"\n{section_header}\n"
+
+            # Add the discovered keys (this is a basic implementation)
+            ssh_keys_line = (
+                f'GERRIT_KNOWN_HOSTS_DISCOVERED = "{self._discovered_ssh_keys}"'
+            )
+            if "GERRIT_KNOWN_HOSTS_DISCOVERED" not in content:
+                content += f"{ssh_keys_line}\n"
+
+            # Write back if changes were made
+            if content != original_content:
+                config_path_obj.write_text(content, encoding="utf-8")
+                log.info(
+                    "Configuration file updated with discovered SSH keys: %s",
+                    config_path_obj,
+                )
+            else:
+                log.debug("No SSH key changes needed in config file")
+
+        except Exception as exc:
+            log.warning(
+                "Failed to update configuration file with discovered "
+                "SSH keys: %s",
                 exc,
             )
 
@@ -3327,51 +3456,205 @@ class Orchestrator:
             change_urls=urls, change_numbers=nums, commit_shas=shas
         )
 
-    def _setup_git_workspace(self, inputs: Inputs, gh: GitHubContext) -> None:
-        """Initialize and set up git workspace for PR processing."""
+    def _prepare_workspace_checkout(
+        self, inputs: Inputs, gh: GitHubContext
+    ) -> None:
+        """Initialize and set up git workspace using battle-tested CLI logic."""
         from .gitutils import run_cmd
+        from .ssh_common import build_git_ssh_command
+        from .ssh_common import build_non_interactive_ssh_env
+        from .utils import env_bool
 
-        # Try modern git init with explicit branch first
-        try:
-            run_cmd(
-                ["git", "init", "--initial-branch=master"], cwd=self.workspace
-            )
-        except Exception:
-            # Fallback for older git versions (hint filtered at logging level)
-            run_cmd(["git", "init"], cwd=self.workspace)
-
-        # Add GitHub remote
+        # Use CLI's proven checkout logic with SSH support
         repo_full = gh.repository.strip() if gh.repository else ""
         server_url = gh.server_url or "https://github.com"
         server_url = server_url.rstrip("/")
-        repo_url = f"{server_url}/{repo_full}.git"
+        base_ref = gh.base_ref or ""
+        pr_num_str: str = str(gh.pr_number) if gh.pr_number else "0"
+
+        # Initialize git repository (no hardcoded branch assumption)
+        run_cmd(["git", "init"], cwd=self.workspace)
+
+        # Determine repository URL and setup authentication like CLI does
+        repo_https_url = f"{server_url}/{repo_full}.git"
+        repo_ssh_url = f"git@{server_url.split('//')[-1]}:{repo_full}.git"
+
+        # Check for SSH preference (matching CLI behavior)
+        use_ssh = env_bool("G2G_RESPECT_USER_SSH", False)
+
+        if use_ssh:
+            repo_url = repo_ssh_url
+            # Set up SSH environment for private repos
+            env = {
+                "GIT_SSH_COMMAND": build_git_ssh_command(),
+                **build_non_interactive_ssh_env(),
+            }
+            log.debug("Using SSH URL for GitHub repo: %s", repo_url)
+        else:
+            repo_url = repo_https_url
+            env = {}
+            log.debug("Using HTTPS URL: %s", repo_url)
+
         run_cmd(
-            ["git", "remote", "add", "origin", repo_url],
-            cwd=self.workspace,
+            ["git", "remote", "add", "origin", repo_url], cwd=self.workspace
         )
 
-        # Fetch PR head
+        # Fetch base branch and PR head with CLI's fallback logic
+        fetch_success = False
+
+        if base_ref:
+            try:
+                branch_ref = (
+                    f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
+                )
+                run_cmd(
+                    [
+                        "git",
+                        "fetch",
+                        f"--depth={inputs.fetch_depth}",
+                        "origin",
+                        branch_ref,
+                    ],
+                    cwd=self.workspace,
+                    env=env,
+                )
+            except Exception as exc:
+                log.debug("Base branch fetch failed for %s: %s", base_ref, exc)
+
         if gh.pr_number:
-            pr_ref = (
-                f"refs/pull/{gh.pr_number}/head:refs/remotes/origin/pr/"
-                f"{gh.pr_number}/head"
-            )
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={inputs.fetch_depth}",
-                    "origin",
-                    pr_ref,
-                ],
-                cwd=self.workspace,
-            )
-            # Checkout PR head
-            pr_head_ref = f"refs/remotes/origin/pr/{gh.pr_number}/head"
-            run_cmd(
-                ["git", "checkout", "-B", "g2g_pr_head", pr_head_ref],
-                cwd=self.workspace,
-            )
+            try:
+                pr_ref = (
+                    f"refs/pull/{pr_num_str}/head:"
+                    f"refs/remotes/origin/pr/{pr_num_str}/head"
+                )
+                run_cmd(
+                    [
+                        "git",
+                        "fetch",
+                        f"--depth={inputs.fetch_depth}",
+                        "origin",
+                        pr_ref,
+                    ],
+                    cwd=self.workspace,
+                    env=env,
+                )
+                # Checkout PR head
+                run_cmd(
+                    [
+                        "git",
+                        "checkout",
+                        "-B",
+                        "g2g_pr_head",
+                        f"refs/remotes/origin/pr/{pr_num_str}/head",
+                    ],
+                    cwd=self.workspace,
+                )
+                fetch_success = True
+            except Exception as exc:
+                log.debug("PR fetch failed, will try API fallback: %s", exc)
+
+        # Fallback to GitHub API archive if git fetch failed (CLI's resilience)
+        if not fetch_success and pr_num_str and pr_num_str != "0":
+            log.info("Git fetch failed, falling back to GitHub API archive")
+            self._fallback_to_api_archive(self.workspace, gh, inputs)
+
+    def _fallback_to_api_archive(
+        self, workspace: Path, gh: GitHubContext, inputs: Inputs
+    ) -> None:
+        """Fallback to GitHub API archive download (ported from CLI)."""
+        import json
+        import zipfile
+        from urllib.request import Request
+        from urllib.request import urlopen
+
+        repo_full = gh.repository.strip() if gh.repository else ""
+        pr_num_str = str(gh.pr_number) if gh.pr_number else "0"
+
+        # Get GitHub token
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+        if not token:
+            msg = "No GITHUB_TOKEN available for API fallback"
+            raise OrchestratorError(msg)
+
+        # Determine API base URL
+        server_url = gh.server_url or "https://github.com"
+        if "github.com" in server_url.lower():
+            api_base = "https://api.github.com"
+        else:
+            # GitHub Enterprise
+            parsed = urllib.parse.urlparse(server_url)
+            api_base = f"{parsed.scheme}://{parsed.netloc}/api/v3"
+
+        # Get PR details to find head SHA
+        pr_api_url = f"{api_base}/repos/{repo_full}/pulls/{pr_num_str}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+
+        try:
+            req = Request(pr_api_url, headers=headers)  # noqa: S310
+            with urlopen(req, timeout=30) as response:  # noqa: S310
+                pr_data = json.loads(response.read().decode())
+        except Exception:
+            log.exception("Failed to fetch PR data from GitHub API")
+            raise
+
+        head_sha = pr_data["head"]["sha"]
+
+        # Download archive
+        archive_url = f"{api_base}/repos/{repo_full}/zipball/{head_sha}"
+
+        try:
+            req = Request(archive_url, headers=headers)  # noqa: S310
+            with urlopen(req, timeout=120) as response:  # noqa: S310
+                archive_data = response.read()
+        except Exception:
+            log.exception("Failed to download archive from GitHub API")
+            raise
+
+        # Initialize git if needed
+        if not (workspace / ".git").exists():
+            run_cmd(["git", "init"], cwd=workspace)
+
+        # Extract archive
+        archive_path = workspace / "archive.zip"
+        archive_path.write_bytes(archive_data)
+
+        with zipfile.ZipFile(archive_path, "r") as zip_ref:
+            zip_ref.extractall(workspace)
+
+        # Find extracted directory (GitHub creates repo-sha format)
+        extracted_dirs = [
+            d for d in workspace.iterdir() if d.is_dir() and d.name != ".git"
+        ]
+        if not extracted_dirs:
+            msg = "No content found in GitHub archive"
+            raise OrchestratorError(msg)
+
+        source_dir = extracted_dirs[0]
+
+        # Move contents to workspace root
+        for item in source_dir.iterdir():
+            if item.name != ".git":
+                import shutil
+
+                target = workspace / item.name
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                shutil.move(str(item), str(target))
+
+        # Clean up
+        source_dir.rmdir()
+        archive_path.unlink()
+
+        # Create expected branch
+        run_cmd(["git", "checkout", "-B", "g2g_pr_head"], cwd=workspace)
+
+        log.info("Successfully set up workspace using GitHub API archive")
 
     def _install_commit_msg_hook(self, gerrit: GerritInfo) -> None:
         """Manually install commit-msg hook from Gerrit."""
@@ -3662,16 +3945,23 @@ class Orchestrator:
         gh: GitHubContext,
     ) -> None:
         """Post a comment in Gerrit pointing back to the GitHub PR and run."""
+        log.debug(
+            "_add_backref_comment_in_gerrit called with %d commit SHAs",
+            len(commit_shas),
+        )
+
         if not commit_shas:
             log.warning("No commit shas to comment on in Gerrit")
             return
 
         # Check if back-reference comments are disabled
-        if os.getenv("G2G_SKIP_GERRIT_COMMENTS", "").lower() in (
-            "true",
-            "1",
-            "yes",
-        ):
+        skip_comments_env = os.getenv("G2G_SKIP_GERRIT_COMMENTS", "")
+        log.debug(
+            "G2G_SKIP_GERRIT_COMMENTS environment variable: '%s'",
+            skip_comments_env,
+        )
+
+        if skip_comments_env.lower() in ("true", "1", "yes"):
             log.info(
                 "Skipping back-reference comments "
                 "(G2G_SKIP_GERRIT_COMMENTS=true)"
@@ -3729,10 +4019,20 @@ class Orchestrator:
                 )
             return False
 
+        log.debug(
+            "Processing %d commit SHAs for back-reference comments",
+            len(commit_shas),
+        )
+
         for csha in commit_shas:
+            log.debug("Processing commit SHA: %s", csha)
             if _has_existing_backref(csha):
+                log.debug(
+                    "Commit %s already has back-reference, skipping", csha
+                )
                 continue
             if not csha:
+                log.debug("Empty commit SHA, skipping")
                 continue
             try:
                 log.debug("Executing SSH command for commit %s", csha)
@@ -3868,12 +4168,15 @@ class Orchestrator:
                     log.debug("SSH stderr: %s", exc.stderr)
                 if exc.stdout:
                     log.debug("SSH stdout: %s", exc.stdout)
-                log.info(
+                log.debug(
+                    "SSH command that failed: %s",
+                    " ".join(ssh_cmd) if "ssh_cmd" in locals() else "unknown",
+                )
+                log.debug(
                     "Back-reference comment failed but change was successfully "
                     "submitted. You can set G2G_SKIP_GERRIT_COMMENTS=true to "
                     "disable these comments."
                 )
-                # Continue processing - this is not a fatal error
             except Exception as exc:
                 log.warning(
                     "Failed to add back-reference comment for %s "
@@ -3904,24 +4207,12 @@ class Orchestrator:
         if not gh.pr_number:
             return
         urls = result.change_urls or []
-        org = os.getenv("ORGANIZATION", gh.repository_owner)
-        # Create centralized URL builder for organization link
-        url_builder = create_gerrit_url_builder(gerrit.host)
-        org_url = url_builder.web_url()
-        text = (
-            f"The pull-request PR-{gh.pr_number} is submitted to Gerrit "
-            f"[{org}]({org_url})!\n\n"
-        )
-        if urls:
-            text += "To follow up on the change visit:\n\n" + "\n".join(urls)
         try:
             client = build_client()
             repo = get_repo_from_env(client)
             # At this point, gh.pr_number is non-None due to earlier guard.
             pr_obj = get_pull(repo, int(gh.pr_number))
-            create_pr_comment(pr_obj, text)
-            # Also post a succinct one-line comment
-            # for each Gerrit change URL
+            # Post a concise one-line comment for each Gerrit change URL
             for u in urls:
                 create_pr_comment(
                     pr_obj,

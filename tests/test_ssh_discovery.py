@@ -239,13 +239,13 @@ OTHER_KEY = "other_value"
             gerrit_hostname="example.com",
             gerrit_port=29418,
             organization="testorg",
-            save_to_config=True,
         )
 
         assert result is not None
         assert "ssh-rsa" in result
         mock_fetch.assert_called_once_with("example.com", 29418)
-        mock_save.assert_called_once()
+        # Function no longer saves immediately
+        mock_save.assert_not_called()
 
     @patch("github2gerrit.ssh_discovery.fetch_ssh_host_keys")
     def test_auto_discover_no_save(self, mock_fetch: Mock) -> None:
@@ -261,10 +261,10 @@ OTHER_KEY = "other_value"
                 gerrit_hostname="example.com",
                 gerrit_port=29418,
                 organization="testorg",
-                save_to_config=False,
             )
 
             assert result is not None
+            # Function never saves immediately
             mock_save.assert_not_called()
 
     def test_auto_discover_no_hostname(self) -> None:
@@ -305,10 +305,8 @@ OTHER_KEY = "other_value"
         )
 
         assert result is not None
-        mock_save.assert_called_once()
-        # Verify it used the environment organization
-        call_args = mock_save.call_args
-        assert "envorg" in call_args[0]
+        # Function no longer saves immediately
+        mock_save.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
     @patch("github2gerrit.ssh_discovery.fetch_ssh_host_keys")
@@ -329,6 +327,7 @@ OTHER_KEY = "other_value"
             )
 
             assert result is not None
+            # Function never saves immediately
             mock_save.assert_not_called()
 
     def test_save_host_keys_permission_error(self) -> None:

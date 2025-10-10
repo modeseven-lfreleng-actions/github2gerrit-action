@@ -253,6 +253,7 @@ class TestSSHAgentSetup:
     ) -> None:
         """Test successful SSH agent authentication setup."""
         mock_manager = Mock()
+        mock_manager.use_existing_agent.return_value = False
         mock_manager.list_keys.return_value = (
             "2048 SHA256:abc123 test@example.com (RSA)"
         )
@@ -277,6 +278,7 @@ class TestSSHAgentSetup:
     ) -> None:
         """Test setup failure when no keys are loaded."""
         mock_manager = Mock()
+        mock_manager.use_existing_agent.return_value = True
         mock_manager.list_keys.return_value = "No keys loaded"
         mock_manager_class.return_value = mock_manager
 
@@ -300,6 +302,7 @@ class TestSSHAgentSetup:
     ) -> None:
         """Test cleanup on setup failure."""
         mock_manager = Mock()
+        mock_manager.use_existing_agent.return_value = False
         mock_manager.start_agent.side_effect = SSHAgentError("Test failure")
         mock_manager_class.return_value = mock_manager
 

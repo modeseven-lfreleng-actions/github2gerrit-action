@@ -49,6 +49,8 @@ def test_conflicting_options_error_message_in_stderr(tmp_path: Path) -> None:
 
 def test_missing_required_input_error_message_in_stderr(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
+    # Disable SSH agent to force SSH private key requirement
+    env["G2G_USE_SSH_AGENT"] = "false"
     # Remove a required input to trigger a validation error path
     env.pop("GERRIT_SSH_PRIVKEY_G2G", None)
 
@@ -65,6 +67,8 @@ def test_configuration_error_no_traceback_in_stderr(tmp_path: Path) -> None:
     """Verify that configuration errors don't expose Python tracebacks to
     users."""
     env = _base_env(tmp_path)
+    # Disable SSH agent to force SSH private key requirement
+    env["G2G_USE_SSH_AGENT"] = "false"
     # Remove a required input to trigger a validation error path
     env.pop("GERRIT_SSH_PRIVKEY_G2G", None)
 
@@ -130,6 +134,8 @@ def test_conflicting_options_exits_2(tmp_path: Path) -> None:
 
 def test_missing_required_inputs_exits_2(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
+    # Disable SSH agent to force SSH private key requirement
+    env["G2G_USE_SSH_AGENT"] = "false"
     # Remove one required input to trigger validation error
     env.pop("GERRIT_SSH_PRIVKEY_G2G", None)
 

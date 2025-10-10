@@ -99,8 +99,8 @@ def test_git_review_args_include_branch_and_repeated_reviewer_flags(
     t_idx = args.index("-t")
     assert args[t_idx + 1] == "GH-my-repo-42"
 
-    # Branch as positional argument at the end
-    assert args[-1] == branch
+    # Branch is no longer passed as positional argument to avoid git-review bug
+    # where it adds the branch name as a reviewer. Git-review infers target branch.
 
     # Reviewers are passed via repeated --reviewer flags; no '--reviewers'
     # aggregate flag

@@ -37,7 +37,6 @@ from .github_api import get_pull
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
 from .gitutils import CommandError
-from .gitutils import run_cmd
 from .models import GitHubContext
 from .models import Inputs
 from .rich_display import RICH_AVAILABLE
@@ -47,8 +46,6 @@ from .rich_display import display_pr_info
 from .rich_display import safe_console_print
 from .rich_display import safe_typer_echo
 from .rich_logging import setup_rich_aware_logging
-from .ssh_common import build_git_ssh_command
-from .ssh_common import build_non_interactive_ssh_env
 from .utils import append_github_output
 from .utils import env_bool
 from .utils import env_str
@@ -96,6 +93,7 @@ def _exit_for_pr_fetch_error(exc: Exception) -> None:
 
 def _extract_and_display_pr_info(
     gh: GitHubContext,
+    data: Inputs,
     progress_tracker: Any = None,
 ) -> None:
     """Extract PR information and display it with Rich formatting."""
@@ -103,8 +101,12 @@ def _extract_and_display_pr_info(
         return
 
     try:
-        # Get GitHub token and build client
-        token = os.getenv("GITHUB_TOKEN", "")
+        # Get GitHub token from inputs if available, fallback to environment
+        token = ""
+        if hasattr(data, "github_token") and data.github_token:
+            token = data.github_token
+        else:
+            token = os.getenv("GITHUB_TOKEN", "")
         if not token:
             safe_console_print(
                 "⚠️  No GITHUB_TOKEN available - skipping PR info display",
@@ -272,6 +274,40 @@ if TYPE_CHECKING:
     ) -> Callable[[F], F]: ...
 else:
     typed_app_command = app.command
+
+
+def _save_derived_parameters_after_success(data: Inputs) -> None:
+    """Save derived parameters to config file after successful Gerrit
+    submission."""
+    try:
+        # Get the organization used for derivation
+        org_for_cfg = (
+            data.organization
+            or os.getenv("ORGANIZATION")
+            or os.getenv("GITHUB_REPOSITORY_OWNER")
+        )
+
+        if not org_for_cfg:
+            log.debug("No organization available for derived parameter saving")
+            return
+
+        # Load current config to check what needs derivation
+        cfg = load_org_config(org_for_cfg)
+
+        # Apply derivation with saving enabled to capture newly derived
+        # parameters
+        apply_parameter_derivation(cfg, org_for_cfg, save_to_config=True)
+
+        log.debug(
+            "Derived parameters saved to configuration after successful "
+            "Gerrit submission for organization '%s'",
+            org_for_cfg,
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to save derived parameters after successful submission: %s",
+            exc,
+        )
 
 
 @typed_app_command()
@@ -455,7 +491,7 @@ def main(
         "--verbose",
         "-v",
         envvar="G2G_VERBOSE",
-        help="Verbose output (sets loglevel to DEBUG).",
+        help="Verbose output (enables DEBUG logging including Rich displays).",
     ),
     version_flag: bool = typer.Option(
         False,
@@ -656,6 +692,7 @@ def _build_inputs_from_env() -> Inputs:
         gerrit_ssh_privkey_g2g=env_str("GERRIT_SSH_PRIVKEY_G2G"),
         gerrit_ssh_user_g2g=env_str("GERRIT_SSH_USER_G2G"),
         gerrit_ssh_user_g2g_email=env_str("GERRIT_SSH_USER_G2G_EMAIL"),
+        github_token=env_str("GITHUB_TOKEN"),
         organization=env_str(
             "ORGANIZATION", env_str("GITHUB_REPOSITORY_OWNER")
         ),
@@ -951,15 +988,31 @@ def _process_single(
     data: Inputs,
     gh: GitHubContext,
     progress_tracker: Any = None,
-) -> bool:
+) -> tuple[bool, SubmissionResult]:
     # Create temporary directory for all git operations
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
 
+        orch = Orchestrator(workspace=workspace)
+
         try:
             if progress_tracker:
                 progress_tracker.update_operation("Preparing local checkout...")
-            _prepare_local_checkout(workspace, gh, data)
+            log.debug(
+                "Preparing workspace checkout in temporary directory: %s",
+                workspace,
+            )
+            log.debug("Repository URL: %s", gh.repository)
+            log.debug("Fetch depth: %s", data.fetch_depth)
+
+            try:
+                log.debug("About to call _prepare_workspace_checkout")
+                orch._prepare_workspace_checkout(data, gh)
+                log.debug("Workspace checkout completed successfully")
+            except Exception:
+                log.exception("Workspace checkout failed")
+                log.debug("Full checkout exception details:", exc_info=True)
+                raise
         except Exception as exc:
             log.debug("Local checkout preparation failed: %s", exc)
             if progress_tracker:
@@ -970,19 +1023,43 @@ def _process_single(
                 "Configuring SSH authentication..."
             )
 
-        orch = Orchestrator(workspace=workspace)
+        log.debug("Configuring SSH authentication for Gerrit access")
+        log.debug(
+            "Gerrit server: %s:%s", data.gerrit_server, data.gerrit_server_port
+        )
 
         if progress_tracker:
             progress_tracker.update_operation(
                 "Extracting commit information..."
             )
 
+        log.debug("Extracting commit information from PR")
+        log.debug("PR commits range: base_sha..head_sha (not available)")
+
         pipeline_success = False
         try:
             if progress_tracker:
                 progress_tracker.update_operation("Submitting to Gerrit...")
-            result = orch.execute(inputs=data, gh=gh)
+            log.debug("Starting Gerrit submission process")
+            log.debug("Dry run mode: %s", data.dry_run)
+            log.debug("About to call orch.execute() - where issues often occur")
+
+            try:
+                result = orch.execute(inputs=data, gh=gh)
+                log.debug("orch.execute() completed successfully")
+            except Exception:
+                log.exception("Exception during orch.execute()")
+                log.debug("Full exception details:", exc_info=True)
+                raise
+
             pipeline_success = True
+            log.debug("Gerrit submission completed successfully")
+
+            # Save derived parameters to config after successful submission
+            _save_derived_parameters_after_success(data)
+
+            if result.change_urls:
+                log.debug("Generated change URLs: %s", result.change_urls)
             if progress_tracker:
                 progress_tracker.pr_processed()
             if progress_tracker and result.change_urls:
@@ -1053,14 +1130,9 @@ def _process_single(
             os.environ["GERRIT_CHANGE_REQUEST_URL"] = "\n".join(
                 result.change_urls
             )
-            # Output Gerrit change URL(s) to console
+            # Log Gerrit change URL(s) for debugging
             for url in result.change_urls:
                 log.debug("Gerrit change URL: %s", url)
-                safe_console_print(
-                    f"🔗 Gerrit change URL: {url}",
-                    style="green",
-                    progress_tracker=progress_tracker,
-                )
         if result.change_numbers:
             os.environ["GERRIT_CHANGE_REQUEST_NUM"] = "\n".join(
                 result.change_numbers
@@ -1083,279 +1155,20 @@ def _process_single(
             }
         )
 
-        return pipeline_success
-
-
-def _prepare_local_checkout(
-    workspace: Path, gh: GitHubContext, data: Inputs
-) -> None:
-    repo_full = gh.repository.strip() if gh.repository else ""
-    server_url = gh.server_url or os.getenv(
-        "GITHUB_SERVER_URL", "https://github.com"
-    )
-    server_url = (server_url or "https://github.com").rstrip("/")
-    base_ref = gh.base_ref or ""
-    pr_num_str: str = str(gh.pr_number) if gh.pr_number else "0"
-
-    if not repo_full:
-        return
-
-    # Try SSH first for private repos if available, then fall back to HTTPS/API
-    repo_ssh_url = (
-        f"git@{server_url.replace('https://', '').replace('http://', '')}:"
-        f"{repo_full}.git"
-    )
-    repo_https_url = f"{server_url}/{repo_full}.git"
-
-    run_cmd(["git", "init"], cwd=workspace)
-
-    # Determine which URL to use and set up authentication
-    env: dict[str, str] = {}
-    repo_url = repo_https_url  # Default to HTTPS
-
-    # Check if we should try SSH for private repos
-    use_ssh = False
-    respect_user_ssh = os.getenv("G2G_RESPECT_USER_SSH", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-    gerrit_ssh_privkey = os.getenv("GERRIT_SSH_PRIVKEY_G2G")
-
-    log.debug(
-        "GitHub repo access decision: SSH URL available=%s, "
-        "G2G_RESPECT_USER_SSH=%s, GERRIT_SSH_PRIVKEY_G2G=%s",
-        repo_ssh_url.startswith("git@"),
-        respect_user_ssh,
-        bool(gerrit_ssh_privkey),
-    )
-
-    if repo_ssh_url.startswith("git@"):
-        # For private repos, only try SSH if G2G_RESPECT_USER_SSH is
-        # explicitly enabled
-        # Don't use SSH just because GERRIT_SSH_PRIVKEY_G2G is set
-        # (that's for Gerrit, not GitHub)
-        if respect_user_ssh:
-            use_ssh = True
-            repo_url = repo_ssh_url
-            log.debug(
-                "Using SSH for GitHub repo access due to "
-                "G2G_RESPECT_USER_SSH=true"
-            )
-        else:
-            log.debug(
-                "Not using SSH for GitHub repo access - "
-                "G2G_RESPECT_USER_SSH not enabled"
-            )
-
-    if use_ssh:
-        env = {
-            "GIT_SSH_COMMAND": build_git_ssh_command(),
-            **build_non_interactive_ssh_env(),
-        }
-        log.debug("Using SSH URL for private repo: %s", repo_url)
-    else:
-        log.debug("Using HTTPS URL: %s", repo_url)
-
-    run_cmd(["git", "remote", "add", "origin", repo_url], cwd=workspace)
-
-    # Fetch base branch and PR head with fallback to API archive
-    fetch_success = False
-
-    if base_ref:
-        try:
-            branch_ref = f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={data.fetch_depth}",
-                    "origin",
-                    branch_ref,
-                ],
-                cwd=workspace,
-                env=env,
-            )
-        except Exception as exc:
-            log.debug("Base branch fetch failed for %s: %s", base_ref, exc)
-
-    if pr_num_str:
-        try:
-            pr_ref = (
-                f"refs/pull/{pr_num_str}/head:"
-                f"refs/remotes/origin/pr/{pr_num_str}/head"
-            )
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={data.fetch_depth}",
-                    "origin",
-                    pr_ref,
-                ],
-                cwd=workspace,
-                env=env,
-            )
-            run_cmd(
-                [
-                    "git",
-                    "checkout",
-                    "-B",
-                    "g2g_pr_head",
-                    f"refs/remotes/origin/pr/{pr_num_str}/head",
-                ],
-                cwd=workspace,
-                env=env,
-            )
-            fetch_success = True
-        except Exception as exc:
-            log.warning(
-                "Git fetch failed, attempting API archive fallback: %s", exc
-            )
-            # Try API archive fallback for private repos
-            try:
-                _fallback_to_api_archive(workspace, gh, data, pr_num_str)
-                fetch_success = True
-            except Exception as api_exc:
-                log.exception("API archive fallback also failed")
-                raise exc from api_exc
-
-    if not fetch_success and pr_num_str:
-        msg = f"Failed to prepare checkout for PR #{pr_num_str}"
-        raise RuntimeError(msg)
-
-
-def _fallback_to_api_archive(
-    workspace: Path, gh: GitHubContext, data: Inputs, pr_num_str: str
-) -> None:
-    """Fallback to GitHub API archive download for private repos."""
-    import io
-    import json
-    import shutil
-    import zipfile
-    from urllib.request import Request
-    from urllib.request import urlopen
-
-    log.info("Attempting API archive fallback for PR #%s", pr_num_str)
-
-    # Get GitHub token for authenticated requests
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        msg = "GITHUB_TOKEN required for API archive fallback"
-        raise RuntimeError(msg)
-
-    # Build API URLs
-    repo_full = gh.repository
-    server_url = gh.server_url or "https://github.com"
-
-    # Construct GitHub API base URL properly
-    if "github.com" in server_url:
-        # For github.com, use api.github.com
-        api_base = "https://api.github.com"
-    elif server_url.startswith("https://"):
-        # For GitHub Enterprise, append /api/v3
-        api_base = server_url.rstrip("/") + "/api/v3"
-    else:
-        # Fallback for unexpected formats
-        api_base = "https://api.github.com"
-
-    # Get PR details to find head SHA
-    pr_api_url = f"{api_base}/repos/{repo_full}/pulls/{pr_num_str}"
-    log.debug("GitHub API PR URL: %s", pr_api_url)
-
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "github2gerrit",
-    }
-
-    try:
-        req = Request(pr_api_url, headers=headers)  # noqa: S310
-        with urlopen(req, timeout=30) as response:  # noqa: S310
-            pr_data = json.loads(response.read().decode())
-    except Exception:
-        log.exception("Failed to fetch PR data from GitHub API")
-        log.debug("PR API URL was: %s", pr_api_url)
-        raise
-
-    head_sha = pr_data["head"]["sha"]
-
-    # Download archive
-    archive_url = f"{api_base}/repos/{repo_full}/zipball/{head_sha}"
-    log.debug("GitHub API archive URL: %s", archive_url)
-
-    try:
-        req = Request(archive_url, headers=headers)  # noqa: S310
-        with urlopen(req, timeout=120) as response:  # noqa: S310
-            archive_data = response.read()
-    except Exception:
-        log.exception("Failed to download archive from GitHub API")
-        log.debug("Archive URL was: %s", archive_url)
-        raise
-
-    # Extract archive
-    with zipfile.ZipFile(io.BytesIO(archive_data)) as zf:
-        # Find the root directory in the archive (usually repo-sha format)
-        members = zf.namelist()
-        root_dir = None
-        for member in members:
-            if "/" in member:
-                root_dir = member.split("/")[0]
-                break
-
-        if not root_dir:
-            msg = "Could not find root directory in archive"
-            raise RuntimeError(msg)
-
-        # Extract to temporary location then move contents
-        extract_path = workspace / "archive_temp"
-        zf.extractall(extract_path)
-
-        # Move contents from extracted root to workspace
-        extracted_root = extract_path / root_dir
-        for item in extracted_root.iterdir():
-            if item.name == ".git":
-                continue  # Skip .git if present
-            dest = workspace / item.name
-            if dest.exists():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            item.rename(dest)
-
-        # Clean up
-        shutil.rmtree(extract_path)
-
-    # Set up git for the extracted content
-    if not (workspace / ".git").exists():
-        run_cmd(["git", "init"], cwd=workspace)
-
-    # Create a commit for the PR content
-    run_cmd(["git", "add", "."], cwd=workspace)
-    run_cmd(
-        [
-            "git",
-            "commit",
-            "-m",
-            f"PR #{pr_num_str} content from API archive",
-            "--author",
-            "GitHub API <noreply@github.com>",
-        ],
-        cwd=workspace,
-    )
-
-    # Create the expected branch
-    run_cmd(["git", "checkout", "-B", "g2g_pr_head"], cwd=workspace)
-
-    log.info(
-        "Successfully extracted PR #%s content via API archive", pr_num_str
-    )
+        return pipeline_success, result
 
 
 def _load_effective_inputs() -> Inputs:
     # Build inputs from environment (used by URL callback path)
     data = _build_inputs_from_env()
+
+    # Detect GitHub CI mode and configure accordingly
+    github_mode = _is_github_mode()
+    log.debug("GitHub CI mode detected: %s", github_mode)
+
+    if not github_mode and not os.getenv("G2G_RESPECT_USER_SSH"):
+        log.debug("Local execution detected, enabling user SSH config respect")
+        os.environ["G2G_RESPECT_USER_SSH"] = "true"
 
     # Load per-org configuration and apply to environment before validation
     org_for_cfg = (
@@ -1366,7 +1179,7 @@ def _load_effective_inputs() -> Inputs:
     cfg = load_org_config(org_for_cfg)
 
     # Apply dynamic parameter derivation for missing Gerrit parameters
-    cfg = apply_parameter_derivation(cfg, org_for_cfg, save_to_config=True)
+    cfg = apply_parameter_derivation(cfg, org_for_cfg, save_to_config=False)
 
     # Debug: Show what configuration would be applied
     log.debug("Configuration to apply: %s", cfg)
@@ -1401,6 +1214,7 @@ def _load_effective_inputs() -> Inputs:
                     gerrit_ssh_privkey_g2g=data.gerrit_ssh_privkey_g2g,
                     gerrit_ssh_user_g2g=data.gerrit_ssh_user_g2g,
                     gerrit_ssh_user_g2g_email=data.gerrit_ssh_user_g2g_email,
+                    github_token=data.github_token,
                     organization=data.organization,
                     reviewers_email=os.environ["REVIEWERS_EMAIL"],
                     preserve_github_prs=data.preserve_github_prs,
@@ -1550,7 +1364,7 @@ def _process() -> None:
 
     # Display PR information with Rich formatting
     if gh.pr_number:
-        _extract_and_display_pr_info(gh, progress_tracker)
+        _extract_and_display_pr_info(gh, data, progress_tracker)
 
     # Check for duplicates in single-PR mode (before workspace setup)
     if gh.pr_number and not env_bool("SYNC_ALL_OPEN_PRS", False):
@@ -1566,11 +1380,21 @@ def _process() -> None:
             )
             if progress_tracker:
                 progress_tracker.update_operation("Checking for duplicates...")
+            log.debug(
+                "Starting duplicate detection for PR #%s in %s",
+                gh.pr_number,
+                gh.repository,
+            )
+            log.debug(
+                "Expected GitHub hash for duplicate detection: %s",
+                expected_github_hash,
+            )
             check_for_duplicates(
                 gh,
                 allow_duplicates=data.allow_duplicates,
                 expected_github_hash=expected_github_hash,
             )
+            log.debug("Duplicate check completed successfully")
             if progress_tracker:
                 progress_tracker.update_operation("Duplicate check completed")
         except DuplicateChangeError as exc:
@@ -1604,7 +1428,11 @@ def _process() -> None:
     if progress_tracker:
         progress_tracker.update_operation("Processing pull request...")
 
-    pipeline_success = _process_single(data, gh, progress_tracker)
+    log.debug("Starting single PR processing pipeline")
+    log.debug("Processing PR #%s from %s", gh.pr_number, gh.repository)
+    log.debug("Target Gerrit server: %s", data.gerrit_server)
+    log.debug("Target Gerrit project: %s", data.gerrit_project)
+    pipeline_success, result = _process_single(data, gh, progress_tracker)
 
     # Log external API metrics summary
     try:
@@ -1641,6 +1469,11 @@ def _process() -> None:
             safe_console_print(
                 f"📝 Changes updated: {summary['changes_updated']}"
             )
+
+        # Show Gerrit change URL(s) in final summary
+        if pipeline_success and result.change_urls:
+            for url in result.change_urls:
+                safe_console_print(f"🔗 Gerrit change: {url}", style="green")
 
     # Final success/failure message after all cleanup
     if pipeline_success:
@@ -1742,8 +1575,9 @@ def _validate_inputs(data: Inputs) -> None:
     # Context-aware validation: different requirements for GH Actions vs CLI
     is_github_actions = _is_github_actions_context()
 
-    # SSH private key is always required
-    required_fields = ["gerrit_ssh_privkey_g2g"]
+    # SSH private key is required unless using SSH agent
+    use_ssh_agent = env_bool("G2G_USE_SSH_AGENT", default=True)
+    required_fields = [] if use_ssh_agent else ["gerrit_ssh_privkey_g2g"]
 
     # Gerrit parameters can be derived in GH Actions if organization available
     # In local CLI context, we're more strict about explicit configuration
@@ -1812,23 +1646,94 @@ def _validate_inputs(data: Inputs) -> None:
         raise ConfigurationError(_MSG_ISSUE_ID_MULTILINE)
 
 
+def _is_github_mode() -> bool:
+    """Detect if running in GitHub CI environment.
+
+    Returns:
+        True if running in GitHub CI, False if running locally
+    """
+    return (
+        os.getenv("GITHUB_ACTIONS") == "true"
+        or os.getenv("GITHUB_EVENT_NAME", "").strip() != ""
+    )
+
+
+def _get_ssh_agent_status() -> str:
+    """Get SSH agent availability and usage status."""
+    import shutil
+
+    # Check if SSH agent is available
+    ssh_agent_available = shutil.which("ssh-agent") is not None
+
+    # Check if SSH agent is configured to be used
+    use_ssh_agent = env_bool("G2G_USE_SSH_AGENT", default=True)
+
+    # Check if SSH agent is currently running (SSH_AUTH_SOCK exists)
+    ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
+    agent_running = ssh_auth_sock and os.path.exists(ssh_auth_sock)
+
+    # Check if we have explicit SSH private key
+    has_private_key = bool(os.getenv("GERRIT_SSH_PRIVKEY_G2G", "").strip())
+
+    if not ssh_agent_available:
+        return "❎ Unavailable, Unused"
+    elif has_private_key:
+        # SSH key explicitly provided - don't use agent
+        if agent_running:
+            return "☑️ Available, Unused"
+        else:
+            return "❎ Unavailable, Unused"
+    elif use_ssh_agent and agent_running:
+        return "✅ Available, Used"
+    elif agent_running:
+        return "☑️ Available, Unused"
+    else:
+        return "❎ Unavailable, Unused"
+
+
 def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     """Display effective configuration in a formatted table."""
     from .rich_display import display_pr_info
 
-    # Avoid displaying sensitive values
-    known_hosts_status = "✅" if data.gerrit_known_hosts else "❌"
-    privkey_status = "✅" if data.gerrit_ssh_privkey_g2g else "❌"
+    # Detect GitHub mode and display prominently
+    github_mode = _is_github_mode()
+    github_mode_status = "✅" if github_mode else "❎"
+
+    # Avoid displaying sensitive values - use context-appropriate indicators
+    # For known hosts: ❎ in local mode (normal), ❌ in CI mode (error)
+    if data.gerrit_known_hosts:
+        known_hosts_status = "✅"
+    else:
+        known_hosts_status = "❌" if github_mode else "❎"
+
+    # For SSH private key: ❎ in local mode (normal), ❌ in CI mode (error)
+    if data.gerrit_ssh_privkey_g2g:
+        privkey_status = "✅"
+    else:
+        privkey_status = "❌" if github_mode else "❎"
+
+    # For GitHub token: ❎ in local mode (optional), ❌ in CI mode (required)
+    if data.github_token:
+        github_token_status = "✅"  # noqa: S105
+    else:
+        github_token_status = "❌" if github_mode else "❎"
+    ssh_agent_status = _get_ssh_agent_status()
 
     # Build configuration data, filtering out empty/default values
-    # Order items logically: behavioral settings first, then credentials
+    # Order items logically: GitHub mode first, then behavioral settings,
+    # then credentials
     config_info = {}
+
+    # GitHub mode first - always show
+    config_info["GITHUB_MODE"] = github_mode_status
 
     # Only show non-default boolean values
     if data.submit_single_commits:
         config_info["SUBMIT_SINGLE_COMMITS"] = str(data.submit_single_commits)
     if data.use_pr_as_commit:
         config_info["USE_PR_AS_COMMIT"] = str(data.use_pr_as_commit)
+    if data.dry_run:
+        config_info["DRY_RUN"] = str(data.dry_run)
 
     # Only show non-default fetch depth
     if data.fetch_depth != 10:
@@ -1868,6 +1773,8 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     if data.gerrit_known_hosts or not data.gerrit_known_hosts:
         config_info["GERRIT_KNOWN_HOSTS"] = known_hosts_status
     config_info["GERRIT_SSH_PRIVKEY_G2G"] = privkey_status
+    config_info["GITHUB_TOKEN"] = github_token_status
+    config_info["SSH_AGENT"] = ssh_agent_status
 
     # Display the configuration table
     display_pr_info(config_info, "GitHub2Gerrit Configuration")

@@ -4,8 +4,10 @@
 """Tests for the ssh_common module containing SSH utilities."""
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from _pytest.logging import LogCaptureFixture
 
@@ -16,26 +18,28 @@ from github2gerrit.ssh_common import build_ssh_options
 
 
 class TestBuildSshOptions:
-    """Test the build_ssh_options function."""
+    """Test SSH options building functionality."""
 
     def test_build_ssh_options_minimal(self) -> None:
         """Test build_ssh_options with minimal parameters."""
-        options = build_ssh_options()
+        # Ensure secure SSH options by not respecting user SSH config
+        with patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}):
+            options = build_ssh_options()
 
-        expected_options = [
-            "-F /dev/null",
-            "-o IdentitiesOnly=yes",
-            "-o IdentityAgent=none",
-            "-o BatchMode=yes",
-            "-o PreferredAuthentications=publickey",
-            "-o PasswordAuthentication=no",
-            "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o ConnectTimeout=10",
-            "-o StrictHostKeyChecking=yes",
-        ]
+            expected_options = [
+                "-F /dev/null",
+                "-o IdentitiesOnly=yes",
+                "-o IdentityAgent=none",
+                "-o BatchMode=yes",
+                "-o PreferredAuthentications=publickey",
+                "-o PasswordAuthentication=no",
+                "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-o ConnectTimeout=10",
+                "-o StrictHostKeyChecking=yes",
+            ]
 
-        for expected_option in expected_options:
-            assert expected_option in options
+            for expected_option in expected_options:
+                assert expected_option in options
 
     def test_build_ssh_options_with_key_path(self) -> None:
         """Test build_ssh_options with SSH key path."""
@@ -53,10 +57,11 @@ class TestBuildSshOptions:
 
     def test_build_ssh_options_identities_only_false(self) -> None:
         """Test build_ssh_options with identities_only=False."""
-        options = build_ssh_options(identities_only=False)
+        with patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}):
+            options = build_ssh_options(identities_only=False)
 
-        assert "-o IdentitiesOnly=yes" not in options
-        assert "-o IdentityAgent=none" not in options
+            assert "-o IdentitiesOnly=yes" not in options
+            assert "-o IdentityAgent=none" not in options
 
     def test_build_ssh_options_strict_host_checking_false(self) -> None:
         """Test build_ssh_options with strict_host_checking=False."""
@@ -86,38 +91,39 @@ class TestBuildSshOptions:
             assert option in options
 
     def test_build_ssh_options_all_parameters(self) -> None:
-        """Test build_ssh_options with all parameters set."""
+        """Test build_ssh_options with all parameters specified."""
         key_path = "/path/to/key"
         known_hosts_path = "/path/to/known_hosts"
-        additional = ["-o ServerAliveInterval=60"]
+        connect_timeout = 15
 
-        options = build_ssh_options(
-            key_path=key_path,
-            known_hosts_path=known_hosts_path,
-            identities_only=True,
-            strict_host_checking=True,
-            batch_mode=True,
-            connect_timeout=15,
-            additional_options=additional,
-        )
+        with patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}):
+            options = build_ssh_options(
+                key_path=key_path,
+                known_hosts_path=known_hosts_path,
+                identities_only=True,
+                strict_host_checking=True,
+                batch_mode=True,
+                connect_timeout=connect_timeout,
+                additional_options=["-o CustomOption=value"],
+            )
 
-        expected_options = [
-            "-F /dev/null",
-            f"-i {key_path}",
-            f"-o UserKnownHostsFile={known_hosts_path}",
-            "-o IdentitiesOnly=yes",
-            "-o IdentityAgent=none",
-            "-o BatchMode=yes",
-            "-o PreferredAuthentications=publickey",
-            "-o PasswordAuthentication=no",
-            "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o ConnectTimeout=15",
-            "-o StrictHostKeyChecking=yes",
-            "-o ServerAliveInterval=60",
-        ]
+            expected_options = [
+                "-F /dev/null",
+                f"-i {key_path}",
+                f"-o UserKnownHostsFile={known_hosts_path}",
+                "-o IdentitiesOnly=yes",
+                "-o IdentityAgent=none",
+                "-o BatchMode=yes",
+                "-o PreferredAuthentications=publickey",
+                "-o PasswordAuthentication=no",
+                "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-o ConnectTimeout=15",
+                "-o StrictHostKeyChecking=yes",
+                "-o CustomOption=value",
+            ]
 
-        for expected_option in expected_options:
-            assert expected_option in options
+            for expected_option in expected_options:
+                assert expected_option in options
 
     def test_build_ssh_options_pathlib_paths(self) -> None:
         """Test build_ssh_options with pathlib.Path objects."""
@@ -140,7 +146,10 @@ class TestBuildGitSshCommand:
         self, caplog: LogCaptureFixture
     ) -> None:
         """Test build_git_ssh_command with minimal parameters."""
-        with caplog.at_level(logging.DEBUG):
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}),
+        ):
             command = build_git_ssh_command()
 
         assert command.startswith("ssh ")
@@ -294,11 +303,13 @@ class TestIntegration:
         key_path = "/path/to/key"
         known_hosts_path = "/path/to/known_hosts"
 
-        # Build SSH command
-        command = build_git_ssh_command(
-            key_path=key_path,
-            known_hosts_path=known_hosts_path,
-        )
+        # Ensure secure SSH options by not respecting user SSH config
+        with patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}):
+            # Build SSH command
+            command = build_git_ssh_command(
+                key_path=key_path,
+                known_hosts_path=known_hosts_path,
+            )
 
         # Verify command structure
         assert command.startswith("ssh ")
@@ -361,20 +372,22 @@ class TestIntegration:
             {"identities_only": False, "batch_mode": False},
         ]
 
-        for combo in combinations:
-            params: dict[str, Any] = {**base_params, **combo}
-            command = build_git_ssh_command(**params)
+        # Ensure secure SSH options by not respecting user SSH config
+        with patch.dict(os.environ, {"G2G_RESPECT_USER_SSH": "false"}):
+            for combo in combinations:
+                params: dict[str, Any] = {**base_params, **combo}
+                command = build_git_ssh_command(**params)
 
-            # Should always start with ssh and contain basic options
-            assert command.startswith("ssh ")
-            assert "-F /dev/null" in command
+                # Should always start with ssh and contain basic options
+                assert command.startswith("ssh ")
+                assert "-F /dev/null" in command
 
-            # Check specific combinations
-            if not combo.get("identities_only", True):
-                assert "-o IdentitiesOnly=yes" not in command
+                # Check specific combinations
+                if not combo.get("identities_only", True):
+                    assert "-o IdentitiesOnly=yes" not in command
 
-            if not combo.get("strict_host_checking", True):
-                assert "-o StrictHostKeyChecking=yes" not in command
+                if not combo.get("strict_host_checking", True):
+                    assert "-o StrictHostKeyChecking=yes" not in command
 
-            if not combo.get("batch_mode", True):
-                assert "-o BatchMode=yes" not in command
+                if not combo.get("batch_mode", True):
+                    assert "-o BatchMode=yes" not in command

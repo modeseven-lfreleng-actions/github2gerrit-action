@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from unittest.mock import patch
 
 import pytest
 
@@ -286,8 +287,12 @@ def test_overlay_missing_prefers_primary_and_fills_empty_strings() -> None:
     assert merged["D"] == "added"
 
 
-def test_derive_gerrit_parameters_basic() -> None:
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_basic(mock_derive_creds) -> None:
     """Test basic parameter derivation from organization name."""
+    # Mock to return None for both SSH user and git email, forcing fallback
+    mock_derive_creds.return_value = (None, None)
+
     derived = derive_gerrit_parameters("onap")
     assert derived["GERRIT_SSH_USER_G2G"] == "onap.gh2gerrit"
     assert (
@@ -297,8 +302,12 @@ def test_derive_gerrit_parameters_basic() -> None:
     assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
 
 
-def test_derive_gerrit_parameters_case_normalization() -> None:
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_case_normalization(mock_derive_creds) -> None:
     """Test that organization name is normalized to lowercase."""
+    # Mock to return None for both SSH user and git email, forcing fallback
+    mock_derive_creds.return_value = (None, None)
+
     derived = derive_gerrit_parameters("ONAP")
     assert derived["GERRIT_SSH_USER_G2G"] == "onap.gh2gerrit"
     assert (
@@ -308,8 +317,12 @@ def test_derive_gerrit_parameters_case_normalization() -> None:
     assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
 
 
-def test_derive_gerrit_parameters_with_spaces() -> None:
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_with_spaces(mock_derive_creds) -> None:
     """Test that spaces in organization name are handled."""
+    # Mock to return None for both SSH user and git email, forcing fallback
+    mock_derive_creds.return_value = (None, None)
+
     derived = derive_gerrit_parameters("  o-ran-sc  ")
     assert derived["GERRIT_SSH_USER_G2G"] == "o-ran-sc.gh2gerrit"
     assert (
@@ -325,13 +338,55 @@ def test_derive_gerrit_parameters_empty_org() -> None:
     assert derive_gerrit_parameters(None) == {}
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_ssh_fallback(mock_derive_creds) -> None:
+    """Test that function falls back to organization-based values when SSH config not found."""
+    # Mock SSH config and git config to return None (simulating no local config)
+    mock_derive_creds.return_value = (None, None)
+
+    derived = derive_gerrit_parameters("onap")
+
+    # Verify it falls back to organization-based synthetic defaults
+    assert derived["GERRIT_SSH_USER_G2G"] == "onap.gh2gerrit"
+    assert (
+        derived["GERRIT_SSH_USER_G2G_EMAIL"]
+        == "releng+onap-gh2gerrit@linuxfoundation.org"
+    )
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
+
+    # Verify the SSH config lookup was attempted
+    mock_derive_creds.assert_called_once_with("gerrit.onap.org", "onap")
+
+
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_ssh_found(mock_derive_creds) -> None:
+    """Test that function uses SSH config values when found."""
+    # Mock SSH config to return actual user credentials
+    mock_derive_creds.return_value = ("myuser", "myemail@example.com")
+
+    derived = derive_gerrit_parameters("onap")
+
+    # Verify it uses the SSH config values instead of organization fallback
+    assert derived["GERRIT_SSH_USER_G2G"] == "myuser"
+    assert derived["GERRIT_SSH_USER_G2G_EMAIL"] == "myemail@example.com"
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
+
+    # Verify the SSH config lookup was attempted
+    mock_derive_creds.assert_called_once_with("gerrit.onap.org", "onap")
+
+
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_fills_missing_values(
+    mock_derive_creds,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Test that derivation only fills missing or empty values in GitHub
     Actions context.
     """
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
+
     # Simulate GitHub Actions environment to enable derivation
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
 
@@ -384,10 +439,15 @@ def test_apply_parameter_derivation_no_org() -> None:
     assert result == cfg
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_github_actions_context(
+    mock_derive_creds,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that derivation works automatically in GitHub Actions context."""
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
+
     # Simulate GitHub Actions environment
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
 
@@ -409,10 +469,14 @@ def test_apply_parameter_derivation_github_actions_context(
     assert result["OTHER_KEY"] == "value"
 
 
-def test_apply_parameter_derivation_local_cli_with_explicit_disable(
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_local_cli_explicit_disabled(
+    mock_derive_creds,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that derivation is disabled when explicitly set to false."""
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
     # Simulate local CLI environment (no GitHub Actions context)
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -431,10 +495,15 @@ def test_apply_parameter_derivation_local_cli_with_explicit_disable(
     assert result["OTHER_KEY"] == "value"
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_local_cli_default_enabled(
+    mock_derive_creds,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test that derivation works by default in local CLI context."""
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
+
     # Simulate local CLI environment with derivation enabled by default
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -563,14 +632,18 @@ def test_save_derived_parameters_to_config_existing_section(
     assert 'GERRIT_SERVER = "gerrit.onap.org"' in updated_content  # Added
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_saves_to_config_local_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_derive_creds, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Test that apply_parameter_derivation saves derived parameters to config
     in local CLI mode.
     """
     from github2gerrit.config import apply_parameter_derivation
+
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
 
     config_file = tmp_path / "config.txt"
     config_file.write_text("", encoding="utf-8")
@@ -602,14 +675,18 @@ def test_apply_parameter_derivation_saves_to_config_local_cli(
     assert 'GERRIT_SSH_USER_G2G = "o-ran-sc.gh2gerrit"' in updated_content
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_no_save_github_actions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_derive_creds, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Test that apply_parameter_derivation does not save to config in GitHub
     Actions by default.
     """
     from github2gerrit.config import apply_parameter_derivation
+
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
 
     config_file = tmp_path / "config.txt"
     config_file.write_text("", encoding="utf-8")
@@ -633,11 +710,15 @@ def test_apply_parameter_derivation_no_save_github_actions(
     assert updated_content == ""  # File should remain empty
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_disabled_auto_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_derive_creds, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test that auto-save can be disabled with G2G_AUTO_SAVE_CONFIG=false."""
     from github2gerrit.config import apply_parameter_derivation
+
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
 
     config_file = tmp_path / "config.txt"
     config_file.write_text("", encoding="utf-8")
@@ -663,14 +744,18 @@ def test_apply_parameter_derivation_disabled_auto_save(
     assert updated_content == ""  # File should remain empty
 
 
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_github_actions_explicit_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_derive_creds, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Test that GitHub Actions can explicitly enable auto-save with
     G2G_AUTO_SAVE_CONFIG=true.
     """
     from github2gerrit.config import apply_parameter_derivation
+
+    # Mock SSH config to return None, forcing fallback to org values
+    mock_derive_creds.return_value = (None, None)
 
     config_file = tmp_path / "config.txt"
     config_file.write_text("", encoding="utf-8")
@@ -679,6 +764,7 @@ def test_apply_parameter_derivation_github_actions_explicit_save(
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
     monkeypatch.setenv("G2G_AUTO_SAVE_CONFIG", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
 
     cfg = {
         "GERRIT_SSH_USER_G2G": "",
@@ -693,3 +779,71 @@ def test_apply_parameter_derivation_github_actions_explicit_save(
     updated_content = config_file.read_text(encoding="utf-8")
     assert "[onap]" in updated_content
     assert 'GERRIT_SSH_USER_G2G = "onap.gh2gerrit"' in updated_content
+
+
+def test_save_derived_parameters_skipped_in_dry_run_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that config file is not updated during dry-run mode."""
+    from github2gerrit.config import save_derived_parameters_to_config
+
+    config_file = tmp_path / "config.txt"
+    original_content = '[default]\nGERRIT_SERVER = "gerrit.example.org"\n'
+    config_file.write_text(original_content, encoding="utf-8")
+
+    # Simulate local CLI environment with dry-run enabled
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("DRY_RUN", "true")
+
+    derived_params = {
+        "GERRIT_SSH_USER_G2G": "onap.gh2gerrit",
+        "GERRIT_SSH_USER_G2G_EMAIL": "onap.gh2gerrit@linuxfoundation.org",
+    }
+
+    save_derived_parameters_to_config("onap", derived_params, str(config_file))
+
+    # Content should remain unchanged in dry-run mode
+    updated_content = config_file.read_text(encoding="utf-8")
+    assert updated_content == original_content
+    assert "[onap]" not in updated_content
+    assert "GERRIT_SSH_USER_G2G" not in updated_content
+
+
+def test_save_derived_parameters_works_when_dry_run_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that config file is updated when dry-run is disabled or not set."""
+    from github2gerrit.config import save_derived_parameters_to_config
+
+    config_file = tmp_path / "config.txt"
+    original_content = '[default]\nGERRIT_SERVER = "gerrit.example.org"\n'
+    config_file.write_text(original_content, encoding="utf-8")
+
+    # Simulate local CLI environment with dry-run explicitly disabled
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    derived_params = {
+        "GERRIT_SSH_USER_G2G": "onap.gh2gerrit",
+        "GERRIT_SSH_USER_G2G_EMAIL": "onap.gh2gerrit@linuxfoundation.org",
+    }
+
+    save_derived_parameters_to_config("onap", derived_params, str(config_file))
+
+    # Content should be updated when dry-run is disabled
+    updated_content = config_file.read_text(encoding="utf-8")
+    assert "[onap]" in updated_content
+    assert "GERRIT_SSH_USER_G2G" in updated_content
+
+    # Reset and test with DRY_RUN not set at all
+    config_file.write_text(original_content, encoding="utf-8")
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    save_derived_parameters_to_config("onap", derived_params, str(config_file))
+
+    # Content should still be updated when DRY_RUN is not set
+    updated_content = config_file.read_text(encoding="utf-8")
+    assert "[onap]" in updated_content
+    assert "GERRIT_SSH_USER_G2G" in updated_content
