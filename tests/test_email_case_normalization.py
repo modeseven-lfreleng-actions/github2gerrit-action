@@ -231,6 +231,81 @@ SOME_OTHER_SETTING = "value"
         updated_content = config_path.read_text(encoding="utf-8")
         assert updated_content == original_content
 
+    def test_update_config_skipped_in_dry_run_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that config file is not updated during dry-run mode."""
+        config_path = tmp_path / "test_config.txt"
+
+        config_content = """[testorg]
+REVIEWERS_EMAIL = "Test.User@Example.COM"
+"""
+
+        config_path.write_text(config_content, encoding="utf-8")
+        original_content = config_content
+
+        # Test various dry-run flag values
+        dry_run_values = ["true", "TRUE", "1", "yes", "YES"]
+
+        for dry_run_value in dry_run_values:
+            # Reset config file
+            config_path.write_text(original_content, encoding="utf-8")
+
+            # Set up environment with dry-run enabled
+            monkeypatch.setenv("ORGANIZATION", "testorg")
+            monkeypatch.setenv("G2G_CONFIG_PATH", str(config_path))
+            monkeypatch.setenv("DRY_RUN", dry_run_value)
+
+            # Attempt to normalize emails
+            original_emails = ["Test.User@Example.COM"]
+            self.orch._update_config_with_normalized_emails(original_emails)
+
+            # Content should remain unchanged in dry-run mode
+            updated_content = config_path.read_text(encoding="utf-8")
+            assert updated_content == original_content, (
+                f"Failed for DRY_RUN={dry_run_value}"
+            )
+            assert "Test.User@Example.COM" in updated_content
+            assert "test.user@example.com" not in updated_content
+
+    def test_update_config_works_when_dry_run_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that config file is updated when dry-run is disabled or not set."""
+        config_path = tmp_path / "test_config.txt"
+
+        config_content = """[testorg]
+REVIEWERS_EMAIL = "Test.User@Example.COM"
+"""
+
+        config_path.write_text(config_content, encoding="utf-8")
+
+        # Test with dry-run explicitly disabled
+        monkeypatch.setenv("ORGANIZATION", "testorg")
+        monkeypatch.setenv("G2G_CONFIG_PATH", str(config_path))
+        monkeypatch.setenv("DRY_RUN", "false")
+
+        # Attempt to normalize emails
+        original_emails = ["Test.User@Example.COM"]
+        self.orch._update_config_with_normalized_emails(original_emails)
+
+        # Content should be updated when dry-run is disabled
+        updated_content = config_path.read_text(encoding="utf-8")
+        assert "test.user@example.com" in updated_content
+        assert "Test.User@Example.COM" not in updated_content
+
+        # Reset and test with DRY_RUN not set at all
+        config_path.write_text(config_content, encoding="utf-8")
+        monkeypatch.delenv("DRY_RUN", raising=False)
+
+        # Attempt to normalize emails again
+        self.orch._update_config_with_normalized_emails(original_emails)
+
+        # Content should still be updated when DRY_RUN is not set
+        updated_content = config_path.read_text(encoding="utf-8")
+        assert "test.user@example.com" in updated_content
+        assert "Test.User@Example.COM" not in updated_content
+
     def test_integration_email_patterns(self) -> None:
         """Test various email patterns in error messages."""
         test_cases = [

@@ -206,9 +206,14 @@ def extract_dependency_package_from_subject(subject: str) -> str:
     """
     s = (subject or "").lower()
     patterns = [
-        r"(?:chore:\s*)?bump\s+([^\s]+)\s+from\s+",
-        r"(?:chore:\s*)?update\s+([^\s]+)\s+from\s+",
-        r"(?:chore:\s*)?upgrade\s+([^\s]+)\s+from\s+",
+        # Full version with "from" clause
+        r"(?:chore.*?:\s*)?bump\s+([^\s]+)\s+from\s+",
+        r"(?:chore.*?:\s*)?update\s+([^\s]+)\s+from\s+",
+        r"(?:chore.*?:\s*)?upgrade\s+([^\s]+)\s+from\s+",
+        # Truncated version without "from" clause (for Gerrit subjects)
+        r"(?:chore.*?:\s*)?bump\s+([^\s]+)\s*$",
+        r"(?:chore.*?:\s*)?update\s+([^\s]+)\s*$",
+        r"(?:chore.*?:\s*)?upgrade\s+([^\s]+)\s*$",
     ]
     for pat in patterns:
         m = re.search(pat, s)
@@ -319,6 +324,7 @@ def score_subjects(
         # Prefer package equality for dependency updates
         pkg_src = extract_dependency_package_from_subject(src)
         pkg_cand = extract_dependency_package_from_subject(candidate_subject)
+
         if pkg_src and pkg_cand and pkg_src == pkg_cand:
             return ScoreResult(
                 score=1.0, reasons=[f"Same dependency package: {pkg_src}"]

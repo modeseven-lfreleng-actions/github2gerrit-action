@@ -468,7 +468,7 @@ class TestStepDependencies:
         install_idx = next(
             i
             for i, name in enumerate(step_names)
-            if "Install required dependencies" in name
+            if "Setup github2gerrit" in name
         )
 
         assert python_idx < install_idx
@@ -726,7 +726,7 @@ class TestPerformanceConsiderations:
         # Installation should use UV
         install_step = None
         for step in steps:
-            if "Install required dependencies" in step.get("name", ""):
+            if "Setup github2gerrit" in step.get("name", ""):
                 install_step = step
                 break
 
@@ -775,7 +775,7 @@ class TestFullWorkflow:
             "Setup Python",
             "Setup uv",
             "Checkout repository",
-            "Install required dependencies",
+            "Setup github2gerrit",
             "Run github2gerrit Python CLI",
             "Capture outputs",
         ]

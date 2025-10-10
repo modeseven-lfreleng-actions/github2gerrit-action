@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from github2gerrit import github_api as ghapi
+from github2gerrit.error_codes import GitHub2GerritError
 
 
 def test_build_client_uses_env_token_and_returns_dummy(
@@ -222,7 +223,7 @@ def test_build_client_raises_without_token(
 ) -> None:
     # Ensure no token is set so build_client raises before any network use
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    with pytest.raises(ValueError):
+    with pytest.raises(GitHub2GerritError):
         ghapi.build_client()
 
 
@@ -236,7 +237,7 @@ def test_get_repo_from_env_raises_when_env_missing(
         def get_repo(self, full: str) -> object:
             raise AssertionError("error")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(GitHub2GerritError):
         ghapi.get_repo_from_env(DummyClient())
 
 

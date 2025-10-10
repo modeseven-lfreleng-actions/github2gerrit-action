@@ -48,6 +48,110 @@ Gerrit `Change-Id` trailers to create or update changes.
 - The workflow runs with `pull_request_target` or via
   `workflow_dispatch` using a valid PR context.
 
+## Error Codes
+
+The `github2gerrit` tool uses standardized exit codes for different failure types. This helps with automation,
+debugging, and providing clear feedback to users.
+
+| Exit Code | Description | Common Causes | Resolution |
+|-----------|-------------|---------------|------------|
+| **0** | Success | Operation completed | N/A |
+| **1** | General Error | Unexpected operational failure | Check logs for details |
+| **2** | Configuration Error | Missing or invalid configuration parameters | Verify required inputs and environment variables |
+| **3** | Duplicate Error | Duplicate change detected (when not allowed) | Use `--allow-duplicates` flag or check existing changes |
+| **4** | GitHub API Error | GitHub API access or permission issues | Verify `GITHUB_TOKEN` has required permissions |
+| **5** | Gerrit Connection Error | Failed to connect to Gerrit server | Check SSH keys, server configuration, and network |
+| **6** | Network Error | Network connectivity issues | Check internet connection and firewall settings |
+| **7** | Repository Error | Git repository access or operation failed | Verify repository permissions and git configuration |
+| **8** | PR State Error | Pull request in invalid state for processing | Ensure PR is open and mergeable |
+| **9** | Validation Error | Input validation failed | Check parameter values and formats |
+
+### Common Error Messages
+
+#### GitHub API Permission Issues (Exit Code 4)
+
+```text
+❌ GitHub API query failed; provide a GITHUB_TOKEN with the required permissions
+```
+
+**Common causes:**
+
+- Missing `GITHUB_TOKEN` environment variable
+- Token lacks permissions for target repository
+- Token expired or invalid
+- Cross-repository access without proper token
+
+**Resolution:**
+
+- Configure `GITHUB_TOKEN` with a valid personal access token
+- For cross-repository workflows, use a token with access to the target repository
+- Grant required permissions: `contents: read`, `pull-requests: write`, `issues: write`
+
+#### Configuration Issues (Exit Code 2)
+
+```text
+❌ Configuration validation failed; check required parameters
+```
+
+**Common causes:**
+
+- Missing or invalid configuration parameters
+- Invalid parameter combinations
+- Missing `.gitreview` file without override parameters
+
+**Resolution:**
+
+- Verify all required inputs exist
+- Check parameter compatibility (e.g., don't use conflicting options)
+- Provide `GERRIT_SERVER`, `GERRIT_PROJECT` if `.gitreview` is missing
+
+#### Gerrit Connection Issues (Exit Code 5)
+
+```text
+❌ Gerrit connection failed; check SSH keys and server configuration
+```
+
+**Common causes:**
+
+- Invalid SSH private key
+- SSH key not added to Gerrit account
+- Incorrect Gerrit server configuration
+- Network connectivity to Gerrit server
+
+**Resolution:**
+
+- Verify SSH private key is correct and has access to Gerrit
+- Check Gerrit server hostname and port
+- Ensure network connectivity to Gerrit server
+
+### Integration Test Scenarios
+
+The improved error handling is important for integration tests that run across different repositories.
+For example, when testing the `github2gerrit-action` repository but accessing PRs in the `lfit/sandbox`
+repository, you need:
+
+1. **Cross-Repository Token Access**: Use `READ_ONLY_GITHUB_TOKEN` instead of the default `GITHUB_TOKEN`
+   for workflows that access PRs in different repositories.
+
+2. **Clear Error Messages**: If the token lacks permissions, you'll see:
+
+   ```text
+   ❌ GitHub API query failed; provide a GITHUB_TOKEN with the required permissions
+   Details: Cannot access repository 'lfit/sandbox' - check token permissions
+   ```
+
+3. **Actionable Resolution**: The error message tells you what's needed - configure a token with access
+   to the target repository.
+
+### Debugging Workflow
+
+When troubleshooting failures:
+
+1. **Check the Exit Code**: Each failure has a unique exit code to help identify the root cause
+2. **Read the Error Message**: Look for the ❌ prefixed message that explains what went wrong
+3. **Review Details**: Context appears when available
+4. **Check Logs**: Enable verbose logging with `G2G_VERBOSE=true` for detailed debugging information
+
 ### Note on sitecustomize.py
 
 This repository includes a sitecustomize.py that is automatically
@@ -92,7 +196,7 @@ Use `--allow-duplicates` or set `ALLOW_DUPLICATES=true` to override:
 github2gerrit --allow-duplicates https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   ALLOW_DUPLICATES: 'true'
 ```
@@ -113,7 +217,7 @@ github2gerrit --duplicate-types=open,merged https://github.com/org/repo
 DUPLICATE_TYPES=open,merged,abandoned github2gerrit https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   DUPLICATE_TYPES: 'open,merged'
 ```
@@ -178,7 +282,7 @@ NORMALISE_COMMIT=true github2gerrit https://github.com/org/repo
 NORMALISE_COMMIT=false github2gerrit https://github.com/org/repo
 
 # GitHub Actions
-uses: onap/github2gerrit@main
+uses: lfit/github2gerrit@main
 with:
   NORMALISE_COMMIT: 'true'  # default
   # or

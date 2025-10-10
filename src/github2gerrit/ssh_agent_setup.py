@@ -44,17 +44,34 @@ _MSG_NO_KEYS_LOADED = "No keys were loaded into SSH agent"
 _MSG_SSH_AGENT_NOT_FOUND = "ssh-agent not found in PATH"
 _MSG_SSH_ADD_NOT_FOUND = "ssh-add not found in PATH"
 _MSG_TOOL_NOT_FOUND = "Required tool '{tool_name}' not found in PATH"
+_MSG_WORKSPACE_NOT_SET = "Workspace not set"
+_MSG_NO_AGENT_AND_KEY = "No SSH agent and no key provided"
+
+
+def _raise_workspace_error() -> None:
+    """Raise error when workspace is not set."""
+    raise SSHAgentError(_MSG_WORKSPACE_NOT_SET)
+
+
+def _raise_no_keys_error() -> None:
+    """Raise error when no keys are loaded."""
+    raise SSHAgentError(_MSG_NO_KEYS_LOADED)
+
+
+def _raise_no_agent_error() -> None:
+    """Raise error when no SSH agent found and no key provided."""
+    raise SSHAgentError(_MSG_NO_AGENT_AND_KEY)
 
 
 class SSHAgentManager:
     """Manages SSH agent lifecycle and key loading for secure authentication."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path | None = None):
         """Initialize SSH agent manager.
 
         Args:
             workspace: Secure temporary directory for storing SSH files (outside
-                git workspace)
+                git workspace). Optional when using existing agent.
         """
         self.workspace = workspace
         self.agent_pid: int | None = None
@@ -106,6 +123,59 @@ class SSHAgentManager:
 
         except Exception as exc:
             raise SSHAgentError(_MSG_START_FAILED.format(error=exc)) from exc
+
+    def use_existing_agent(self) -> bool:
+        """Attempt to use an existing SSH agent.
+
+        Returns:
+            True if existing SSH agent is available and usable, False otherwise
+        """
+        try:
+            # Check if SSH_AUTH_SOCK environment variable is set
+            auth_sock = os.environ.get("SSH_AUTH_SOCK")
+            if not auth_sock:
+                log.debug("No SSH_AUTH_SOCK environment variable found")
+                return False
+
+            # Check if the socket file exists
+            if not os.path.exists(auth_sock):
+                log.debug("SSH agent socket does not exist: %s", auth_sock)
+                return False
+
+            # Try to list keys to verify agent is working
+            # Use original environment to preserve SSH_AUTH_SOCK
+            ssh_add_path = _ensure_tool_available("ssh-add")
+            result = subprocess.run(  # noqa: S603
+                [ssh_add_path, "-l"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=os.environ.copy(),  # Use original environment
+            )
+
+            if result.returncode != 0:
+                log.debug(
+                    "ssh-add failed with exit code %d: %s",
+                    result.returncode,
+                    result.stderr,
+                )
+                return False
+
+            # Store the existing agent info
+            self.auth_sock = auth_sock
+            self.agent_pid = None  # We don't own this agent
+
+            log.debug(
+                "Successfully connected to existing SSH agent: %s", auth_sock
+            )
+            log.debug("Existing agent keys: %s", result.stdout.strip())
+
+        except Exception as exc:
+            log.debug("Failed to connect to existing SSH agent: %s", exc)
+            return False
+
+        return True
 
     def add_key(self, private_key_content: str) -> None:
         """Add a private key to the SSH agent.
@@ -164,7 +234,10 @@ class SSHAgentManager:
             # Create tool-specific SSH directory in secure temp location
             # Note: workspace is now a separate secure temp directory outside
             # git workspace
-            tool_ssh_dir = self.workspace / ".ssh-g2g"
+            if self.workspace is None:
+                _raise_workspace_error()
+            workspace = cast(Path, self.workspace)  # Type narrowing for mypy
+            tool_ssh_dir = workspace / ".ssh-g2g"
             tool_ssh_dir.mkdir(mode=0o700, exist_ok=True)
 
             # Write known hosts file (normalize/augment with [host]:port
@@ -202,17 +275,30 @@ class SSHAgentManager:
         if not self.known_hosts_path:
             raise SSHAgentError(_MSG_HOSTS_NOT_CONFIGURED)
 
-        ssh_options = [
-            "-F /dev/null",
-            f"-o UserKnownHostsFile={self.known_hosts_path}",
-            "-o IdentitiesOnly=no",  # Allow SSH agent
-            "-o BatchMode=yes",
-            "-o PreferredAuthentications=publickey",
-            "-o StrictHostKeyChecking=yes",
-            "-o PasswordAuthentication=no",
-            "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o ConnectTimeout=10",
-        ]
+        import os
+
+        # Check if we should respect user SSH config
+        respect_user_ssh = os.getenv(
+            "G2G_RESPECT_USER_SSH", "false"
+        ).lower() in ("true", "1", "yes")
+
+        ssh_options = []
+
+        if not respect_user_ssh:
+            ssh_options.append("-F /dev/null")
+
+        ssh_options.extend(
+            [
+                f"-o UserKnownHostsFile={self.known_hosts_path}",
+                "-o IdentitiesOnly=no",  # Allow SSH agent
+                "-o BatchMode=yes",
+                "-o PreferredAuthentications=publickey",
+                "-o StrictHostKeyChecking=yes",
+                "-o PasswordAuthentication=no",
+                "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-o ConnectTimeout=10",
+            ]
+        )
 
         return f"ssh {' '.join(ssh_options)}"
 
@@ -264,13 +350,16 @@ class SSHAgentManager:
     def cleanup(self) -> None:
         """Securely clean up SSH agent and temporary files."""
         try:
-            # Kill SSH agent if we started it
+            # Only kill SSH agent if we started it (agent_pid is set)
+            # Never kill an existing SSH agent that we're borrowing
             if self.agent_pid:
                 try:
                     run_cmd(["/bin/kill", str(self.agent_pid)], timeout=5)
                     log.debug("SSH agent (PID %d) terminated", self.agent_pid)
                 except Exception as exc:
                     log.warning("Failed to kill SSH agent: %s", exc)
+            else:
+                log.debug("Not terminating SSH agent (using existing agent)")
 
             # Restore original environment
             for key, value in self._original_env.items():
@@ -280,6 +369,8 @@ class SSHAgentManager:
                     del os.environ[key]
 
             # Securely clean up temporary files
+            if self.workspace is None:
+                return
             tool_ssh_dir = self.workspace / ".ssh-g2g"
             if tool_ssh_dir.exists():
                 import shutil
@@ -335,11 +426,12 @@ def setup_ssh_agent_auth(
     Args:
         workspace: Secure temporary directory for SSH files (outside git
             workspace)
-        private_key_content: SSH private key content
+        private_key_content: SSH private key content (empty string to use
+            existing agent)
         known_hosts_content: Known hosts content
 
     Returns:
-        Configured SSHAgentManager instance
+        Configured SSH agent manager
 
     Raises:
         SSHAgentError: If setup fails
@@ -347,7 +439,48 @@ def setup_ssh_agent_auth(
     manager = SSHAgentManager(workspace)
 
     try:
-        # Start SSH agent
+        # First, always try to use existing SSH agent if available
+        log.debug("Checking for existing SSH agent...")
+        log.debug(
+            "SSH_AUTH_SOCK environment variable: %s",
+            os.environ.get("SSH_AUTH_SOCK"),
+        )
+        if manager.use_existing_agent():
+            log.debug("Using existing SSH agent successfully")
+            # Setup known hosts for existing agent
+            manager.setup_known_hosts(known_hosts_content)
+
+            # Verify existing agent has keys
+            keys_list = manager.list_keys()
+            if "No keys loaded" in keys_list:
+                log.debug("Existing SSH agent has no keys loaded")
+                # If we have a private key, we can start a new agent
+                if private_key_content.strip():
+                    log.debug(
+                        "Starting new SSH agent with provided private key"
+                    )
+                    # Fall through to start new agent
+                else:
+                    log.debug("No private key provided for new agent")
+                    _raise_no_keys_error()
+            else:
+                log.debug(
+                    "SSH agent auth configured successfully (existing agent)"
+                )
+                log.debug("Loaded keys: %s", keys_list)
+                return manager
+        else:
+            log.debug("No existing SSH agent found")
+
+        # Only start new SSH agent if we have a private key to load
+        if not private_key_content.strip():
+            log.debug(
+                "No private key provided and no existing SSH agent available"
+            )
+            _raise_no_agent_error()
+
+        # Start new SSH agent and add the private key
+        log.debug("Starting new SSH agent with provided private key")
         manager.start_agent()
 
         # Add the private key
@@ -361,7 +494,9 @@ def setup_ssh_agent_auth(
         if "No keys loaded" in keys_list:
             _raise_no_keys_error()
 
-        log.debug("SSH agent authentication configured successfully")
+        log.debug(
+            "SSH agent authentication configured successfully (new agent)"
+        )
         log.debug("Loaded keys: %s", keys_list)
 
     except Exception:
@@ -415,8 +550,3 @@ def _raise_ssh_agent_not_found() -> None:
 def _raise_ssh_add_not_found() -> None:
     """Raise SSH add not found error."""
     raise SSHAgentError(_MSG_SSH_ADD_NOT_FOUND)
-
-
-def _raise_no_keys_error() -> None:
-    """Raise no keys loaded error."""
-    raise SSHAgentError(_MSG_NO_KEYS_LOADED)

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 name: github2gerrit
-description: "Creates Gerrit changes from GitHub pull requests"
+description: "Creates Gerrit changes from GitHub pull requests with comprehensive error handling and clear exit codes"
 
 inputs:
   # Optional
@@ -140,7 +140,7 @@ runs:
 
     - name: Setup uv
       # yamllint disable-line rule:line-length
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d  # v7.1.0
 
     - name: Checkout repository
       # yamllint disable-line rule:line-length
@@ -185,18 +185,18 @@ runs:
           echo "RESOLVED_ISSUE_ID=$val" >> "$GITHUB_ENV"
         fi
 
-    - name: Install required dependencies
+    - name: Setup github2gerrit
       shell: bash
       run: |
         set -euo pipefail
         uv --version
-        # Install from PyPI when called from external repos, local source for self-testing
+        # Install locally for self-testing, use uvx for external repos
         if [[ "${{ github.repository }}" == "modeseven-lfreleng-actions/github2gerrit-action" ]]; then
           echo "Installing from local source (self-testing)"
           uv pip install --system ${{ github.action_path }}
         else
-          echo "Installing from PyPI (external repository)"
-          uv pip install --system github2gerrit
+          echo "Will use uvx to run latest PyPI release (external repository)"
+          # No installation needed - uvx will handle it
         fi
 
     - name: Validate PR_NUMBER usage (non-dispatch)
@@ -310,8 +310,14 @@ runs:
         G2G_TEST_MODE: "false"
       run: |
         set -euo pipefail
-        echo "Invoking github2gerrit Python CLI..."
-        python -m github2gerrit.cli
+        # Use different invocation methods based on repository
+        if [[ "${{ github.repository }}" == "modeseven-lfreleng-actions/github2gerrit-action" ]]; then
+          echo "Invoking github2gerrit Python CLI (local source)..."
+          python -m github2gerrit.cli
+        else
+          echo "Invoking github2gerrit via uvx (latest PyPI release)..."
+          uvx --from github2gerrit github2gerrit
+        fi
 
     - name: Capture outputs (best-effort)
       id: capture-outputs

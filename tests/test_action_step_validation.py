@@ -45,10 +45,10 @@ class TestActionStepValidation:
         # Define expected order dependencies
         order_requirements = [
             ("Setup Python", "Setup uv"),
-            ("Setup Python", "Install required dependencies"),
-            ("Setup uv", "Install required dependencies"),
+            ("Setup Python", "Setup github2gerrit"),
+            ("Setup uv", "Setup github2gerrit"),
             ("Checkout repository", "Run github2gerrit Python CLI"),
-            ("Install required dependencies", "Run github2gerrit Python CLI"),
+            ("Setup github2gerrit", "Run github2gerrit Python CLI"),
             ("Run github2gerrit Python CLI", "Capture outputs (best-effort)"),
         ]
 
@@ -209,7 +209,7 @@ class TestActionStepValidation:
             (
                 step
                 for step in steps
-                if "Install required dependencies" in step.get("name", "")
+                if "Setup github2gerrit" in step.get("name", "")
             ),
             None,
         )
@@ -219,11 +219,11 @@ class TestActionStepValidation:
 
         script = install_step["run"]
         assert "uv --version" in script
-        # Should contain both PyPI and local installation logic
+        # Should contain both local installation and uvx logic
         assert "github.repository" in script
         assert "modeseven-lfreleng-actions/github2gerrit-action" in script
         assert "uv pip install --system ${{ github.action_path }}" in script
-        assert "uv pip install --system github2gerrit" in script
+        assert "Will use uvx to run latest PyPI release" in script
 
     def test_cli_execution_step(self, action_config):
         """Test CLI execution step configuration."""

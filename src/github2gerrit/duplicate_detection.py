@@ -28,6 +28,7 @@ from .github_api import GhRepository
 from .github_api import build_client
 from .github_api import get_repo_from_env
 from .models import GitHubContext
+from .rich_display import safe_console_print
 from .trailers import extract_github_metadata
 
 
@@ -452,8 +453,10 @@ class DuplicateDetector:
                 return []
 
         # Build query path for centralized client
+        # Try CURRENT_REVISION instead of CURRENT_COMMIT to get revision data
         query_path = (
-            f"/changes/?q={encoded_q}&n=50&o=CURRENT_COMMIT&o=CURRENT_FILES"
+            f"/changes/?q={encoded_q}&n=50&o=CURRENT_REVISION&o=CURRENT_FILES"
+            "&o=MESSAGES"
         )
 
         log.debug(
@@ -474,6 +477,7 @@ class DuplicateDetector:
             dup_filter,
             cutoff_date,
         )
+
         if changes:
             sample_subjects = ", ".join(
                 str(c.get("subject") or "")[:60] for c in changes[:5]
@@ -490,13 +494,32 @@ class DuplicateDetector:
 
             for c in changes:
                 # Extract commit message and check for GitHub trailers
+                # Extract commit message and check for GitHub trailers
+
+                # Try to get commit message from revisions first
                 rev = str(c.get("current_revision") or "")
                 revs_obj = c.get("revisions")
                 revs = revs_obj if isinstance(revs_obj, dict) else {}
-                cur_obj = revs.get(rev)
+                cur_obj = revs.get(rev) if rev else {}
                 cur = cur_obj if isinstance(cur_obj, dict) else {}
                 commit = cur.get("commit") or {}
                 msg = str(commit.get("message") or "")
+
+                # If no commit message from revisions, try messages field
+                if not msg:
+                    messages = c.get("messages", [])
+                    if (
+                        messages
+                        and isinstance(messages, list)
+                        and len(messages) > 0
+                    ):
+                        # Use the last message (most recent commit)
+                        last_msg = messages[-1] if messages else {}
+                        msg = (
+                            str(last_msg.get("message", ""))
+                            if isinstance(last_msg, dict)
+                            else ""
+                        )
 
                 if msg:
                     github_metadata = extract_github_metadata(msg)
@@ -578,18 +601,47 @@ class DuplicateDetector:
                     continue
                 # Extract commit message and files from revisions
                 # (CURRENT_COMMIT, CURRENT_FILES)
+                # Get subject and body from commit message
+                subj = str(c.get("subject") or "")
+
+                # Try to get commit message from revisions first
                 rev = str(c.get("current_revision") or "")
                 revs_obj = c.get("revisions")
                 revs = revs_obj if isinstance(revs_obj, dict) else {}
-                cur_obj = revs.get(rev)
+                cur_obj = revs.get(rev) if rev else {}
                 cur = cur_obj if isinstance(cur_obj, dict) else {}
                 commit = cur.get("commit") or {}
                 msg = str(commit.get("message") or "")
+
+                # If no commit message from revisions, try messages field
+                if not msg:
+                    messages = c.get("messages", [])
+                    if (
+                        messages
+                        and isinstance(messages, list)
+                        and len(messages) > 0
+                    ):
+                        # Use the last message (most recent commit)
+                        last_msg = messages[-1] if messages else {}
+                        msg = (
+                            str(last_msg.get("message", ""))
+                            if isinstance(last_msg, dict)
+                            else ""
+                        )
+
                 cand_body_raw = ""
                 if "\n" in msg:
                     cand_body_raw = msg.split("\n", 1)[1]
                 cand_body = remove_commit_trailers(cand_body_raw)
+
+                # Try to get files from current revision, fallback to files
+                # field
                 files_dict = cur.get("files") or {}
+                if not files_dict:
+                    # Some Gerrit versions may not populate revisions.files
+                    # For now, we'll have empty files which gives 0 file score
+                    pass
+
                 cand_files = [
                     p
                     for p in files_dict
@@ -653,11 +705,45 @@ class DuplicateDetector:
                         )
                     )
 
-                # Collect all candidates above threshold
-                if agg >= config.similarity_threshold and ref:
+                # Special handling for perfect dependency package matches
+                is_perfect_dependency_match = (
+                    s_res.score == 1.0
+                    and len(s_res.reasons) > 0
+                    and any(
+                        "Same dependency package:" in reason
+                        for reason in s_res.reasons
+                    )
+                )
+
+                # Collect candidates above threshold OR perfect dependency
+                # matches
+                dependency_threshold = (
+                    0.45  # Lower threshold for perfect dependency matches
+                )
+                effective_threshold = (
+                    dependency_threshold
+                    if is_perfect_dependency_match
+                    else config.similarity_threshold
+                )
+
+                if agg >= effective_threshold and ref:
                     hits.append((agg, ref, num))
                     if isinstance(num, int):
                         all_nums.append(num)
+
+                    # Log special handling
+                    if (
+                        is_perfect_dependency_match
+                        and agg < config.similarity_threshold
+                    ):
+                        log.debug(
+                            "Perfect dependency match found below normal "
+                            "threshold: score=%.2f (threshold=%.2f, "
+                            "dependency_threshold=%.2f)",
+                            agg,
+                            config.similarity_threshold,
+                            dependency_threshold,
+                        )
 
             log.debug(
                 "Similarity scoring found %d hit(s) (threshold=%.2f)",
@@ -667,10 +753,11 @@ class DuplicateDetector:
             if hits:
                 hits_sorted = sorted(hits, key=lambda t: t[0], reverse=True)
 
-                # Log each matching change individually
+                # Log each matching change individually and display on console
                 for s, u, _ in hits_sorted:
                     if u:
-                        log.info("Score: %.2f  URL: %s", s, u)
+                        log.debug("Score: %.2f  URL: %s", s, u)
+                        safe_console_print(f"🔀 Duplicate change: {u}")
                 msg = (
                     f"Similar Gerrit change(s) detected "
                     f"[≥ {config.similarity_threshold:.2f}]"
@@ -696,6 +783,7 @@ class DuplicateDetector:
                 match_lines.append(f"Score: 1.0  URL: {url}")
                 duplicate_urls.append(url)
                 log.debug("Score: 1.0  URL: %s", url)
+                safe_console_print(f"🔀 Duplicate change: {url}")
             else:
                 match_lines.append(f"Score: 1.0  URL: change {n}")
                 duplicate_urls.append(f"change {n}")
@@ -740,18 +828,35 @@ def check_for_duplicates(
         log.debug("No PR number provided, skipping duplicate check")
         return
 
+    log.debug("Starting duplicate detection for PR #%s", gh.pr_number)
+    log.debug(
+        "Duplicate check parameters: allow_duplicates=%s, lookback_days=%s",
+        allow_duplicates,
+        lookback_days,
+    )
+    log.debug("Expected GitHub hash: %s", expected_github_hash)
+
     try:
         client = build_client()
         repo = get_repo_from_env(client)
+        log.debug(
+            "GitHub repository: %s", getattr(repo, "full_name", "unknown")
+        )
 
         # Get the target PR
         target_pr = repo.get_pull(gh.pr_number)
+        log.debug("Retrieved PR #%s: %s", target_pr.number, target_pr.title)
 
         # Create detector and check
+        duplicate_types = os.getenv("DUPLICATE_TYPES", "open")
+        log.debug(
+            "Checking for duplicates in Gerrit changes with states: %s",
+            duplicate_types,
+        )
         detector = DuplicateDetector(
             repo,
             lookback_days=lookback_days,
-            duplicates_filter=os.getenv("DUPLICATE_TYPES", "open"),
+            duplicates_filter=duplicate_types,
         )
         detector.check_for_duplicates(
             target_pr,
@@ -760,7 +865,9 @@ def check_for_duplicates(
             expected_github_hash=expected_github_hash,
         )
 
-        log.debug("Duplicate check completed for PR #%d", gh.pr_number)
+        log.debug(
+            "Duplicate check completed successfully for PR #%d", gh.pr_number
+        )
 
     except DuplicateChangeError:
         # Re-raise duplicate errors

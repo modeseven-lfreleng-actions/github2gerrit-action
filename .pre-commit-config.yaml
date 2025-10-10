@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 ci:
+  skip: [pytest]
   autofix_commit_msg: |
     Chore: pre-commit autofixes
 
@@ -133,3 +134,14 @@ repos:
         types:
           - yaml
       - id: check-readthedocs
+
+  # Run tests last to ensure all code changes from other hooks are tested
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: uv
+        args: [run, pytest, --tb=short, -q]
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -38,6 +38,9 @@ class Inputs:
     gerrit_ssh_user_g2g: str
     gerrit_ssh_user_g2g_email: str
 
+    # GitHub API access
+    github_token: str
+
     # Metadata and reviewers
     organization: str
     reviewers_email: str

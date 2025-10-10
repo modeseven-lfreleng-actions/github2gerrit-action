@@ -373,7 +373,7 @@ def _emit_summary_json(
         "strategy": strategy,
         "digest": digest,
     }
-    log.info(
+    log.debug(
         "RECONCILE_SUMMARY json=%s",
         json.dumps(summary),
     )
