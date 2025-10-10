@@ -36,6 +36,7 @@ from .github_api import get_pr_title_body
 from .github_api import get_pull
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
+from .gitutils import CommandError
 from .gitutils import run_cmd
 from .models import GitHubContext
 from .models import Inputs
@@ -246,7 +247,7 @@ if "--help" in sys.argv or _is_github_actions_context():
 
 app: typer.Typer = typer.Typer(
     add_completion=False,
-    no_args_is_help=False,
+    no_args_is_help=True,
     cls=cast(Any, _SingleUsageGroup),
     rich_markup_mode="rich",
     help="Tool to convert GitHub pull requests into Gerrit changes",
@@ -990,15 +991,56 @@ def _process_single(
                 else:
                     progress_tracker.change_updated()
         except Exception as exc:
-            error_msg = str(exc)
-            log.debug("Execution failed; continuing to write outputs: %s", exc)
+            # Enhanced error handling for CommandError to show git command
+            # details
+            if isinstance(exc, CommandError):
+                # Always show the basic error message
+                cmd_str = " ".join(exc.cmd) if exc.cmd else "unknown command"
+                basic_error = f"Git command failed: {cmd_str}"
+                if exc.returncode is not None:
+                    basic_error += f" (exit code: {exc.returncode})"
 
-            # Always show the actual error to the user, not just in debug mode
-            if progress_tracker:
-                progress_tracker.add_error(f"Execution failed: {error_msg}")
+                # In verbose mode, show detailed stdout/stderr
+                if is_verbose_mode():
+                    detailed_msg = basic_error
+                    if exc.stdout and exc.stdout.strip():
+                        detailed_msg += f"\nGit stdout: {exc.stdout.strip()}"
+                    if exc.stderr and exc.stderr.strip():
+                        detailed_msg += f"\nGit stderr: {exc.stderr.strip()}"
+
+                    # Show debugging suggestion for merge failures
+                    if "merge --squash" in " ".join(exc.cmd or []):
+                        detailed_msg += (
+                            "\n💡 For local debugging: python "
+                            "test_merge_failure.py --verbose"
+                        )
+
+                    safe_console_print(f"❌ {detailed_msg}", style="red")
+                    if progress_tracker:
+                        progress_tracker.add_error(basic_error)
+                        if exc.stderr and exc.stderr.strip():
+                            progress_tracker.add_error(
+                                f"Details: {exc.stderr.strip()}"
+                            )
+                else:
+                    # In non-verbose mode, show basic error with hint to enable
+                    # verbose
+                    hint_msg = (
+                        basic_error
+                        + "\n💡 Run with VERBOSE=true for detailed git output"
+                    )
+                    safe_console_print(f"❌ {hint_msg}", style="red")
+                    if progress_tracker:
+                        progress_tracker.add_error(basic_error)
             else:
-                # If no progress tracker, show error directly
-                safe_console_print(f"❌ Error: {error_msg}", style="red")
+                # For other exceptions, use original handling
+                error_msg = str(exc)
+                if progress_tracker:
+                    progress_tracker.add_error(f"Execution failed: {error_msg}")
+                else:
+                    safe_console_print(f"❌ Error: {error_msg}", style="red")
+
+            log.debug("Execution failed; continuing to write outputs: %s", exc)
 
             # In verbose mode, also log the full exception with traceback
             if is_verbose_mode():

@@ -1749,6 +1749,10 @@ class Orchestrator:
     ) -> None:
         """Set git global config and initialize git-review if needed."""
         log.debug("Configuring git and git-review for %s", gerrit.host)
+
+        # Configure git user identity (required for merge operations)
+        self._ensure_git_user_identity(inputs)
+
         # Prefer repo-local config; fallback to global if needed
         try:
             git_config(
@@ -1761,26 +1765,7 @@ class Orchestrator:
             git_config(
                 "gitreview.username", inputs.gerrit_ssh_user_g2g, global_=True
             )
-        try:
-            git_config(
-                "user.name",
-                inputs.gerrit_ssh_user_g2g,
-                global_=False,
-                cwd=self.workspace,
-            )
-        except GitError:
-            git_config("user.name", inputs.gerrit_ssh_user_g2g, global_=True)
-        try:
-            git_config(
-                "user.email",
-                inputs.gerrit_ssh_user_g2g_email,
-                global_=False,
-                cwd=self.workspace,
-            )
-        except GitError:
-            git_config(
-                "user.email", inputs.gerrit_ssh_user_g2g_email, global_=True
-            )
+        # Git user identity is configured by _ensure_git_user_identity
         # Disable GPG signing to avoid interactive prompts for signing keys
         try:
             git_config(
@@ -2028,10 +2013,99 @@ class Orchestrator:
         # Create temp branch from base and merge-squash PR head
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
         os.environ["G2G_TMP_BRANCH"] = tmp_branch
+
+        log.debug(
+            "Git merge preparation: base_sha=%s, head_sha=%s, tmp_branch=%s",
+            base_sha,
+            head_sha,
+            tmp_branch,
+        )
+
+        # Check if we have any commits to merge
+        try:
+            merge_base = run_cmd(
+                ["git", "merge-base", base_sha, head_sha], cwd=self.workspace
+            ).stdout.strip()
+            log.debug("Merge base: %s", merge_base)
+
+            # Check if there are any commits between base and head
+            commits_to_merge = run_cmd(
+                ["git", "rev-list", f"{base_sha}..{head_sha}"],
+                cwd=self.workspace,
+            ).stdout.strip()
+            if not commits_to_merge:
+                log.warning(
+                    "No commits found between base (%s) and head (%s)",
+                    base_sha,
+                    head_sha,
+                )
+            else:
+                commit_count = len(commits_to_merge.splitlines())
+                log.debug("Found %d commits to merge", commit_count)
+
+        except Exception as debug_exc:
+            log.warning("Failed to analyze merge situation: %s", debug_exc)
+
         run_cmd(
             ["git", "checkout", "-b", tmp_branch, base_sha], cwd=self.workspace
         )
-        run_cmd(["git", "merge", "--squash", head_sha], cwd=self.workspace)
+
+        # Show git status before attempting merge
+        try:
+            status_output = run_cmd(
+                ["git", "status", "--porcelain"], cwd=self.workspace
+            ).stdout
+            if status_output.strip():
+                log.debug(
+                    "Git status before merge (modified files detected):\n%s",
+                    status_output,
+                )
+            else:
+                log.debug("Git status before merge: working directory clean")
+
+            # Show current branch
+            current_branch = run_cmd(
+                ["git", "branch", "--show-current"], cwd=self.workspace
+            ).stdout.strip()
+            log.debug("Current branch before merge: %s", current_branch)
+
+        except Exception as status_exc:
+            log.warning("Failed to get git status before merge: %s", status_exc)
+
+        log.debug("About to run: git merge --squash %s", head_sha)
+        try:
+            run_cmd(["git", "merge", "--squash", head_sha], cwd=self.workspace)
+        except CommandError as merge_exc:
+            # Enhanced error handling for git merge failures
+            error_details = self._analyze_merge_failure(
+                merge_exc, base_sha, head_sha
+            )
+
+            # Try to provide recovery suggestions
+            recovery_msg = self._suggest_merge_recovery(
+                merge_exc, base_sha, head_sha
+            )
+
+            # Log detailed error information
+            log.exception("Git merge --squash failed: %s", error_details)
+            if recovery_msg:
+                log.exception("Suggested recovery: %s", recovery_msg)
+
+            # Enhanced debugging if verbose mode is enabled
+            from .utils import is_verbose_mode
+
+            if is_verbose_mode():
+                self._debug_merge_failure_context(base_sha, head_sha)
+
+            # Re-raise with enhanced context
+            raise OrchestratorError(
+                f"Failed to merge PR commits: {error_details}"
+                + (
+                    f"\nSuggested recovery: {recovery_msg}"
+                    if recovery_msg
+                    else ""
+                )
+            ) from merge_exc
 
         def _collect_log_lines() -> list[str]:
             body = run_cmd(
@@ -4259,6 +4333,242 @@ class Orchestrator:
 
         except Exception as exc:
             log.debug("File validation failed (non-critical): %s", exc)
+
+    def _analyze_merge_failure(
+        self, merge_exc: CommandError, base_sha: str, head_sha: str
+    ) -> str:
+        """Analyze git merge failure and provide detailed error information."""
+        error_parts = []
+
+        # Include basic command info
+        if merge_exc.cmd:
+            error_parts.append(f"Command: {' '.join(merge_exc.cmd)}")
+        if merge_exc.returncode is not None:
+            error_parts.append(f"Exit code: {merge_exc.returncode}")
+
+        # Analyze stderr for common patterns
+        stderr = merge_exc.stderr or ""
+        if "conflict" in stderr.lower():
+            error_parts.append("Merge conflicts detected")
+        if "abort" in stderr.lower():
+            error_parts.append("Merge was aborted")
+        if "fatal" in stderr.lower():
+            error_parts.append("Fatal git error occurred")
+
+        # Include actual git output
+        if merge_exc.stdout and merge_exc.stdout.strip():
+            error_parts.append(f"Git output: {merge_exc.stdout.strip()}")
+        if stderr and stderr.strip():
+            error_parts.append(f"Git error: {stderr.strip()}")
+
+        return (
+            "; ".join(error_parts) if error_parts else "Unknown merge failure"
+        )
+
+    def _suggest_merge_recovery(
+        self, merge_exc: CommandError, base_sha: str, head_sha: str
+    ) -> str:
+        """Suggest recovery actions based on merge failure analysis."""
+        stderr = (merge_exc.stderr or "").lower()
+
+        if (
+            "committer identity unknown" in stderr
+            or "empty ident name" in stderr
+        ):
+            return (
+                "Git user identity not configured - this should be handled "
+                "automatically by the tool. Please report this as a bug."
+            )
+        elif "conflict" in stderr:
+            return "Check for merge conflicts in the PR files and resolve them"
+        elif "fatal: refusing to merge unrelated histories" in stderr:
+            return (
+                "The branches have unrelated histories - check if the PR "
+                "branch is based on the correct target"
+            )
+        elif "nothing to commit" in stderr:
+            return (
+                "No changes to merge - the PR may already be merged or have "
+                "no differences"
+            )
+        elif "abort" in stderr:
+            return (
+                "Previous merge operation may have been interrupted - check "
+                "repository state"
+            )
+
+        # Try to provide generic guidance
+        try:
+            # Check if commits exist between base and head
+            commits_cmd = ["git", "rev-list", f"{base_sha}..{head_sha}"]
+            commits_result = run_cmd(
+                commits_cmd, cwd=self.workspace, check=False
+            )
+            if (
+                commits_result.returncode == 0
+                and not commits_result.stdout.strip()
+            ):
+                return (
+                    "No commits found between base and head - PR may be empty "
+                    "or already merged"
+                )
+        except Exception as e:
+            log.debug(
+                "Failed to check commit range for recovery suggestion: %s", e
+            )
+
+        return (
+            "Review git repository state and ensure PR branch is properly "
+            "synchronized with target"
+        )
+
+    def _debug_merge_failure_context(
+        self, base_sha: str, head_sha: str
+    ) -> None:
+        """Provide extensive debugging context for merge failures when verbose mode is enabled."""  # noqa: E501
+        log.error("=== VERBOSE MODE: Extended merge failure analysis ===")
+
+        try:
+            # Show detailed git log between base and head
+            log_result = run_cmd(
+                [
+                    "git",
+                    "log",
+                    "--oneline",
+                    "--graph",
+                    f"{base_sha}..{head_sha}",
+                ],
+                cwd=self.workspace,
+                check=False,
+            )
+            if log_result.returncode == 0:
+                log.error("Commits to be merged:\n%s", log_result.stdout)
+            else:
+                log.error("Failed to get commit log: %s", log_result.stderr)
+
+            # Show file differences
+            diff_result = run_cmd(
+                ["git", "diff", "--name-status", base_sha, head_sha],
+                cwd=self.workspace,
+                check=False,
+            )
+            if diff_result.returncode == 0:
+                log.error(
+                    "Files changed between base and head:\n%s",
+                    diff_result.stdout,
+                )
+
+            # Show merge-base information
+            merge_base_result = run_cmd(
+                ["git", "merge-base", "--is-ancestor", base_sha, head_sha],
+                cwd=self.workspace,
+                check=False,
+            )
+            if merge_base_result.returncode == 0:
+                log.error(
+                    "Base SHA %s is an ancestor of head SHA %s",
+                    base_sha[:8],
+                    head_sha[:8],
+                )
+            else:
+                log.error(
+                    "Base SHA %s is NOT an ancestor of head SHA %s",
+                    base_sha[:8],
+                    head_sha[:8],
+                )
+
+            # Show current repository state
+            status_result = run_cmd(
+                ["git", "status", "--porcelain"],
+                cwd=self.workspace,
+                check=False,
+            )
+            if status_result.stdout.strip():
+                log.error(
+                    "Repository has uncommitted changes:\n%s",
+                    status_result.stdout,
+                )
+
+            # Show current branch and HEAD
+            branch_result = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=self.workspace,
+                check=False,
+            )
+            if branch_result.returncode == 0:
+                log.error("Current branch: %s", branch_result.stdout.strip())
+
+            head_result = run_cmd(
+                ["git", "rev-parse", "HEAD"], cwd=self.workspace, check=False
+            )
+            if head_result.returncode == 0:
+                log.error("Current HEAD: %s", head_result.stdout.strip())
+
+        except Exception:
+            log.exception("Failed to gather debug context")
+
+        log.error("=== End verbose merge failure analysis ===")
+
+    def _ensure_git_user_identity(self, inputs: Inputs) -> None:
+        """Ensure git user identity is configured for merge operations."""
+        log.debug("Ensuring git user identity is configured")
+
+        # Check if user.name and user.email are already configured
+        try:
+            name_result = run_cmd(
+                ["git", "config", "user.name"], cwd=self.workspace, check=False
+            )
+            email_result = run_cmd(
+                ["git", "config", "user.email"], cwd=self.workspace, check=False
+            )
+
+            if (
+                name_result.returncode == 0
+                and name_result.stdout.strip()
+                and email_result.returncode == 0
+                and email_result.stdout.strip()
+            ):
+                log.debug(
+                    "Git user identity already configured: %s <%s>",
+                    name_result.stdout.strip(),
+                    email_result.stdout.strip(),
+                )
+                return
+
+        except Exception as e:
+            log.debug("Failed to check existing git identity: %s", e)
+
+        # Configure git identity using Gerrit credentials
+        user_name = inputs.gerrit_ssh_user_g2g or "github2gerrit-bot"
+        user_email = (
+            inputs.gerrit_ssh_user_g2g_email or "github2gerrit@example.com"
+        )
+
+        log.debug("Configuring git identity: %s <%s>", user_name, user_email)
+
+        try:
+            # Set local repository identity
+            run_cmd(
+                ["git", "config", "user.name", user_name], cwd=self.workspace
+            )
+            run_cmd(
+                ["git", "config", "user.email", user_email], cwd=self.workspace
+            )
+            log.debug("Successfully configured git user identity")
+
+        except CommandError as e:
+            # Fallback to global config if local fails
+            log.warning(
+                "Failed to set local git identity, trying global: %s", e
+            )
+            try:
+                run_cmd(["git", "config", "--global", "user.name", user_name])
+                run_cmd(["git", "config", "--global", "user.email", user_email])
+                log.debug("Successfully configured global git user identity")
+            except CommandError as global_e:
+                log.exception("Failed to configure git user identity")
+                msg = "Cannot configure git user identity"
+                raise OrchestratorError(msg) from global_e
 
 
 # ---------------------
