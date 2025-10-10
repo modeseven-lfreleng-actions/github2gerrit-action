@@ -37,7 +37,6 @@ from .github_api import get_pull
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
 from .gitutils import CommandError
-from .gitutils import run_cmd
 from .models import GitHubContext
 from .models import Inputs
 from .rich_display import RICH_AVAILABLE
@@ -47,8 +46,6 @@ from .rich_display import display_pr_info
 from .rich_display import safe_console_print
 from .rich_display import safe_typer_echo
 from .rich_logging import setup_rich_aware_logging
-from .ssh_common import build_git_ssh_command
-from .ssh_common import build_non_interactive_ssh_env
 from .utils import append_github_output
 from .utils import env_bool
 from .utils import env_str
@@ -956,10 +953,12 @@ def _process_single(
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
 
+        orch = Orchestrator(workspace=workspace)
+
         try:
             if progress_tracker:
                 progress_tracker.update_operation("Preparing local checkout...")
-            _prepare_local_checkout(workspace, gh, data)
+            orch._prepare_workspace_checkout(data, gh)
         except Exception as exc:
             log.debug("Local checkout preparation failed: %s", exc)
             if progress_tracker:
@@ -969,8 +968,6 @@ def _process_single(
             progress_tracker.update_operation(
                 "Configuring SSH authentication..."
             )
-
-        orch = Orchestrator(workspace=workspace)
 
         if progress_tracker:
             progress_tracker.update_operation(
@@ -1084,273 +1081,6 @@ def _process_single(
         )
 
         return pipeline_success
-
-
-def _prepare_local_checkout(
-    workspace: Path, gh: GitHubContext, data: Inputs
-) -> None:
-    repo_full = gh.repository.strip() if gh.repository else ""
-    server_url = gh.server_url or os.getenv(
-        "GITHUB_SERVER_URL", "https://github.com"
-    )
-    server_url = (server_url or "https://github.com").rstrip("/")
-    base_ref = gh.base_ref or ""
-    pr_num_str: str = str(gh.pr_number) if gh.pr_number else "0"
-
-    if not repo_full:
-        return
-
-    # Try SSH first for private repos if available, then fall back to HTTPS/API
-    repo_ssh_url = (
-        f"git@{server_url.replace('https://', '').replace('http://', '')}:"
-        f"{repo_full}.git"
-    )
-    repo_https_url = f"{server_url}/{repo_full}.git"
-
-    run_cmd(["git", "init"], cwd=workspace)
-
-    # Determine which URL to use and set up authentication
-    env: dict[str, str] = {}
-    repo_url = repo_https_url  # Default to HTTPS
-
-    # Check if we should try SSH for private repos
-    use_ssh = False
-    respect_user_ssh = os.getenv("G2G_RESPECT_USER_SSH", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-    gerrit_ssh_privkey = os.getenv("GERRIT_SSH_PRIVKEY_G2G")
-
-    log.debug(
-        "GitHub repo access decision: SSH URL available=%s, "
-        "G2G_RESPECT_USER_SSH=%s, GERRIT_SSH_PRIVKEY_G2G=%s",
-        repo_ssh_url.startswith("git@"),
-        respect_user_ssh,
-        bool(gerrit_ssh_privkey),
-    )
-
-    if repo_ssh_url.startswith("git@"):
-        # For private repos, only try SSH if G2G_RESPECT_USER_SSH is
-        # explicitly enabled
-        # Don't use SSH just because GERRIT_SSH_PRIVKEY_G2G is set
-        # (that's for Gerrit, not GitHub)
-        if respect_user_ssh:
-            use_ssh = True
-            repo_url = repo_ssh_url
-            log.debug(
-                "Using SSH for GitHub repo access due to "
-                "G2G_RESPECT_USER_SSH=true"
-            )
-        else:
-            log.debug(
-                "Not using SSH for GitHub repo access - "
-                "G2G_RESPECT_USER_SSH not enabled"
-            )
-
-    if use_ssh:
-        env = {
-            "GIT_SSH_COMMAND": build_git_ssh_command(),
-            **build_non_interactive_ssh_env(),
-        }
-        log.debug("Using SSH URL for private repo: %s", repo_url)
-    else:
-        log.debug("Using HTTPS URL: %s", repo_url)
-
-    run_cmd(["git", "remote", "add", "origin", repo_url], cwd=workspace)
-
-    # Fetch base branch and PR head with fallback to API archive
-    fetch_success = False
-
-    if base_ref:
-        try:
-            branch_ref = f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={data.fetch_depth}",
-                    "origin",
-                    branch_ref,
-                ],
-                cwd=workspace,
-                env=env,
-            )
-        except Exception as exc:
-            log.debug("Base branch fetch failed for %s: %s", base_ref, exc)
-
-    if pr_num_str:
-        try:
-            pr_ref = (
-                f"refs/pull/{pr_num_str}/head:"
-                f"refs/remotes/origin/pr/{pr_num_str}/head"
-            )
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={data.fetch_depth}",
-                    "origin",
-                    pr_ref,
-                ],
-                cwd=workspace,
-                env=env,
-            )
-            run_cmd(
-                [
-                    "git",
-                    "checkout",
-                    "-B",
-                    "g2g_pr_head",
-                    f"refs/remotes/origin/pr/{pr_num_str}/head",
-                ],
-                cwd=workspace,
-                env=env,
-            )
-            fetch_success = True
-        except Exception as exc:
-            log.warning(
-                "Git fetch failed, attempting API archive fallback: %s", exc
-            )
-            # Try API archive fallback for private repos
-            try:
-                _fallback_to_api_archive(workspace, gh, data, pr_num_str)
-                fetch_success = True
-            except Exception as api_exc:
-                log.exception("API archive fallback also failed")
-                raise exc from api_exc
-
-    if not fetch_success and pr_num_str:
-        msg = f"Failed to prepare checkout for PR #{pr_num_str}"
-        raise RuntimeError(msg)
-
-
-def _fallback_to_api_archive(
-    workspace: Path, gh: GitHubContext, data: Inputs, pr_num_str: str
-) -> None:
-    """Fallback to GitHub API archive download for private repos."""
-    import io
-    import json
-    import shutil
-    import zipfile
-    from urllib.request import Request
-    from urllib.request import urlopen
-
-    log.info("Attempting API archive fallback for PR #%s", pr_num_str)
-
-    # Get GitHub token for authenticated requests
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        msg = "GITHUB_TOKEN required for API archive fallback"
-        raise RuntimeError(msg)
-
-    # Build API URLs
-    repo_full = gh.repository
-    server_url = gh.server_url or "https://github.com"
-
-    # Construct GitHub API base URL properly
-    if "github.com" in server_url:
-        # For github.com, use api.github.com
-        api_base = "https://api.github.com"
-    elif server_url.startswith("https://"):
-        # For GitHub Enterprise, append /api/v3
-        api_base = server_url.rstrip("/") + "/api/v3"
-    else:
-        # Fallback for unexpected formats
-        api_base = "https://api.github.com"
-
-    # Get PR details to find head SHA
-    pr_api_url = f"{api_base}/repos/{repo_full}/pulls/{pr_num_str}"
-    log.debug("GitHub API PR URL: %s", pr_api_url)
-
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "github2gerrit",
-    }
-
-    try:
-        req = Request(pr_api_url, headers=headers)  # noqa: S310
-        with urlopen(req, timeout=30) as response:  # noqa: S310
-            pr_data = json.loads(response.read().decode())
-    except Exception:
-        log.exception("Failed to fetch PR data from GitHub API")
-        log.debug("PR API URL was: %s", pr_api_url)
-        raise
-
-    head_sha = pr_data["head"]["sha"]
-
-    # Download archive
-    archive_url = f"{api_base}/repos/{repo_full}/zipball/{head_sha}"
-    log.debug("GitHub API archive URL: %s", archive_url)
-
-    try:
-        req = Request(archive_url, headers=headers)  # noqa: S310
-        with urlopen(req, timeout=120) as response:  # noqa: S310
-            archive_data = response.read()
-    except Exception:
-        log.exception("Failed to download archive from GitHub API")
-        log.debug("Archive URL was: %s", archive_url)
-        raise
-
-    # Extract archive
-    with zipfile.ZipFile(io.BytesIO(archive_data)) as zf:
-        # Find the root directory in the archive (usually repo-sha format)
-        members = zf.namelist()
-        root_dir = None
-        for member in members:
-            if "/" in member:
-                root_dir = member.split("/")[0]
-                break
-
-        if not root_dir:
-            msg = "Could not find root directory in archive"
-            raise RuntimeError(msg)
-
-        # Extract to temporary location then move contents
-        extract_path = workspace / "archive_temp"
-        zf.extractall(extract_path)
-
-        # Move contents from extracted root to workspace
-        extracted_root = extract_path / root_dir
-        for item in extracted_root.iterdir():
-            if item.name == ".git":
-                continue  # Skip .git if present
-            dest = workspace / item.name
-            if dest.exists():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            item.rename(dest)
-
-        # Clean up
-        shutil.rmtree(extract_path)
-
-    # Set up git for the extracted content
-    if not (workspace / ".git").exists():
-        run_cmd(["git", "init"], cwd=workspace)
-
-    # Create a commit for the PR content
-    run_cmd(["git", "add", "."], cwd=workspace)
-    run_cmd(
-        [
-            "git",
-            "commit",
-            "-m",
-            f"PR #{pr_num_str} content from API archive",
-            "--author",
-            "GitHub API <noreply@github.com>",
-        ],
-        cwd=workspace,
-    )
-
-    # Create the expected branch
-    run_cmd(["git", "checkout", "-B", "g2g_pr_head"], cwd=workspace)
-
-    log.info(
-        "Successfully extracted PR #%s content via API archive", pr_num_str
-    )
 
 
 def _load_effective_inputs() -> Inputs:

@@ -437,28 +437,55 @@ def _is_local_cli_context() -> bool:
 
 
 def derive_gerrit_parameters(organization: str | None) -> dict[str, str]:
-    """Derive Gerrit parameters from GitHub organization name.
+    """Derive Gerrit parameters using SSH config, git config, and org fallback.
+
+    Priority order for credential derivation:
+    1. SSH config user for gerrit.* hosts (checks generic and specific patterns)
+    2. Git user email from local git configuration
+    3. Fallback to organization-based derivation
 
     Args:
-        organization: GitHub organization name
+        organization: GitHub organization name for fallback
 
     Returns:
         Dict with derived parameter values:
-        - GERRIT_SSH_USER_G2G: [org].gh2gerrit
-        - GERRIT_SSH_USER_G2G_EMAIL: releng+[org]-gh2gerrit@linuxfoundation.org
-        - GERRIT_SERVER: gerrit.[org].org
+        - GERRIT_SSH_USER_G2G: From SSH config or [org].gh2gerrit
+        - GERRIT_SSH_USER_G2G_EMAIL: From git config or fallback email
+        - GERRIT_SERVER: Resolved from config or gerrit.[org].org
     """
     if not organization:
         return {}
 
     org = organization.strip().lower()
-    return {
-        "GERRIT_SSH_USER_G2G": f"{org}.gh2gerrit",
-        "GERRIT_SSH_USER_G2G_EMAIL": (
-            f"releng+{org}-gh2gerrit@linuxfoundation.org"
-        ),
-        "GERRIT_SERVER": f"gerrit.{org}.org",
-    }
+
+    # Check if we have a config file entry for this organization
+    config = load_org_config(org)
+    configured_server = config.get("GERRIT_SERVER", "").strip()
+
+    # Determine the gerrit server to use for SSH config lookup
+    gerrit_host = configured_server or f"gerrit.{org}.org"
+
+    # Try to use SSH config and git config for personalized credentials
+    try:
+        from .ssh_config_parser import derive_gerrit_credentials
+
+        ssh_user, git_email = derive_gerrit_credentials(gerrit_host, org)
+    except ImportError:
+        # Fallback to original behavior if ssh_config_parser not available
+        return {
+            "GERRIT_SSH_USER_G2G": f"{org}.gh2gerrit",
+            "GERRIT_SSH_USER_G2G_EMAIL": (
+                f"releng+{org}-gh2gerrit@linuxfoundation.org"
+            ),
+            "GERRIT_SERVER": gerrit_host,
+        }
+    else:
+        return {
+            "GERRIT_SSH_USER_G2G": ssh_user or f"{org}.gh2gerrit",
+            "GERRIT_SSH_USER_G2G_EMAIL": git_email
+            or (f"releng+{org}-gh2gerrit@linuxfoundation.org"),
+            "GERRIT_SERVER": gerrit_host,
+        }
 
 
 def apply_parameter_derivation(

@@ -738,7 +738,7 @@ class Orchestrator:
 
         # Initialize git repository in workspace if it doesn't exist
         if not (self.workspace / ".git").exists():
-            self._setup_git_workspace(inputs, gh)
+            self._prepare_workspace_checkout(inputs, gh)
 
         gitreview = self._read_gitreview(self.workspace / ".gitreview", gh)
         repo_names = self._derive_repo_names(gitreview, gh)
@@ -787,6 +787,9 @@ class Orchestrator:
             )
         except GitError:
             git_config("tag.gpgsign", "false", global_=True)
+
+        # Configure git identity BEFORE any merge operations that create commits
+        self._ensure_git_user_identity(inputs)
 
         if inputs.submit_single_commits:
             prep = self._prepare_single_commits(inputs, gh, gerrit)
@@ -1750,9 +1753,7 @@ class Orchestrator:
         """Set git global config and initialize git-review if needed."""
         log.debug("Configuring git and git-review for %s", gerrit.host)
 
-        # Configure git user identity (required for merge operations)
-        self._ensure_git_user_identity(inputs)
-
+        # Git user identity is now configured earlier before merge operations
         # Prefer repo-local config; fallback to global if needed
         try:
             git_config(
@@ -3327,51 +3328,205 @@ class Orchestrator:
             change_urls=urls, change_numbers=nums, commit_shas=shas
         )
 
-    def _setup_git_workspace(self, inputs: Inputs, gh: GitHubContext) -> None:
-        """Initialize and set up git workspace for PR processing."""
+    def _prepare_workspace_checkout(
+        self, inputs: Inputs, gh: GitHubContext
+    ) -> None:
+        """Initialize and set up git workspace using battle-tested CLI logic."""
         from .gitutils import run_cmd
+        from .ssh_common import build_git_ssh_command
+        from .ssh_common import build_non_interactive_ssh_env
+        from .utils import env_bool
 
-        # Try modern git init with explicit branch first
-        try:
-            run_cmd(
-                ["git", "init", "--initial-branch=master"], cwd=self.workspace
-            )
-        except Exception:
-            # Fallback for older git versions (hint filtered at logging level)
-            run_cmd(["git", "init"], cwd=self.workspace)
-
-        # Add GitHub remote
+        # Use CLI's proven checkout logic with SSH support
         repo_full = gh.repository.strip() if gh.repository else ""
         server_url = gh.server_url or "https://github.com"
         server_url = server_url.rstrip("/")
-        repo_url = f"{server_url}/{repo_full}.git"
+        base_ref = gh.base_ref or ""
+        pr_num_str: str = str(gh.pr_number) if gh.pr_number else "0"
+
+        # Initialize git repository (no hardcoded branch assumption)
+        run_cmd(["git", "init"], cwd=self.workspace)
+
+        # Determine repository URL and setup authentication like CLI does
+        repo_https_url = f"{server_url}/{repo_full}.git"
+        repo_ssh_url = f"git@{server_url.split('//')[-1]}:{repo_full}.git"
+
+        # Check for SSH preference (matching CLI behavior)
+        use_ssh = env_bool("G2G_RESPECT_USER_SSH", False)
+
+        if use_ssh:
+            repo_url = repo_ssh_url
+            # Set up SSH environment for private repos
+            env = {
+                "GIT_SSH_COMMAND": build_git_ssh_command(),
+                **build_non_interactive_ssh_env(),
+            }
+            log.debug("Using SSH URL for GitHub repo: %s", repo_url)
+        else:
+            repo_url = repo_https_url
+            env = {}
+            log.debug("Using HTTPS URL: %s", repo_url)
+
         run_cmd(
-            ["git", "remote", "add", "origin", repo_url],
-            cwd=self.workspace,
+            ["git", "remote", "add", "origin", repo_url], cwd=self.workspace
         )
 
-        # Fetch PR head
+        # Fetch base branch and PR head with CLI's fallback logic
+        fetch_success = False
+
+        if base_ref:
+            try:
+                branch_ref = (
+                    f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
+                )
+                run_cmd(
+                    [
+                        "git",
+                        "fetch",
+                        f"--depth={inputs.fetch_depth}",
+                        "origin",
+                        branch_ref,
+                    ],
+                    cwd=self.workspace,
+                    env=env,
+                )
+            except Exception as exc:
+                log.debug("Base branch fetch failed for %s: %s", base_ref, exc)
+
         if gh.pr_number:
-            pr_ref = (
-                f"refs/pull/{gh.pr_number}/head:refs/remotes/origin/pr/"
-                f"{gh.pr_number}/head"
-            )
-            run_cmd(
-                [
-                    "git",
-                    "fetch",
-                    f"--depth={inputs.fetch_depth}",
-                    "origin",
-                    pr_ref,
-                ],
-                cwd=self.workspace,
-            )
-            # Checkout PR head
-            pr_head_ref = f"refs/remotes/origin/pr/{gh.pr_number}/head"
-            run_cmd(
-                ["git", "checkout", "-B", "g2g_pr_head", pr_head_ref],
-                cwd=self.workspace,
-            )
+            try:
+                pr_ref = (
+                    f"refs/pull/{pr_num_str}/head:"
+                    f"refs/remotes/origin/pr/{pr_num_str}/head"
+                )
+                run_cmd(
+                    [
+                        "git",
+                        "fetch",
+                        f"--depth={inputs.fetch_depth}",
+                        "origin",
+                        pr_ref,
+                    ],
+                    cwd=self.workspace,
+                    env=env,
+                )
+                # Checkout PR head
+                run_cmd(
+                    [
+                        "git",
+                        "checkout",
+                        "-B",
+                        "g2g_pr_head",
+                        f"refs/remotes/origin/pr/{pr_num_str}/head",
+                    ],
+                    cwd=self.workspace,
+                )
+                fetch_success = True
+            except Exception as exc:
+                log.debug("PR fetch failed, will try API fallback: %s", exc)
+
+        # Fallback to GitHub API archive if git fetch failed (CLI's resilience)
+        if not fetch_success and pr_num_str and pr_num_str != "0":
+            log.info("Git fetch failed, falling back to GitHub API archive")
+            self._fallback_to_api_archive(self.workspace, gh, inputs)
+
+    def _fallback_to_api_archive(
+        self, workspace: Path, gh: GitHubContext, inputs: Inputs
+    ) -> None:
+        """Fallback to GitHub API archive download (ported from CLI)."""
+        import json
+        import zipfile
+        from urllib.request import Request
+        from urllib.request import urlopen
+
+        repo_full = gh.repository.strip() if gh.repository else ""
+        pr_num_str = str(gh.pr_number) if gh.pr_number else "0"
+
+        # Get GitHub token
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+        if not token:
+            msg = "No GITHUB_TOKEN available for API fallback"
+            raise OrchestratorError(msg)
+
+        # Determine API base URL
+        server_url = gh.server_url or "https://github.com"
+        if "github.com" in server_url.lower():
+            api_base = "https://api.github.com"
+        else:
+            # GitHub Enterprise
+            parsed = urllib.parse.urlparse(server_url)
+            api_base = f"{parsed.scheme}://{parsed.netloc}/api/v3"
+
+        # Get PR details to find head SHA
+        pr_api_url = f"{api_base}/repos/{repo_full}/pulls/{pr_num_str}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+
+        try:
+            req = Request(pr_api_url, headers=headers)  # noqa: S310
+            with urlopen(req, timeout=30) as response:  # noqa: S310
+                pr_data = json.loads(response.read().decode())
+        except Exception:
+            log.exception("Failed to fetch PR data from GitHub API")
+            raise
+
+        head_sha = pr_data["head"]["sha"]
+
+        # Download archive
+        archive_url = f"{api_base}/repos/{repo_full}/zipball/{head_sha}"
+
+        try:
+            req = Request(archive_url, headers=headers)  # noqa: S310
+            with urlopen(req, timeout=120) as response:  # noqa: S310
+                archive_data = response.read()
+        except Exception:
+            log.exception("Failed to download archive from GitHub API")
+            raise
+
+        # Initialize git if needed
+        if not (workspace / ".git").exists():
+            run_cmd(["git", "init"], cwd=workspace)
+
+        # Extract archive
+        archive_path = workspace / "archive.zip"
+        archive_path.write_bytes(archive_data)
+
+        with zipfile.ZipFile(archive_path, "r") as zip_ref:
+            zip_ref.extractall(workspace)
+
+        # Find extracted directory (GitHub creates repo-sha format)
+        extracted_dirs = [
+            d for d in workspace.iterdir() if d.is_dir() and d.name != ".git"
+        ]
+        if not extracted_dirs:
+            msg = "No content found in GitHub archive"
+            raise OrchestratorError(msg)
+
+        source_dir = extracted_dirs[0]
+
+        # Move contents to workspace root
+        for item in source_dir.iterdir():
+            if item.name != ".git":
+                import shutil
+
+                target = workspace / item.name
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                shutil.move(str(item), str(target))
+
+        # Clean up
+        source_dir.rmdir()
+        archive_path.unlink()
+
+        # Create expected branch
+        run_cmd(["git", "checkout", "-B", "g2g_pr_head"], cwd=workspace)
+
+        log.info("Successfully set up workspace using GitHub API archive")
 
     def _install_commit_msg_hook(self, gerrit: GerritInfo) -> None:
         """Manually install commit-msg hook from Gerrit."""
