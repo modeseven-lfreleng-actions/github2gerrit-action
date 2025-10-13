@@ -11,6 +11,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 # Ensure src directory is on sys.path so tests can import the package without
 # installation
@@ -107,4 +109,40 @@ def pytest_sessionstart(session: Any) -> None:
     # Ensure tests don't write to real GitHub output files
     if "GITHUB_OUTPUT" not in os.environ:
         os.environ["GITHUB_OUTPUT"] = "/dev/null"
+
+    # Disable GitHub CI mode detection during tests to ensure config loading works
+    # This prevents _is_github_ci_mode() from returning True during test execution
+    if "GITHUB_ACTIONS" in os.environ:
+        del os.environ["GITHUB_ACTIONS"]
+    if "GITHUB_EVENT_NAME" in os.environ:
+        del os.environ["GITHUB_EVENT_NAME"]
+
     _remove_coverage_files(bases)
+
+
+@pytest.fixture(autouse=True)
+def disable_github_ci_mode(monkeypatch, request):
+    """
+    Automatically disable GitHub CI mode detection for all tests.
+
+    This ensures that config loading and file operations work normally
+    during test execution, even when running in GitHub Actions CI.
+    """
+    # Clear GitHub Actions environment variables that trigger CI mode
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+
+    # Also clear other GitHub-related vars that might interfere with tests
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY_OWNER", raising=False)
+
+    # Ensure consistent test environment
+    monkeypatch.setenv("G2G_ENABLE_DERIVATION", "true")
+
+    # Only set G2G_AUTO_SAVE_CONFIG if the test doesn't explicitly control it
+    # Check if this is the specific test that needs to control auto-save behavior
+    if (
+        "test_apply_parameter_derivation_saves_to_config_local_cli"
+        not in request.node.name
+    ):
+        monkeypatch.setenv("G2G_AUTO_SAVE_CONFIG", "false")

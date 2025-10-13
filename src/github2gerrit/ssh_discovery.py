@@ -97,7 +97,7 @@ def fetch_ssh_host_keys(
     Raises:
         SSHDiscoveryError: If the host keys cannot be fetched
     """
-    log.info("🔍 Starting SSH host key discovery for %s:%d", hostname, port)
+    log.debug("🔍 Starting SSH host key discovery for %s:%d", hostname, port)
 
     # Check if ssh-keyscan is available
     try:
@@ -191,13 +191,13 @@ def fetch_ssh_host_keys(
             )
 
         discovered_keys = "\n".join(valid_lines)
-        log.info(
+        log.debug(
             "✅ Successfully discovered %d SSH host key(s) for %s:%d",
             len(valid_lines),
             hostname,
             port,
         )
-        log.info("📋 Discovered keys:\n%s", discovered_keys)
+        log.debug("📋 Discovered keys:\n%s", discovered_keys)
 
     except CommandError as exc:
         log.exception("❌ ssh-keyscan command failed for %s:%d", hostname, port)
@@ -302,14 +302,29 @@ def save_host_keys_to_config(
     Save SSH host keys to the organization's configuration file.
 
     Args:
-        host_keys: The host keys in known_hosts format
+        host_keys: SSH host keys in known_hosts format
         organization: GitHub organization name for config section
         config_path: Path to config file (optional, uses default if not
             provided)
 
     Raises:
-        SSHDiscoveryError: If saving fails
+        SSHDiscoveryError: If the keys cannot be saved
     """
+    # Skip config file writes during dry-run mode
+    if os.getenv("DRY_RUN", "").lower() in ("true", "1", "yes"):
+        log.debug("Skipping SSH host keys config save in dry-run mode")
+        return
+
+    # Skip config file writes in GitHub CI environment
+    from .config import _is_github_ci_mode
+
+    if _is_github_ci_mode():
+        log.debug(
+            "GitHub CI mode detected: skipping SSH host keys configuration "
+            "file write"
+        )
+        return
+
     from .config import DEFAULT_CONFIG_PATH
 
     if config_path is None:
@@ -391,7 +406,7 @@ def save_host_keys_to_config(
         # Write the updated configuration
         config_file.write_text("\n".join(new_lines), encoding="utf-8")
 
-        log.info(
+        log.debug(
             "Successfully saved SSH host keys to configuration file: %s [%s]",
             config_file,
             organization,
@@ -407,12 +422,13 @@ def auto_discover_gerrit_host_keys(
     gerrit_hostname: str | None = None,
     gerrit_port: int | None = None,
     organization: str | None = None,
-    save_to_config: bool = True,
 ) -> str | None:
     """
-    Automatically discover Gerrit SSH host keys and optionally save to config.
+    Automatically discover Gerrit SSH host keys for immediate use.
 
     This is the main entry point for auto-discovery functionality.
+    Keys are discovered and returned for immediate use, but are not saved
+    to configuration until after successful Gerrit submission.
 
     Args:
         gerrit_hostname: Gerrit hostname (if not provided, tries to detect
@@ -420,7 +436,6 @@ def auto_discover_gerrit_host_keys(
         gerrit_port: Gerrit SSH port (defaults to 29418)
         organization: GitHub organization (if not provided, tries to detect
             from env)
-        save_to_config: Whether to save discovered keys to config file
 
     Returns:
         The discovered host keys string, or None if discovery failed
@@ -446,17 +461,14 @@ def auto_discover_gerrit_host_keys(
                 "No organization specified for SSH host key auto-discovery. "
                 "Cannot save to configuration file."
             )
-            save_to_config = False
 
         # Log system diagnostics for debugging
 
-        log.info(
-            "🔍 Attempting to auto-discover SSH host keys for %s:%d "
-            "(org: %s, save: %s)",
+        log.debug(
+            "🔍 Attempting to auto-discover SSH host keys for %s:%d (org: %s)",
             gerrit_hostname,
             gerrit_port,
             organization or "none",
-            save_to_config,
         )
 
         # System diagnostics
@@ -506,19 +518,13 @@ def auto_discover_gerrit_host_keys(
         # Discover the host keys
         host_keys = fetch_ssh_host_keys(gerrit_hostname, gerrit_port)
 
-        # Save to configuration if requested and possible
-        if save_to_config and organization:
-            save_host_keys_to_config(host_keys, organization)
-            log.info(
-                "SSH host keys automatically discovered and saved to config "
-                "for organization '%s'. Future runs will use the cached keys.",
-                organization,
-            )
-        else:
-            log.info(
-                "SSH host keys discovered but not saved to configuration. "
-                "Set ORGANIZATION environment variable to enable auto-saving."
-            )
+        # Log discovery success - keys will be saved after successful submission
+        log.debug(
+            "SSH host keys discovered for %s:%d. Keys will be saved to "
+            "configuration after successful Gerrit submission.",
+            gerrit_hostname,
+            gerrit_port,
+        )
 
     except SSHDiscoveryError:
         log.exception(

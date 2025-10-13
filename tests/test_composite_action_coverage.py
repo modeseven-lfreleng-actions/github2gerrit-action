@@ -246,7 +246,7 @@ class TestPRNumberHandling:
         github_context["event_name"] = "workflow_dispatch"
 
         result = action_tester.simulate_step(
-            "Normalize PR_NUMBER for workflow_dispatch",
+            "Normalize PR_NUMBER",
             env_vars,
             inputs,
             github_context,
@@ -268,7 +268,7 @@ class TestPRNumberHandling:
         github_context["event_name"] = "workflow_dispatch"
 
         result = action_tester.simulate_step(
-            "Normalize PR_NUMBER for workflow_dispatch",
+            "Normalize PR_NUMBER",
             env_vars,
             inputs,
             github_context,
@@ -289,7 +289,7 @@ class TestPRNumberHandling:
         github_context["event_name"] = "workflow_dispatch"
 
         result = action_tester.simulate_step(
-            "Normalize PR_NUMBER for workflow_dispatch",
+            "Normalize PR_NUMBER",
             env_vars,
             inputs,
             github_context,
@@ -309,7 +309,7 @@ class TestPRNumberHandling:
         github_context["event_name"] = "pull_request"
 
         result = action_tester.simulate_step(
-            "Validate PR_NUMBER usage (non-dispatch)",
+            "Validate PR_NUMBER usage",
             env_vars,
             inputs,
             github_context,
@@ -441,7 +441,7 @@ class TestOutputCapture:
         """Test multiline output formatting in capture step."""
         capture_step = None
         for step in action_tester.action_config["runs"]["steps"]:
-            if step.get("name") == "Capture outputs (best-effort)":
+            if step.get("name") == "Capture outputs":
                 capture_step = step
                 break
 
@@ -468,7 +468,7 @@ class TestStepDependencies:
         install_idx = next(
             i
             for i, name in enumerate(step_names)
-            if "Install required dependencies" in name
+            if "Setup github2gerrit" in name
         )
 
         assert python_idx < install_idx
@@ -585,7 +585,7 @@ class TestErrorHandling:
         github_context["event_name"] = "workflow_dispatch"
 
         result = action_tester.simulate_step(
-            "Normalize PR_NUMBER for workflow_dispatch",
+            "Normalize PR_NUMBER",
             env_vars,
             inputs,
             github_context,
@@ -726,7 +726,7 @@ class TestPerformanceConsiderations:
         # Installation should use UV
         install_step = None
         for step in steps:
-            if "Install required dependencies" in step.get("name", ""):
+            if "Setup github2gerrit" in step.get("name", ""):
                 install_step = step
                 break
 
@@ -775,7 +775,7 @@ class TestFullWorkflow:
             "Setup Python",
             "Setup uv",
             "Checkout repository",
-            "Install required dependencies",
+            "Setup github2gerrit",
             "Run github2gerrit Python CLI",
             "Capture outputs",
         ]

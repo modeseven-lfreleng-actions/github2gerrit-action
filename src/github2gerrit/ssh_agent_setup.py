@@ -7,6 +7,17 @@ SSH agent-based authentication for github2gerrit.
 This module provides functionality to use SSH agent for authentication
 instead of writing private keys to disk, which is more secure and
 avoids file permission issues in CI environments.
+
+SSH Agent Validation Strategy:
+- Early CLI validation defers SSH agent checks to avoid duplicate validation
+- Runtime validation in setup_ssh_agent_auth() performs comprehensive checks:
+  1. Checks for existing SSH agent (SSH_AUTH_SOCK environment variable)
+  2. Validates agent has keys loaded using "ssh-add -l" command
+  3. Gracefully falls back to file-based SSH if agent validation fails
+  4. Supports starting new agents when private keys are provided
+
+This approach ensures robust SSH authentication while maintaining clean
+separation between configuration validation and runtime validation.
 """
 
 from __future__ import annotations
@@ -44,6 +55,17 @@ _MSG_NO_KEYS_LOADED = "No keys were loaded into SSH agent"
 _MSG_SSH_AGENT_NOT_FOUND = "ssh-agent not found in PATH"
 _MSG_SSH_ADD_NOT_FOUND = "ssh-add not found in PATH"
 _MSG_TOOL_NOT_FOUND = "Required tool '{tool_name}' not found in PATH"
+_MSG_NO_AGENT_AND_KEY = "No SSH agent and no key provided"
+
+
+def _raise_no_keys_error() -> None:
+    """Raise error when no keys are loaded."""
+    raise SSHAgentError(_MSG_NO_KEYS_LOADED)
+
+
+def _raise_no_agent_error() -> None:
+    """Raise error when no SSH agent found and no key provided."""
+    raise SSHAgentError(_MSG_NO_AGENT_AND_KEY)
 
 
 class SSHAgentManager:
@@ -52,15 +74,20 @@ class SSHAgentManager:
     def __init__(self, workspace: Path):
         """Initialize SSH agent manager.
 
+        This class manages both SSH agent lifecycle and secure file storage.
+        All instances require a workspace for consistent behavior.
+
         Args:
             workspace: Secure temporary directory for storing SSH files (outside
-                git workspace)
+                git workspace). Required for all operations including
+                known_hosts management and secure cleanup.
         """
         self.workspace = workspace
         self.agent_pid: int | None = None
         self.auth_sock: str | None = None
         self.known_hosts_path: Path | None = None
         self._original_env: dict[str, str] = {}
+        self._agent_owned_by_us: bool = False
 
     def start_agent(self) -> None:
         """Start a new SSH agent process."""
@@ -82,6 +109,7 @@ class SSHAgentManager:
                     # Format: SSH_AGENT_PID=12345; export SSH_AGENT_PID;
                     value = line.split("=", 1)[1].split(";")[0].strip()
                     self.agent_pid = int(value)
+                    self._agent_owned_by_us = True  # We started this agent
 
             if not self.auth_sock or not self.agent_pid:
                 _raise_parse_error()
@@ -107,6 +135,65 @@ class SSHAgentManager:
         except Exception as exc:
             raise SSHAgentError(_MSG_START_FAILED.format(error=exc)) from exc
 
+    def use_existing_agent(self) -> bool:
+        """Attempt to use an existing SSH agent.
+
+        Returns:
+            True if existing SSH agent is available and usable, False otherwise
+        """
+        try:
+            # Check if SSH_AUTH_SOCK environment variable is set
+            auth_sock = os.environ.get("SSH_AUTH_SOCK")
+            if not auth_sock:
+                log.debug("No SSH_AUTH_SOCK environment variable found")
+                return False
+
+            # Check if the socket file exists
+            if not os.path.exists(auth_sock):
+                log.debug("SSH agent socket does not exist: %s", auth_sock)
+                return False
+
+            # Try to list keys to verify agent is working
+            # Use original environment to preserve SSH_AUTH_SOCK
+            ssh_add_path = _ensure_tool_available("ssh-add")
+            result = subprocess.run(  # noqa: S603
+                [ssh_add_path, "-l"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=os.environ.copy(),  # Use original environment
+            )
+
+            if result.returncode != 0:
+                log.debug(
+                    "ssh-add failed with exit code %d: %s",
+                    result.returncode,
+                    result.stderr,
+                )
+                return False
+
+            # Store the existing agent info
+            self.auth_sock = auth_sock
+            # Try to get PID from environment for informational purposes only
+            agent_pid_str = os.environ.get("SSH_AGENT_PID")
+            if agent_pid_str and agent_pid_str.isdigit():
+                self.agent_pid = int(agent_pid_str)
+            else:
+                self.agent_pid = None
+            self._agent_owned_by_us = False  # We're borrowing this agent
+
+            log.debug(
+                "Successfully connected to existing SSH agent: %s", auth_sock
+            )
+            log.debug("Existing agent keys: %s", result.stdout.strip())
+
+        except Exception as exc:
+            log.debug("Failed to connect to existing SSH agent: %s", exc)
+            return False
+
+        return True
+
     def add_key(self, private_key_content: str) -> None:
         """Add a private key to the SSH agent.
 
@@ -131,11 +218,7 @@ class SSHAgentManager:
                 stderr=subprocess.PIPE,
                 text=True,
                 shell=False,  # Explicitly disable shell for security
-                env={
-                    **os.environ,
-                    "SSH_AUTH_SOCK": self.auth_sock,
-                    "SSH_AGENT_PID": str(self.agent_pid),
-                },
+                env=self._get_ssh_env(),
             )
 
             _stdout, stderr = process.communicate(
@@ -164,7 +247,8 @@ class SSHAgentManager:
             # Create tool-specific SSH directory in secure temp location
             # Note: workspace is now a separate secure temp directory outside
             # git workspace
-            tool_ssh_dir = self.workspace / ".ssh-g2g"
+            workspace = self.workspace
+            tool_ssh_dir = workspace / ".ssh-g2g"
             tool_ssh_dir.mkdir(mode=0o700, exist_ok=True)
 
             # Write known hosts file (normalize/augment with [host]:port
@@ -202,22 +286,33 @@ class SSHAgentManager:
         if not self.known_hosts_path:
             raise SSHAgentError(_MSG_HOSTS_NOT_CONFIGURED)
 
-        ssh_options = [
-            "-F /dev/null",
-            f"-o UserKnownHostsFile={self.known_hosts_path}",
-            "-o IdentitiesOnly=no",  # Allow SSH agent
-            "-o BatchMode=yes",
-            "-o PreferredAuthentications=publickey",
-            "-o StrictHostKeyChecking=yes",
-            "-o PasswordAuthentication=no",
-            "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o ConnectTimeout=10",
-        ]
+        # Check if we should respect user SSH config
+        respect_user_ssh = os.getenv(
+            "G2G_RESPECT_USER_SSH", "false"
+        ).lower() in ("true", "1", "yes")
+
+        ssh_options = []
+
+        if not respect_user_ssh:
+            ssh_options.append("-F /dev/null")
+
+        ssh_options.extend(
+            [
+                f"-o UserKnownHostsFile={self.known_hosts_path}",
+                "-o IdentitiesOnly=no",  # Allow SSH agent
+                "-o BatchMode=yes",
+                "-o PreferredAuthentications=publickey",
+                "-o StrictHostKeyChecking=yes",
+                "-o PasswordAuthentication=no",
+                "-o PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-o ConnectTimeout=10",
+            ]
+        )
 
         return f"ssh {' '.join(ssh_options)}"
 
-    def get_ssh_env(self) -> dict[str, str]:
-        """Get environment variables for SSH operations.
+    def _get_ssh_env(self) -> dict[str, str]:
+        """Get SSH environment variables for internal subprocess calls.
 
         Returns:
             Dictionary of environment variables
@@ -225,16 +320,47 @@ class SSHAgentManager:
         if not self.auth_sock:
             raise SSHAgentError(_MSG_NOT_STARTED)
 
-        return {
+        env = {
+            **os.environ,
             "SSH_AUTH_SOCK": self.auth_sock,
-            "SSH_AGENT_PID": str(self.agent_pid),
         }
 
-    def list_keys(self) -> str:
-        """List keys currently loaded in the agent.
+        # Only set SSH_AGENT_PID if we have one (borrowed agents might not)
+        if self.agent_pid is not None:
+            env["SSH_AGENT_PID"] = str(self.agent_pid)
+
+        return env
+
+    def get_ssh_env(self) -> dict[str, str]:
+        """Get SSH environment variables for subprocess calls.
 
         Returns:
-            Output from ssh-add -l
+            Dictionary of environment variables
+        """
+        if not self.auth_sock:
+            raise SSHAgentError(_MSG_NOT_STARTED)
+
+        env = {"SSH_AUTH_SOCK": self.auth_sock}
+
+        # Only set SSH_AGENT_PID if we have one (borrowed agents might not)
+        if self.agent_pid is not None:
+            env["SSH_AGENT_PID"] = str(self.agent_pid)
+
+        return env
+
+    def list_keys(self) -> str:
+        """List keys currently loaded in the agent using 'ssh-add -l'.
+
+        This method performs the actual SSH agent validation by executing
+        'ssh-add -l' to check if any SSH keys are loaded in the agent.
+        It's used throughout the SSH setup process to validate agent state
+        and ensure SSH operations will succeed.
+
+        Returns:
+            Output from ssh-add -l, or "No keys loaded" if agent has no keys
+
+        Raises:
+            SSHAgentError: If SSH agent is not started or ssh-add fails
         """
         if not self.auth_sock:
             raise SSHAgentError(_MSG_NOT_STARTED)
@@ -245,11 +371,7 @@ class SSHAgentManager:
 
             result = run_cmd(
                 [ssh_add_path, "-l"],
-                env={
-                    **os.environ,
-                    "SSH_AUTH_SOCK": self.auth_sock,
-                    "SSH_AGENT_PID": str(self.agent_pid),
-                },
+                env=self._get_ssh_env(),
                 timeout=5,
             )
         except CommandError as exc:
@@ -264,13 +386,23 @@ class SSHAgentManager:
     def cleanup(self) -> None:
         """Securely clean up SSH agent and temporary files."""
         try:
-            # Kill SSH agent if we started it
-            if self.agent_pid:
+            # Only kill SSH agent if we started it ourselves
+            # Never kill an existing SSH agent that we're borrowing
+            if self.agent_pid and self._agent_owned_by_us:
                 try:
                     run_cmd(["/bin/kill", str(self.agent_pid)], timeout=5)
                     log.debug("SSH agent (PID %d) terminated", self.agent_pid)
                 except Exception as exc:
                     log.warning("Failed to kill SSH agent: %s", exc)
+            else:
+                if self.agent_pid and not self._agent_owned_by_us:
+                    log.debug(
+                        "Not terminating SSH agent (borrowed existing agent "
+                        "with PID %d)",
+                        self.agent_pid,
+                    )
+                else:
+                    log.debug("Not terminating SSH agent (no agent running)")
 
             # Restore original environment
             for key, value in self._original_env.items():
@@ -325,29 +457,87 @@ class SSHAgentManager:
             self.agent_pid = None
             self.auth_sock = None
             self.known_hosts_path = None
+            self._agent_owned_by_us = False
 
 
 def setup_ssh_agent_auth(
     workspace: Path, private_key_content: str, known_hosts_content: str
 ) -> SSHAgentManager:
-    """Setup SSH agent-based authentication.
+    """Setup SSH agent-based authentication with comprehensive validation.
+
+    This function performs the runtime SSH agent validation that was deferred
+    from early CLI validation to avoid duplicate checks. It implements a
+    robust validation and fallback strategy:
+
+    1. Check for existing SSH agent (SSH_AUTH_SOCK environment variable)
+    2. Validate existing agent has keys loaded using "ssh-add -l"
+    3. If existing agent has no keys but private key provided, start new agent
+    4. If no existing agent, start new agent with provided private key
+    5. Fail gracefully if no agent available and no private key provided
+
+    The validation using "ssh-add -l" ensures that SSH operations will succeed
+    and helps prevent authentication failures during Git operations.
 
     Args:
         workspace: Secure temporary directory for SSH files (outside git
             workspace)
-        private_key_content: SSH private key content
-        known_hosts_content: Known hosts content
+        private_key_content: SSH private key content (empty string to use
+            existing agent only)
+        known_hosts_content: Known hosts content for SSH host verification
 
     Returns:
-        Configured SSHAgentManager instance
+        SSHAgentManager instance for the configured agent
 
     Raises:
-        SSHAgentError: If setup fails
+        SSHAgentError: If SSH agent setup fails (no agent + no key, or
+                      validation failures)
     """
     manager = SSHAgentManager(workspace)
 
     try:
-        # Start SSH agent
+        # First, always try to use existing SSH agent if available
+        log.debug("Checking for existing SSH agent...")
+        log.debug(
+            "SSH_AUTH_SOCK environment variable: %s",
+            os.environ.get("SSH_AUTH_SOCK"),
+        )
+        if manager.use_existing_agent():
+            log.debug("Using existing SSH agent successfully")
+            # Setup known hosts for existing agent
+            manager.setup_known_hosts(known_hosts_content)
+
+            # Verify existing agent has keys using "ssh-add -l"
+            # This validation ensures SSH operations will succeed
+            keys_list = manager.list_keys()
+            if "No keys loaded" in keys_list:
+                log.debug("Existing SSH agent has no keys loaded")
+                # If we have a private key, we can start a new agent
+                if private_key_content.strip():
+                    log.debug(
+                        "Starting new SSH agent with provided private key"
+                    )
+                    # Fall through to start new agent
+                else:
+                    log.debug("No private key provided for new agent")
+                    _raise_no_keys_error()
+            else:
+                log.debug(
+                    "SSH agent auth configured successfully (existing agent)"
+                )
+                log.debug("Loaded keys: %s", keys_list)
+                return manager
+        else:
+            log.debug("No existing SSH agent found")
+
+        # Only start new SSH agent if we have a private key to load
+        if not private_key_content.strip():
+            log.debug(
+                "No private key provided and no existing SSH agent available"
+            )
+            _raise_no_agent_error()
+
+        # Start new SSH agent and add the private key
+        log.debug("Starting new SSH agent with provided private key")
         manager.start_agent()
 
         # Add the private key
@@ -356,12 +546,15 @@ def setup_ssh_agent_auth(
         # Setup known hosts
         manager.setup_known_hosts(known_hosts_content)
 
-        # Verify key was added
+        # Verify key was added successfully using "ssh-add -l"
+        # This final validation ensures the agent is ready for SSH operations
         keys_list = manager.list_keys()
         if "No keys loaded" in keys_list:
             _raise_no_keys_error()
 
-        log.debug("SSH agent authentication configured successfully")
+        log.debug(
+            "SSH agent authentication configured successfully (new agent)"
+        )
         log.debug("Loaded keys: %s", keys_list)
 
     except Exception:
@@ -415,8 +608,3 @@ def _raise_ssh_agent_not_found() -> None:
 def _raise_ssh_add_not_found() -> None:
     """Raise SSH add not found error."""
     raise SSHAgentError(_MSG_SSH_ADD_NOT_FOUND)
-
-
-def _raise_no_keys_error() -> None:
-    """Raise no keys loaded error."""
-    raise SSHAgentError(_MSG_NO_KEYS_LOADED)

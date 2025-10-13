@@ -126,7 +126,7 @@ def test_topic_reuse_and_orphan_policy_comment(
     Topic path with two existing changes, one matched / one orphan.
     Orphan policy 'comment' should log commented array with orphan id.
     """
-    caplog.set_level("INFO")
+    caplog.set_level("DEBUG")
     gh = _GH()
     gerrit = _Gerrit()
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
@@ -202,7 +202,7 @@ def test_orphan_policy_variants(policy, expected_field, caplog, monkeypatch):
     """
     Validate that the orphan action bucket changes with policy.
     """
-    caplog.set_level("INFO")
+    caplog.set_level("DEBUG")
     gh = _GH()
     # (removed unused variable; _Gerrit() passed inline)
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
@@ -264,7 +264,7 @@ def test_comment_based_reuse_extension_digest(caplog, monkeypatch):
     Comment fallback path: prior mapping has one id; second commit
     appended with new Change-Id; digest reflects both.
     """
-    caplog.set_level("INFO")
+    caplog.set_level("DEBUG")
     gh = _GH()
     gerrit = _Gerrit()
     existing_ids = ["I1234567890abcdef1234567890abcdef12345678"]

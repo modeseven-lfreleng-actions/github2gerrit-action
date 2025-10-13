@@ -26,6 +26,7 @@ class TestPRContentFilteringIntegration:
             gerrit_ssh_privkey_g2g="-----BEGIN KEY-----\nabc\n-----END KEY-----",
             gerrit_ssh_user_g2g="gerrit-bot",
             gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+            github_token="ghp_test_token_123",  # noqa: S106
             organization="test-org",
             reviewers_email="",
             preserve_github_prs=False,

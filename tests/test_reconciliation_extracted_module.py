@@ -183,7 +183,7 @@ def test_reconciliation_json_summary_emitted(
     """
     Enabling log_reconcile_json should emit a RECONCILE_SUMMARY log line.
     """
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     gh = _DummyGH()
     gerrit = _DummyGerrit()
     inputs = _inputs(reuse_strategy="topic", log_reconcile_json=True)

@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 from unittest.mock import patch
 
+import pytest
+
 from github2gerrit.core import GerritInfo
 from github2gerrit.core import Orchestrator
 from github2gerrit.models import Inputs
@@ -72,6 +74,7 @@ def minimal_inputs() -> Inputs:
         "-----END OPENSSH PRIVATE KEY-----",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="example",
         reviewers_email="",
         preserve_github_prs=False,
@@ -87,7 +90,7 @@ def minimal_inputs() -> Inputs:
 
 
 def test_ssh_setup_creates_workspace_specific_files(
-    tmp_path: Path, minimal_inputs: Inputs
+    tmp_path: Path, minimal_inputs: Inputs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SSH setup should create files in secure temp directory, not user SSH directory."""
     # Arrange
@@ -100,6 +103,9 @@ def test_ssh_setup_creates_workspace_specific_files(
     original_user_ssh_state = snapshot_dir_state(user_ssh_dir)
 
     orch = Orchestrator(workspace=workspace)
+
+    # Force file-based SSH authentication
+    monkeypatch.setenv("G2G_USE_SSH_AGENT", "false")
 
     # Act
     gerrit_info = GerritInfo(
@@ -164,6 +170,7 @@ def test_ssh_setup_skips_when_credentials_missing(tmp_path: Path) -> None:
         gerrit_ssh_privkey_g2g="",  # Missing private key
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="example",
         reviewers_email="",
         preserve_github_prs=False,
@@ -191,13 +198,17 @@ def test_ssh_setup_skips_when_credentials_missing(tmp_path: Path) -> None:
 
 
 def test_git_ssh_command_prevents_agent_scanning(
-    tmp_path: Path, minimal_inputs: Inputs
+    tmp_path: Path, minimal_inputs: Inputs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Generated SSH command should prevent SSH agent scanning."""
     # Arrange
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     orch = Orchestrator(workspace=workspace)
+
+    # Force file-based SSH authentication and ensure secure SSH options
+    monkeypatch.setenv("G2G_USE_SSH_AGENT", "false")
+    monkeypatch.setenv("G2G_RESPECT_USER_SSH", "false")
 
     # Act
     gerrit_info = GerritInfo(
@@ -294,12 +305,17 @@ def test_ssh_setup_preserves_existing_user_config(
             assert current_config == original_config
 
 
-def test_ssh_auto_discovery_integration(tmp_path: Path) -> None:
+def test_ssh_auto_discovery_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test SSH auto-discovery integration with core orchestrator."""
     # Arrange
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     orch = Orchestrator(workspace=workspace)
+
+    # Force file-based SSH authentication
+    monkeypatch.setenv("G2G_USE_SSH_AGENT", "false")
 
     inputs_without_known_hosts = Inputs(
         submit_single_commits=False,
@@ -311,6 +327,7 @@ def test_ssh_auto_discovery_integration(tmp_path: Path) -> None:
         "-----END OPENSSH PRIVATE KEY-----",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="testorg",
         reviewers_email="",
         preserve_github_prs=False,
@@ -344,7 +361,6 @@ def test_ssh_auto_discovery_integration(tmp_path: Path) -> None:
             gerrit_hostname="gerrit.example.org",
             gerrit_port=29418,
             organization="testorg",
-            save_to_config=True,
         )
 
         # Assert: SSH setup completed with auto-discovered keys
@@ -378,6 +394,7 @@ def test_ssh_auto_discovery_fallback_when_discovery_fails(
         "-----END OPENSSH PRIVATE KEY-----",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="testorg",
         reviewers_email="",
         preserve_github_prs=False,
@@ -415,7 +432,7 @@ def test_ssh_auto_discovery_fallback_when_discovery_fails(
 
 
 def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Test that provided known_hosts are augmented with auto-discovery when
@@ -425,6 +442,9 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     orch = Orchestrator(workspace=workspace)
+
+    # Force file-based SSH authentication
+    monkeypatch.setenv("G2G_USE_SSH_AGENT", "false")
 
     inputs_with_known_hosts = Inputs(
         submit_single_commits=False,
@@ -436,6 +456,7 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
         "-----END OPENSSH PRIVATE KEY-----",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="testorg",
         reviewers_email="",
         preserve_github_prs=False,
@@ -470,7 +491,6 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
             gerrit_hostname="gerrit.example.org",
             gerrit_port=29418,
             organization="testorg",
-            save_to_config=True,
         )
 
         # Assert: both provided and discovered keys were used
@@ -486,7 +506,7 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
 
 
 def test_ssh_command_isolation_from_environment(
-    tmp_path: Path, minimal_inputs: Inputs
+    tmp_path: Path, minimal_inputs: Inputs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SSH command should be isolated from SSH agent environment."""
     # Arrange
@@ -494,11 +514,17 @@ def test_ssh_command_isolation_from_environment(
     workspace.mkdir()
     orch = Orchestrator(workspace=workspace)
 
+    # Force file-based SSH authentication and ensure secure SSH options
+    monkeypatch.setenv("G2G_USE_SSH_AGENT", "false")
+    monkeypatch.setenv("G2G_RESPECT_USER_SSH", "false")
+
+    # Mock auto-discovery to return additional key
     # Setup with SSH agent environment variables
     original_auth_sock = os.environ.get("SSH_AUTH_SOCK")
     original_agent_pid = os.environ.get("SSH_AGENT_PID")
 
     try:
+        # Arrange: set environment variables that SSH should ignore
         os.environ["SSH_AUTH_SOCK"] = str(tmp_path / "fake_ssh_agent")
         os.environ["SSH_AGENT_PID"] = "12345"
 
