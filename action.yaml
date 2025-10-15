@@ -132,17 +132,17 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Python
+    - name: "Setup Python"
       # yamllint disable-line rule:line-length
       uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
       with:
         python-version-file: '${{ github.action_path }}/pyproject.toml'
 
-    - name: Setup uv
+    - name: "Setup uv"
       # yamllint disable-line rule:line-length
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d  # v7.1.0
 
-    - name: Checkout repository
+    - name: "Checkout repository"
       # yamllint disable-line rule:line-length
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
       with:
@@ -173,6 +173,7 @@ runs:
       shell: bash
       # yamllint disable rule:line-length
       run: |
+        # Set IssueID in GITHUB_ENV
         set -euo pipefail
         val="${{ steps.json-lookup.outputs.value }}"
         if [ -z "$val" ]; then
@@ -185,33 +186,35 @@ runs:
           echo "RESOLVED_ISSUE_ID=$val" >> "$GITHUB_ENV"
         fi
 
-    - name: Install required dependencies
+    - name: "Setup github2gerrit"
       shell: bash
       run: |
+        # Setup github2gerrit
         set -euo pipefail
         uv --version
-        # Install from PyPI when called from external repos, local source for self-testing
-        if [[ "${{ github.repository }}" == "modeseven-lfreleng-actions/github2gerrit-action" ]]; then
-          echo "Installing from local source (self-testing)"
+        # Install locally for self-testing, use uvx for external repos
+        if [[ "${{ github.repository }}" =~ lfreleng-actions/github2gerrit-action ]]; then
+          echo "Installing with: uv pip install --system ${{ github.action_path }}"
           uv pip install --system ${{ github.action_path }}
         else
-          echo "Installing from PyPI (external repository)"
-          uv pip install --system github2gerrit
+          echo "uvx will install GitHub2Gerrit from PyPI"
         fi
 
-    - name: Validate PR_NUMBER usage (non-dispatch)
+    - name: "Validate PR_NUMBER usage"
       # yamllint disable-line rule:line-length
       if: ${{ github.event_name != 'workflow_dispatch' && inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0' }}
       shell: bash
       run: |
+        # Validate PR_NUMBER usage
         set -euo pipefail
         echo "Error: PR_NUMBER only valid during workflow_dispatch events."
         exit 2
 
-    - name: Normalize PR_NUMBER for workflow_dispatch
+    - name: "Normalize PR_NUMBER"
       if: ${{ github.event_name == 'workflow_dispatch' }}
       shell: bash
       run: |
+        # Normalize PR_NUMBER
         set -euo pipefail
         pr_in="${{ inputs.PR_NUMBER }}"
         if [[ -z "${pr_in}" || "${pr_in}" == "null" ]]; then
@@ -227,9 +230,10 @@ runs:
           echo "PR_NUMBER=${pr_in}" >> "$GITHUB_ENV"
         fi
 
-    - name: Extract PR number and validate context
+    - name: "Extract PR number, validate context"
       shell: bash
       run: |
+        # Extract PR number, validate context
         set -euo pipefail
         # Honor PR_NUMBER or SYNC_ALL_OPEN_PRS set by workflow_dispatch
         if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -257,8 +261,7 @@ runs:
           fi
         fi
 
-
-    - name: Run github2gerrit Python CLI
+    - name: "Run github2gerrit Python CLI"
       id: run-cli
       shell: bash
       env:
@@ -309,20 +312,25 @@ runs:
         PR_NUMBER: ${{ env.PR_NUMBER }}
         G2G_TEST_MODE: "false"
       run: |
+        # Run github2gerrit Python CLI
         set -euo pipefail
-        echo "Invoking github2gerrit Python CLI..."
-        python -m github2gerrit.cli
+        # Use different invocation methods based on repository
+        if [[ "${{ github.repository }}" =~ lfreleng-actions/github2gerrit-action ]]; then
+          echo "Running:python -m github2gerrit.cli"
+          python -m github2gerrit.cli
+        else
+          echo "Running: uvx --from github2gerrit github2gerrit"
+          uvx --from github2gerrit github2gerrit
+        fi
 
-    - name: Capture outputs (best-effort)
+    - name: "Capture outputs"
       id: capture-outputs
       shell: bash
-      # Disable this rule when creating summary output
       # yamllint disable rule:line-length
       run: |
+        # Capture outputs
         set -euo pipefail
-        # Note: The Python CLI sets outputs inside its process. If it also writes them
-        # to GITHUB_ENV/OUTPUT in a future update, these lines will capture them.
-        # Use GitHub Actions multiline output format to support newline values.
+        # Use GitHub Actions multiline output format
         {
           echo "gerrit_change_request_url<<G2G"
           printf '%s\n' "${GERRIT_CHANGE_REQUEST_URL:-}"

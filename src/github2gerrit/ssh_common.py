@@ -8,8 +8,9 @@ CLI and core SSH setup routines, ensuring consistent behavior and options.
 """
 
 import logging
-import os
 from pathlib import Path
+
+from .utils import env_bool
 
 
 log = logging.getLogger(__name__)
@@ -43,9 +44,7 @@ def build_ssh_options(
     """
     # Check if we should respect user SSH config
     if respect_user_ssh_config is None:
-        respect_user_ssh_config = os.getenv(
-            "G2G_RESPECT_USER_SSH", "false"
-        ).lower() in ("true", "1", "yes")
+        respect_user_ssh_config = env_bool("G2G_RESPECT_USER_SSH")
 
     options = []
     if not respect_user_ssh_config:

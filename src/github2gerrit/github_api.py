@@ -26,6 +26,9 @@ from typing import Protocol
 from typing import TypeVar
 from typing import cast
 
+from .error_codes import ExitCode
+from .error_codes import GitHub2GerritError
+from .error_codes import is_github_api_permission_error
 from .external_api import ApiType
 from .external_api import external_api_call
 
@@ -138,7 +141,17 @@ def build_client(token: str | None = None) -> GhClient:
     """
     tok = token or _getenv_str("GITHUB_TOKEN")
     if not tok:
-        raise ValueError(_MSG_MISSING_GITHUB_TOKEN)
+        raise GitHub2GerritError(
+            ExitCode.GITHUB_API_ERROR,
+            message=(
+                "❌ GitHub API access failed; GITHUB_TOKEN environment "
+                "variable is required"
+            ),
+            details=(
+                "Set GITHUB_TOKEN environment variable with a valid GitHub "
+                "personal access token"
+            ),
+        )
     # per_page improves pagination; adjust as needed.
     base_url = _getenv_str("GITHUB_API_URL")
     if not base_url:
@@ -185,16 +198,58 @@ def get_repo_from_env(client: GhClient) -> GhRepository:
             "Invalid GITHUB_REPOSITORY: '%s' (expected format: 'owner/repo')",
             full,
         )
-        raise ValueError(_MSG_BAD_GITHUB_REPOSITORY)
-    repo = client.get_repo(full)
-    return repo
+        raise GitHub2GerritError(
+            ExitCode.GITHUB_API_ERROR,
+            message=(
+                "❌ GitHub API access failed; invalid GITHUB_REPOSITORY format"
+            ),
+            details=f"Expected format: 'owner/repo', got: '{full}'",
+        )
+
+    try:
+        repo = client.get_repo(full)
+    except Exception as exc:
+        if is_github_api_permission_error(exc):
+            raise GitHub2GerritError(
+                ExitCode.GITHUB_API_ERROR,
+                message=(
+                    "❌ GitHub API query failed; provide a GITHUB_TOKEN with "
+                    "the required permissions"
+                ),
+                details=(
+                    f"Cannot access repository '{full}' - check token "
+                    "permissions"
+                ),
+                original_exception=exc,
+            ) from exc
+        raise
+    else:
+        return repo
 
 
 @external_api_call(ApiType.GITHUB, "get_pull")
 def get_pull(repo: GhRepository, number: int) -> GhPullRequest:
     """Fetch a pull request by number."""
-    pr = repo.get_pull(number)
-    return pr
+    try:
+        pr = repo.get_pull(number)
+    except Exception as exc:
+        if is_github_api_permission_error(exc):
+            # Extract repository name for better error message
+            repo_name = getattr(repo, "full_name", "unknown")
+            raise GitHub2GerritError(
+                ExitCode.GITHUB_API_ERROR,
+                message=(
+                    f"❌ GitHub API query failed; cannot access pull request "
+                    f"#{number}"
+                ),
+                details=(
+                    f"Repository: {repo_name} - check GITHUB_TOKEN permissions"
+                ),
+                original_exception=exc,
+            ) from exc
+        raise
+    else:
+        return pr
 
 
 def iter_open_pulls(repo: GhRepository) -> Iterable[GhPullRequest]:
@@ -259,8 +314,22 @@ def create_pr_comment(pr: GhPullRequest, body: str) -> None:
     """Create a new comment on the pull request."""
     if not body.strip():
         return
-    issue = _get_issue(pr)
-    issue.create_comment(body)
+
+    try:
+        issue = _get_issue(pr)
+        issue.create_comment(body)
+    except Exception as exc:
+        if is_github_api_permission_error(exc):
+            raise GitHub2GerritError(
+                ExitCode.GITHUB_API_ERROR,
+                message="❌ GitHub API query failed; cannot create PR comment",
+                details=(
+                    f"Pull request #{pr.number} - GITHUB_TOKEN lacks comment "
+                    "permissions"
+                ),
+                original_exception=exc,
+            ) from exc
+        raise
 
 
 @external_api_call(ApiType.GITHUB, "close_pr")
@@ -273,4 +342,18 @@ def close_pr(pr: GhPullRequest, *, comment: str | None = None) -> None:
             log.warning(
                 "Failed to add close comment to PR #%s: %s", pr.number, exc
             )
-    pr.edit(state="closed")
+
+    try:
+        pr.edit(state="closed")
+    except Exception as exc:
+        if is_github_api_permission_error(exc):
+            raise GitHub2GerritError(
+                ExitCode.GITHUB_API_ERROR,
+                message="❌ GitHub API query failed; cannot close pull request",
+                details=(
+                    f"Pull request #{pr.number} - GITHUB_TOKEN lacks write "
+                    "permissions"
+                ),
+                original_exception=exc,
+            ) from exc
+        raise

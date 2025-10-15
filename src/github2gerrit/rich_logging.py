@@ -19,6 +19,7 @@ Key features:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 from typing import ClassVar
@@ -31,8 +32,17 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-    Console = None
-    RichHandler = None
+
+    # Fallback classes for when Rich is not available
+    class Console:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def print(self, *args: Any, **kwargs: Any) -> None:
+            print(*args)
+
+    class RichHandler:  # type: ignore
+        pass
 
 
 class RichAwareLogger:
@@ -107,41 +117,8 @@ class RichAwareLogger:
         if not RICH_AVAILABLE or self._rich_handlers_installed:
             return
 
-        # Get the root logger and key module loggers
-        loggers_to_modify = [
-            logging.getLogger(),  # Root logger
-            logging.getLogger("github2gerrit"),
-            logging.getLogger("github2gerrit.cli"),
-            logging.getLogger("github2gerrit.core"),
-            logging.getLogger("github2gerrit.duplicate_detection"),
-            logging.getLogger("github2gerrit.external_api"),
-            logging.getLogger("github2gerrit.gerrit_rest"),
-            logging.getLogger("github2gerrit.gitutils"),
-        ]
-
-        for logger in loggers_to_modify:
-            logger_name = logger.name or "root"
-
-            # Store original handlers
-            self._original_handlers[logger_name] = logger.handlers.copy()
-
-            # Remove existing handlers
-            for handler in logger.handlers[:]:
-                logger.removeHandler(handler)
-
-            # Add Rich-aware handler for ERROR and WARNING levels
-            rich_handler = RichAwareHandler(self._rich_console)
-            rich_handler.setLevel(
-                logging.WARNING
-            )  # Only handle WARNING and ERROR
-            logger.addHandler(rich_handler)
-
-            # Add silent handler for INFO and DEBUG (logs to file but not
-            # console)
-            silent_handler = SilentHandler()
-            silent_handler.setLevel(logging.DEBUG)
-            logger.addHandler(silent_handler)
-
+        # Don't install any special handlers - let normal logging work
+        # Rich displays can coexist with normal logging output
         self._rich_handlers_installed = True
 
     def _restore_original_handlers(self) -> None:
@@ -149,20 +126,7 @@ class RichAwareLogger:
         if not self._rich_handlers_installed:
             return
 
-        for logger_name, original_handlers in self._original_handlers.items():
-            logger = logging.getLogger(
-                logger_name if logger_name != "root" else None
-            )
-
-            # Remove Rich handlers
-            for handler in logger.handlers[:]:
-                logger.removeHandler(handler)
-
-            # Restore original handlers
-            for handler in original_handlers:
-                logger.addHandler(handler)
-
-        self._original_handlers.clear()
+        # No handlers to restore since we don't modify them anymore
         self._rich_handlers_installed = False
 
 
@@ -206,6 +170,64 @@ class RichAwareHandler(logging.Handler):
         except Exception:
             # Fallback to handleError if Rich printing fails
             self.handleError(record)
+
+
+class VerboseAwareHandler(logging.Handler):
+    """
+    Handler that respects verbose mode for DEBUG messages.
+
+    This handler will show DEBUG messages when verbose mode is enabled,
+    but silently discard them otherwise to prevent Rich interference.
+    """
+
+    def __init__(self, rich_console: Console | None = None) -> None:
+        """Initialize the verbose-aware handler."""
+        super().__init__()
+        self._rich_console = rich_console
+
+        # Set up formatting for debug messages
+        formatter = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
+        self.setFormatter(formatter)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Emit log record based on verbose mode and log level."""
+        # Check if verbose mode is enabled
+        verbose_enabled = os.getenv("G2G_VERBOSE", "").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+        # Always show INFO messages, show DEBUG only in verbose mode
+        if record.levelno >= logging.INFO or (
+            record.levelno >= logging.DEBUG and verbose_enabled
+        ):
+            if self._rich_console:
+                try:
+                    msg = self.format(record)
+
+                    # Choose style and prefix based on log level
+                    if record.levelno >= logging.INFO:
+                        style = "cyan"
+                        prefix = "i"
+                    else:  # DEBUG level
+                        style = "dim white"
+                        prefix = "🔍"
+
+                    # Print through Rich console
+                    self._rich_console.print(f"{prefix} {msg}", style=style)
+                except Exception:
+                    # Fallback to handleError if Rich printing fails
+                    self.handleError(record)
+            else:
+                # Fallback to standard print if no Rich console
+                try:
+                    msg = self.format(record)
+                    prefix = "i" if record.levelno >= logging.INFO else "🔍"
+                    print(f"{prefix} {msg}")
+                except Exception:
+                    self.handleError(record)
+        # If not verbose mode and it's DEBUG level, silently discard
 
 
 class SilentHandler(logging.Handler):

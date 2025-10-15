@@ -29,6 +29,7 @@ def _minimal_inputs(*, dry_run: bool = False) -> Inputs:
         gerrit_ssh_privkey_g2g="-----BEGIN KEY-----\nabc\n-----END KEY-----",
         gerrit_ssh_user_g2g="gerrit-bot",
         gerrit_ssh_user_g2g_email="gerrit-bot@example.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="example",
         reviewers_email="",
         preserve_github_prs=False,
@@ -148,6 +149,7 @@ def test_resolve_gerrit_info_dry_run_uses_derived_project_when_missing(
         gerrit_ssh_privkey_g2g=inputs.gerrit_ssh_privkey_g2g,
         gerrit_ssh_user_g2g=inputs.gerrit_ssh_user_g2g,
         gerrit_ssh_user_g2g_email=inputs.gerrit_ssh_user_g2g_email,
+        github_token=inputs.github_token,
         organization=inputs.organization,
         reviewers_email=inputs.reviewers_email,
         preserve_github_prs=inputs.preserve_github_prs,

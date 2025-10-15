@@ -44,6 +44,7 @@ def _create_test_inputs(*, issue_id: str = "CIMAN-33") -> Inputs:
         gerrit_ssh_privkey_g2g="fake-key",
         gerrit_ssh_user_g2g="onap.gh2gerrit",
         gerrit_ssh_user_g2g_email="releng+onap-gh2gerrit@linuxfoundation.org",
+        github_token="ghp_test_token_123",  # noqa: S106
         organization="onap",
         reviewers_email="",
         preserve_github_prs=False,
