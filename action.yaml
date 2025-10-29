@@ -163,7 +163,7 @@ runs:
     - name: "Get ticket from JSON lookup table"
       if: ${{ inputs.ISSUE_ID == '' && inputs.ISSUE_ID_LOOKUP == 'true' }}
       id: json-lookup
-      uses: lfit/releng-reusable-workflows/.github/actions/json-key-value-lookup-action@main
+      uses: lfreleng-actions/json-key-value-lookup-action@ed95008d49173ba450865d6c8faad0aabf07a39c  # v0.1.0
       with:
         json: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
         key: ${{ env.key }}
