@@ -325,18 +325,6 @@ autolabeler:
 The tool will detect the capitalization style from these files and apply
 it consistently to normalized commit messages.
 
-## Exit Codes
-
-The CLI tool uses specific exit codes to signal different types of failures,
-making it easier to handle errors in automation and CI/CD pipelines:
-
-| Exit Code | Description | Common Causes |
-|-----------|-------------|---------------|
-| `0` | Success | Operation completed |
-| `1` | General runtime failure | Submission pipeline errors, Git operations failed, network issues, unhandled exceptions |
-| `2` | Configuration or validation error | Invalid configuration parameters, missing required settings, empty PR context |
-| `3` | Duplicate detection blocked submission | Similar change already exists in Gerrit and `ALLOW_DUPLICATES` is `false` |
-
 ### Example Usage in CI/CD
 
 ```bash
