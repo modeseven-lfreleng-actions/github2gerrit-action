@@ -764,6 +764,115 @@ variable.
 **Note**: Unknown configuration keys will generate warnings to help catch typos
 and missing functionality.
 
+### Credential Derivation
+
+When `GERRIT_SSH_USER_G2G` and `GERRIT_SSH_USER_G2G_EMAIL` are not explicitly provided,
+the tool automatically derives these credentials using a multi-source approach with the
+following priority order:
+
+#### Derivation Sources (in priority order)
+
+1. **SSH Config User** (if `G2G_RESPECT_USER_SSH=true` in local mode)
+   - Reads from `~/.ssh/config` for the specific Gerrit host
+   - Matches host patterns (supports wildcards like `gerrit.*`)
+   - Extracts the `User` directive for matching entries
+
+2. **Git User Email** (if `G2G_RESPECT_USER_SSH=true` in local mode)
+   - Reads from local git configuration (`git config user.email`)
+   - Used as the email address for commits
+
+3. **Organization-based Fallback** (default for GitHub Actions)
+   - Derives credentials from the GitHub organization name
+   - Generates standardized values
+
+#### Organization-based Pattern
+
+The fallback credentials follow this pattern based on the `ORGANIZATION` value:
+
+- **Gerrit Server**: Derived as `gerrit.{organization}.org` (or from config file)
+- **SSH Username**: `{organization}.gh2gerrit`
+- **Email Address**: `releng+{organization}-gh2gerrit@linuxfoundation.org`
+
+**Example**: For organization `onap`:
+
+- Server: `gerrit.onap.org`
+- Username: `onap.gh2gerrit`
+- Email: `releng+onap-gh2gerrit@linuxfoundation.org`
+
+#### Organization Name Source
+
+The tool determines the organization name from GitHub context in the following order:
+
+1. Explicit `ORGANIZATION` parameter (action input or environment variable)
+2. `GITHUB_REPOSITORY_OWNER` (automatically set by GitHub Actions to the repository owner)
+
+**Example**: For a repository `onap/releng-builder`:
+
+- Organization: `onap` (from `github.repository_owner`)
+- Derived server: `gerrit.onap.org`
+- Derived username: `onap.gh2gerrit`
+- Derived email: `releng+onap-gh2gerrit@linuxfoundation.org`
+
+The tool normalizes the organization name to lowercase before using it to construct the
+Gerrit server hostname and credentials.
+
+#### Local Development Mode
+
+For local CLI usage, set `G2G_RESPECT_USER_SSH=true` to use your personal SSH config
+and git config instead of organization-based defaults:
+
+```bash
+# Enable personalized credentials from SSH/git config
+export G2G_RESPECT_USER_SSH=true
+github2gerrit https://github.com/org/repo/pull/123
+```
+
+**Example `~/.ssh/config` entry:**
+
+```ssh-config
+Host gerrit.*.org
+    User alice
+
+Host gerrit.opendaylight.org
+    User alice-odl
+    Port 29418
+```
+
+With this configuration and `G2G_RESPECT_USER_SSH=true`:
+
+- Username will be `alice` (from SSH config)
+- Email will be from `git config user.email`
+- Falls back to organization-based values if SSH/git config not found
+
+#### GitHub Actions Mode
+
+In GitHub Actions (the default), credentials always use the organization-based fallback
+pattern unless explicitly provided via action inputs:
+
+```yaml
+- uses: lfreleng-actions/github2gerrit-action@main
+  with:
+    ORGANIZATION: ${{ github.repository_owner }}  # e.g., "onap"
+    # Credentials auto-derived:
+    # - GERRIT_SSH_USER_G2G: onap.gh2gerrit
+    # - GERRIT_SSH_USER_G2G_EMAIL: releng+onap-gh2gerrit@linuxfoundation.org
+```
+
+To override with custom credentials:
+
+```yaml
+- uses: lfreleng-actions/github2gerrit-action@main
+  with:
+    GERRIT_SSH_USER_G2G: ${{ vars.GERRIT_SSH_USER_G2G }}
+    GERRIT_SSH_USER_G2G_EMAIL: ${{ vars.GERRIT_SSH_USER_G2G_EMAIL }}
+    ORGANIZATION: ${{ github.repository_owner }}
+```
+
+#### Disabling Derivation
+
+To disable automatic derivation entirely, set `G2G_ENABLE_DERIVATION=false`. This requires
+all Gerrit parameters to be explicitly provided.
+
 ### Issue ID Lookup
 
 > **Migration Note**: If you were using repository variables `ISSUE_ID_LOOKUP`
