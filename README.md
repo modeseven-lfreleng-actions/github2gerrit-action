@@ -671,7 +671,7 @@ alignment between action inputs, environment variables, and CLI flags:
 | `CI_TESTING` | `CI_TESTING` | `--ci-testing` | No | `"false"` | Enable CI testing mode (overrides .gitreview) |
 | `ISSUE_ID` | `ISSUE_ID` | `--issue-id` | No | `""` | Issue ID to include (e.g., ABC-123) |
 | `ISSUE_ID_LOOKUP` | N/A | N/A | No | `"false"` | Enable Issue ID lookup via JSON table |
-| `ISSUE_ID_LOOKUP_JSON` | N/A | N/A | No | `"{}"` | JSON mapping of GitHub actors to Issue IDs |
+| `ISSUE_ID_LOOKUP_JSON` | N/A | N/A | No | `"[]"` | JSON array mapping GitHub actors to Issue IDs |
 | `G2G_USE_SSH_AGENT` | `G2G_USE_SSH_AGENT` | N/A | No | `"true"` | Use SSH agent for authentication |
 | `DUPLICATE_TYPES` | `DUPLICATE_TYPES` | `--duplicate-types` | No | `"open"` | Comma-separated Gerrit change states to check for duplicate detection |
 | `GERRIT_SERVER` | `GERRIT_SERVER` | `--gerrit-server` | No² | `""` | Gerrit server hostname (auto-derived if enabled) |
@@ -686,6 +686,10 @@ alignment between action inputs, environment variables, and CLI flags:
 
 1. Auto-derived when `G2G_ENABLE_DERIVATION=true` (default: true in all contexts)
 2. Optional if `.gitreview` file exists in repository
+
+The format required for the JSON Issue-ID lookup is:
+
+`[{"key": "username", "value": "ISSUE-ID"}]`
 
 ### Internal Environment Variables
 
@@ -788,12 +792,12 @@ explicit `ISSUE_ID` exists:
 2. **Example JSON format:**
 
    ```json
-   {
-     "dependabot[bot]": "AUTO-123",
-     "renovate[bot]": "AUTO-456",
-     "alice": "PROJ-789",
-     "bob": "PROJ-101"
-   }
+   [
+     { "key": "dependabot[bot]", "value": "AUTO-123" },
+     { "key": "renovate[bot]", "value": "AUTO-456" },
+     { "key": "alice", "value": "PROJ-789" },
+     { "key": "bob", "value": "PROJ-101" }
+   ]
    ```
 
 **Lookup Logic:**
