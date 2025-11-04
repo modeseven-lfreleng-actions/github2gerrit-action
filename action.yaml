@@ -114,9 +114,9 @@ inputs:
     required: false
     default: "false"
   ISSUE_ID_LOOKUP_JSON:
-    description: "JSON mapping of GitHub actors to Issue IDs"
+    description: "JSON array mapping GitHub actors to Issue IDs"
     required: false
-    default: "{}"
+    default: "[]"
 
 outputs:
   gerrit_change_request_url:

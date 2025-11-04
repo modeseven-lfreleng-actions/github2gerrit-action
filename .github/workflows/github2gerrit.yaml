@@ -95,6 +95,16 @@ on:
         required: false
         default: ""
         type: string
+      ISSUE_ID_LOOKUP:
+        description: "Enable Issue ID lookup via JSON table"
+        required: false
+        default: false
+        type: boolean
+      ISSUE_ID_LOOKUP_JSON:
+        description: "JSON array mapping GitHub actors to Issue IDs"
+        required: false
+        default: "[]"
+        type: string
       ALLOW_DUPLICATES:
         description: "Allow submitting duplicate changes without error"
         required: false
@@ -184,6 +194,8 @@ jobs:
           PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
           DRY_RUN: ${{ inputs.DRY_RUN }}
           ISSUE_ID: ${{ inputs.ISSUE_ID }}
+          ISSUE_ID_LOOKUP: ${{ vars.ISSUE_ID_LOOKUP }}
+          ISSUE_ID_LOOKUP_JSON: ${{ vars.ISSUE_ID_LOOKUP_JSON }}
           PR_NUMBER: ${{ inputs.PR_NUMBER }}
 
   github2gerrit:
@@ -213,6 +225,8 @@ jobs:
           DRY_RUN: ${{ inputs.DRY_RUN }}
           ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
           ISSUE_ID: ${{ inputs.ISSUE_ID }}
+          ISSUE_ID_LOOKUP: ${{ inputs.ISSUE_ID_LOOKUP }}
+          ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
           GERRIT_SERVER: ${{ inputs.GERRIT_SERVER }}
           GERRIT_SERVER_PORT: ${{ inputs.GERRIT_SERVER_PORT }}
           GERRIT_PROJECT: ${{ inputs.GERRIT_PROJECT }}
