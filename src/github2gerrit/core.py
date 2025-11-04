@@ -121,69 +121,8 @@ _MSG_PYGERRIT2_MISSING = "pygerrit2 missing"
 _MSG_PYGERRIT2_AUTH_MISSING = "pygerrit2 auth missing"
 
 
-def _insert_issue_id_into_commit_message(message: str, issue_id: str) -> str:
-    """
-    Insert Issue ID into commit message footer above Change-Id.
-
-    Format:
-    Title line
-
-    Body content...
-
-    Issue-ID: CIMAN-33
-    Change-Id: I1234567890123456789012345678901234567890
-    """
-    if not issue_id.strip():
-        return message
-
-    # Validate that Issue ID is a single line string
-    cleaned_issue_id = issue_id.strip()
-    if "\n" in cleaned_issue_id or "\r" in cleaned_issue_id:
-        raise ValueError(_MSG_ISSUE_ID_MULTILINE)
-
-    # Format as proper Issue-ID trailer
-    issue_line = (
-        cleaned_issue_id
-        if cleaned_issue_id.startswith("Issue-ID:")
-        else f"Issue-ID: {cleaned_issue_id}"
-    )
-
-    # Parse the message to find trailers
-    lines = message.splitlines()
-    if not lines:
-        return message
-
-    # Find the start of trailers (lines like "Key: value" at the end)
-    trailer_start = len(lines)
-    for i in range(len(lines) - 1, -1, -1):
-        line = lines[i].strip()
-        if not line:
-            continue
-        # Common trailer patterns
-        if any(
-            line.startswith(prefix)
-            for prefix in [
-                "Change-Id:",
-                "Signed-off-by:",
-                "Co-authored-by:",
-                "GitHub-",
-            ]
-        ):
-            trailer_start = i
-        else:
-            break
-
-    # Insert Issue-ID at the beginning of trailers
-    if trailer_start < len(lines):
-        # There are existing trailers
-        lines.insert(trailer_start, issue_line)
-    else:
-        # No existing trailers, add at the end
-        if lines and lines[-1].strip():
-            lines.append("")  # Empty line before trailer
-        lines.append(issue_line)
-
-    return "\n".join(lines)
+# Removed _insert_issue_id_into_commit_message - dead code
+# All commit message building now uses _build_commit_message_with_trailers
 
 
 def _clean_ellipses_from_message(message: str) -> str:
@@ -329,6 +268,133 @@ class Orchestrator:
         except Exception as exc:
             log.debug("Failed to compute GitHub-Hash trailer: %s", exc)
         return trailers
+
+    def _build_commit_message_with_trailers(
+        self,
+        base_message: str,
+        inputs: Inputs,
+        gh: GitHubContext,
+        *,
+        change_id: str | None = None,
+        preserve_existing: bool = True,
+    ) -> str:
+        """
+        Build complete commit message with all trailers in proper order.
+
+        This is the single source of truth for trailer management.
+
+        Trailer order:
+        1. Issue-ID (if provided)
+        2. Signed-off-by (preserved or added)
+        3. Change-ID (if provided or preserved)
+        4. GitHub-PR
+        5. GitHub-Hash
+
+        Args:
+            base_message: The base commit message (subject + body)
+            inputs: User inputs including issue_id
+            gh: GitHub context
+            change_id: Optional Change-ID to inject
+            preserve_existing: Whether to preserve existing trailers
+
+        Returns:
+            Complete commit message with all trailers properly ordered
+        """
+        from .gitutils import _parse_trailers
+
+        # Parse existing trailers if preserving
+        existing_trailers = {}
+        if preserve_existing:
+            existing_trailers = _parse_trailers(base_message)
+
+        # Split message into body and trailers
+        lines = base_message.splitlines()
+        body_lines = []
+
+        # Find where trailers start (working backwards)
+        trailer_start = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].strip()
+            if not line:
+                continue
+            # Common trailer patterns
+            if any(
+                line.startswith(prefix)
+                for prefix in [
+                    "Issue-ID:",
+                    "Signed-off-by:",
+                    "Change-Id:",
+                    "GitHub-PR:",
+                    "GitHub-Hash:",
+                    "Co-authored-by:",
+                ]
+            ):
+                trailer_start = i
+            else:
+                break
+
+        # Body is everything before trailers
+        body_lines = lines[:trailer_start]
+        base_body = "\n".join(body_lines).rstrip()
+
+        # Build trailers in proper order
+        trailers_ordered: list[str] = []
+
+        # 1. Issue-ID (if provided)
+        if inputs.issue_id.strip():
+            issue_line = (
+                inputs.issue_id.strip()
+                if inputs.issue_id.strip().startswith("Issue-ID:")
+                else f"Issue-ID: {inputs.issue_id.strip()}"
+            )
+            # Check if not already in the trailers
+            if "Issue-ID" not in existing_trailers:
+                trailers_ordered.append(issue_line)
+                # Log and display Issue-ID addition (only once)
+                issue_id_value = inputs.issue_id.strip().replace(
+                    "Issue-ID: ", ""
+                )
+                log.info(
+                    "Adding Issue-ID to commit message: %s", issue_id_value
+                )
+                print(f"✅ Added Issue-ID {issue_id_value} to commit message")
+        elif preserve_existing and "Issue-ID" in existing_trailers:
+            # Preserve existing Issue-ID
+            for issue_id_val in existing_trailers["Issue-ID"]:
+                trailers_ordered.append(f"Issue-ID: {issue_id_val}")
+
+        # 2. Signed-off-by (preserve existing)
+        if preserve_existing and "Signed-off-by" in existing_trailers:
+            seen_sob: set[str] = set()
+            for sob_val in existing_trailers["Signed-off-by"]:
+                sob_line = f"Signed-off-by: {sob_val}"
+                if sob_line not in seen_sob:
+                    trailers_ordered.append(sob_line)
+                    seen_sob.add(sob_line)
+
+        # 3. Change-ID
+        if change_id:
+            # Use provided Change-ID
+            trailers_ordered.append(f"Change-Id: {change_id}")
+        elif preserve_existing and "Change-Id" in existing_trailers:
+            # Preserve existing Change-ID (use last one)
+            cid_val = existing_trailers["Change-Id"][-1]
+            trailers_ordered.append(f"Change-Id: {cid_val}")
+
+        # 4 & 5. GitHub metadata (GitHub-PR, GitHub-Hash)
+        gh_metadata = self._build_pr_metadata_trailers(gh)
+        for gh_trailer in gh_metadata:
+            # Check if not already present
+            if gh_trailer not in trailers_ordered:
+                trailers_ordered.append(gh_trailer)
+
+        # Assemble final message
+        if trailers_ordered:
+            final_message = base_body + "\n\n" + "\n".join(trailers_ordered)
+        else:
+            final_message = base_body
+
+        return final_message
 
     def _emit_change_id_map_comment(
         self,
@@ -1981,53 +2047,38 @@ class Orchestrator:
             git_commit_amend(
                 author=author, no_edit=True, signoff=True, cwd=self.workspace
             )
-            # Phase 3: Reuse Change-Id if provided
+
+            # Get current commit message
+            cur_msg = run_cmd(
+                ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
+                cwd=self.workspace,
+            ).stdout
+            # Clean ellipses from commit message
+            cur_msg = _clean_ellipses_from_message(cur_msg)
+
+            # Determine Change-ID to use (reuse if provided)
+            desired_change_id = None
             if reuse_change_ids and idx < len(reuse_change_ids):
-                desired = reuse_change_ids[idx]
-                if desired:
-                    cur_msg = run_cmd(
-                        ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
-                        cwd=self.workspace,
-                    ).stdout
-                    # Clean ellipses from commit message
-                    cur_msg = _clean_ellipses_from_message(cur_msg)
-                    if f"Change-Id: {desired}" not in cur_msg:
-                        amended = (
-                            cur_msg.rstrip() + f"\n\nChange-Id: {desired}\n"
-                        )
-                        git_commit_amend(
-                            author=author,
-                            no_edit=False,
-                            signoff=False,
-                            message=amended,
-                            cwd=self.workspace,
-                        )
-            # Phase 1: ensure PR metadata trailers (idempotent)
-            try:
-                meta = self._build_pr_metadata_trailers(gh)
-                if meta:
-                    cur_msg = run_cmd(
-                        ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
-                        cwd=self.workspace,
-                    ).stdout
-                    # Clean ellipses from commit message
-                    cur_msg = _clean_ellipses_from_message(cur_msg)
-                    needed = [m for m in meta if m not in cur_msg]
-                    if needed:
-                        new_msg = Orchestrator._append_missing_trailers(
-                            cur_msg, needed
-                        )
-                        git_commit_amend(
-                            message=new_msg,
-                            no_edit=False,
-                            signoff=False,
-                            cwd=self.workspace,
-                        )
-            except Exception as meta_exc:
-                log.debug(
-                    "Skipping metadata trailer injection for commit %s: %s",
-                    csha,
-                    meta_exc,
+                desired_change_id = reuse_change_ids[idx]
+
+            # Use centralized function to build complete message
+            # with all trailers
+            new_msg = self._build_commit_message_with_trailers(
+                base_message=cur_msg,
+                inputs=inputs,
+                gh=gh,
+                change_id=desired_change_id,
+                preserve_existing=True,
+            )
+
+            # Only amend if message changed
+            if new_msg.strip() != cur_msg.strip():
+                git_commit_amend(
+                    message=new_msg,
+                    no_edit=False,
+                    signoff=False,
+                    author=author,
+                    cwd=self.workspace,
                 )
             # Extract newly added Change-Id from last commit trailers
             trailers = git_last_commit_trailers(
@@ -2338,30 +2389,19 @@ class Orchestrator:
                 )
             return reuse
 
-        def _compose_commit_message(
+        def _compose_base_message(
             lines_in: list[str],
             signed_off: list[str],
-            reuse_cid: str,
         ) -> str:
+            """
+            Compose base message with Signed-off-by for centralized
+            builder.
+            """
             msg = "\n".join(lines_in).strip()
-
-            # Build footer with proper trailer ordering (Issue-ID first,
-            # then others)
-            footer_parts = []
-            if inputs.issue_id.strip():
-                issue_line = (
-                    inputs.issue_id.strip()
-                    if inputs.issue_id.strip().startswith("Issue-ID:")
-                    else f"Issue-ID: {inputs.issue_id.strip()}"
-                )
-                footer_parts.append(issue_line)
+            # Add Signed-off-by to message body so centralized function
+            # can parse it
             if signed_off:
-                footer_parts.extend(signed_off)
-            if reuse_cid:
-                footer_parts.append(f"Change-Id: {reuse_cid}")
-
-            if footer_parts:
-                msg += "\n\n" + "\n".join(footer_parts)
+                msg += "\n\n" + "\n".join(signed_off)
             return msg
 
         # Build message parts
@@ -2378,28 +2418,23 @@ class Orchestrator:
             cand = reuse_change_ids[0]
             if cand:
                 reuse_cid = cand
-        commit_msg = _compose_commit_message(clean_lines, signed_off, reuse_cid)
+        # Build base message with Signed-off-by
+        base_msg = _compose_base_message(clean_lines, signed_off)
+
+        # Use centralized function to build complete message with all trailers
+        commit_msg = self._build_commit_message_with_trailers(
+            base_message=base_msg,
+            inputs=inputs,
+            gh=gh,
+            change_id=reuse_cid,
+            preserve_existing=True,
+        )
 
         # Preserve primary author from the PR head commit
         author = run_cmd(
             ["git", "show", "-s", "--pretty=format:%an <%ae>", head_sha],
             cwd=self.workspace,
         ).stdout.strip()
-        # Phase 1: ensure metadata trailers before creating commit
-        # (idempotent merge)
-        try:
-            meta = self._build_pr_metadata_trailers(gh)
-            if meta:
-                needed = [m for m in meta if m not in commit_msg]
-                if needed:
-                    commit_msg = Orchestrator._append_missing_trailers(
-                        commit_msg, needed
-                    )
-        except Exception as meta_exc:
-            log.debug(
-                "Skipping metadata trailer injection (squash path): %s",
-                meta_exc,
-            )
 
         git_commit_new(
             message=commit_msg,
@@ -2506,59 +2541,35 @@ class Orchestrator:
         change_id_lines = [
             ln for ln in lines_cur if ln.startswith("Change-Id:")
         ]
-        github_hash_lines = [
-            ln for ln in lines_cur if ln.startswith("GitHub-Hash:")
-        ]
-        github_pr_lines = [
-            ln for ln in lines_cur if ln.startswith("GitHub-PR:")
-        ]
 
-        msg_parts = [title, "", body] if title or body else [current_body]
-        commit_message = "\n".join(msg_parts).strip()
-
-        # Issue-ID will be added in the footer section later
-        # (removed from here to avoid duplication)
-
-        # Prepare GitHub-Hash (will be placed after GitHub-PR at footer)
-        if github_hash_lines:
-            gh_hash_line = github_hash_lines[-1]
+        # Build base message with PR title/body plus existing Signed-off-by
+        if title or body:
+            msg_parts = [title, "", body]
+            # Include Signed-off-by trailers in the base message
+            # so centralized function can preserve them
+            if signed_lines:
+                msg_parts.append("")
+                msg_parts.extend(signed_lines)
+            base_message = "\n".join(msg_parts).strip()
         else:
-            from .duplicate_detection import DuplicateDetector
+            base_message = current_body
 
-            gh_val = DuplicateDetector._generate_github_change_hash(gh)
-            gh_hash_line = f"GitHub-Hash: {gh_val}"
-
-        # Build trailers: Signed-off-by first, Change-Id next.
-        trailers_out: list[str] = []
-        if signed_lines:
-            seen_so: set[str] = set()
-            for ln in signed_lines:
-                if ln not in seen_so:
-                    trailers_out.append(ln)
-                    seen_so.add(ln)
+        # Determine Change-ID to preserve
+        change_id_to_use = None
         if change_id_lines:
-            trailers_out.append(change_id_lines[-1])
-
-        # GitHub-PR (after Change-Id)
-        if github_pr_lines:
-            pr_line = github_pr_lines[-1]
-        else:
-            pr_line = (
-                f"GitHub-PR: {gh.server_url}/{gh.repository}/pull/"
-                f"{gh.pr_number}"
-                if gh.pr_number
-                else ""
+            change_id_to_use = (
+                change_id_lines[-1].replace("Change-Id: ", "").strip()
             )
 
-        # Assemble footer in desired order:
-        footer_lines: list[str] = []
-        footer_lines.extend(trailers_out)
-        if pr_line:
-            footer_lines.append(pr_line)
-        footer_lines.append(gh_hash_line)
-
-        if footer_lines:
-            commit_message += "\n\n" + "\n".join(footer_lines)
+        # Use centralized function to build complete message
+        # with all trailers
+        commit_message = self._build_commit_message_with_trailers(
+            base_message=base_message,
+            inputs=inputs,
+            gh=gh,
+            change_id=change_id_to_use,
+            preserve_existing=True,
+        )
 
         author = run_cmd(
             ["git", "show", "-s", "--pretty=format:%an <%ae>", "HEAD"],
@@ -2572,7 +2583,7 @@ class Orchestrator:
             author=author,
             message=commit_message,
         )
-        # Phase 2: collect Change-Id trailers for later comment emission
+        # Collect Change-Id trailers for later comment emission
         try:
             trailers_after = git_last_commit_trailers(
                 keys=["Change-Id"], cwd=self.workspace
@@ -2583,31 +2594,6 @@ class Orchestrator:
         except Exception as exc:
             log.debug(
                 "Failed to collect Change-Ids after apply_pr_title: %s", exc
-            )
-        # Phase 1: ensure trailers present even if earlier logic skipped
-        # (idempotent)
-        try:
-            meta = self._build_pr_metadata_trailers(gh)
-            if meta:
-                cur_msg = run_cmd(
-                    ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
-                    cwd=self.workspace,
-                ).stdout
-                needed = [m for m in meta if m not in cur_msg]
-                if needed:
-                    new_msg = Orchestrator._append_missing_trailers(
-                        cur_msg, needed
-                    )
-                    git_commit_amend(
-                        cwd=self.workspace,
-                        no_edit=False,
-                        signoff=False,
-                        author=author,
-                        message=new_msg,
-                    )
-        except Exception as meta_exc:
-            log.debug(
-                "Skipping post-apply metadata trailer ensure: %s", meta_exc
             )
 
     @staticmethod

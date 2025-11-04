@@ -60,6 +60,7 @@ def _inputs(*, use_pr_as_commit: bool = True) -> Inputs:
         gerrit_server_port="",
         gerrit_project="",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
         duplicates_filter="open",

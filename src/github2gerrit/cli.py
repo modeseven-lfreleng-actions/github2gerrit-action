@@ -263,6 +263,69 @@ _MSG_MISSING_REQUIRED_INPUT = "Missing required input: {field_name}"
 _MSG_INVALID_FETCH_DEPTH = "FETCH_DEPTH must be a positive integer"
 _MSG_ISSUE_ID_MULTILINE = "Issue ID must be single line"
 
+
+def _resolve_issue_id_from_json(json_str: str, github_actor: str) -> str:
+    """
+    Resolve Issue-ID from JSON lookup table.
+
+    Args:
+        json_str: JSON array with format
+            [{"key": "username", "value": "ISSUE-ID"}]
+        github_actor: GitHub username to lookup
+
+    Returns:
+        Resolved Issue-ID or empty string if not found/invalid
+    """
+    if not json_str or not github_actor:
+        return ""
+
+    try:
+        # Parse JSON
+        lookup_data = json.loads(json_str)
+
+        # Validate it's an array
+        if not isinstance(lookup_data, list):
+            log.warning(
+                "⚠️ Warning: Issue-ID JSON was not valid (expected array)"
+            )
+            print("⚠️ Warning: Issue-ID JSON was not valid")
+            return ""
+
+        # Search for matching key
+        for entry in lookup_data:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("key") == github_actor:
+                issue_id = entry.get("value", "")
+                if issue_id:
+                    log.info(
+                        "Resolved Issue-ID from JSON lookup: %s -> %s",
+                        github_actor,
+                        issue_id,
+                    )
+                    return str(issue_id)
+
+        # No match found - return empty string
+        log.debug(
+            "No Issue-ID found in JSON lookup for GitHub actor: %s",
+            github_actor,
+        )
+
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "⚠️ Warning: Issue-ID JSON was not valid (parse error: %s)",
+            exc,
+        )
+        print("⚠️ Warning: Issue-ID JSON was not valid")
+    except Exception as exc:
+        log.warning(
+            "⚠️ Warning: Issue-ID JSON lookup failed: %s",
+            exc,
+        )
+
+    return ""
+
+
 # Show version information when --help is used or in GitHub Actions mode
 if "--help" in sys.argv or _is_github_actions_context():
     try:
@@ -437,6 +500,15 @@ def main(
         envvar="ISSUE_ID",
         help="Issue ID to include in commit message (e.g., Issue-ID: ABC-123).",
     ),
+    issue_id_lookup_json: str = typer.Option(
+        "",
+        "--issue-id-lookup-json",
+        envvar="ISSUE_ID_LOOKUP_JSON",
+        help=(
+            "JSON array mapping GitHub actors to Issue IDs "
+            "for automatic lookup."
+        ),
+    ),
     log_reconcile_json: bool = typer.Option(
         True,
         "--log-reconcile-json/--no-log-reconcile-json",
@@ -478,7 +550,13 @@ def main(
         "",
         "--reviewers-email",
         envvar="REVIEWERS_EMAIL",
-        help="Comma-separated list of reviewer emails.",
+        help="Email(s) of reviewers (comma-separated).",
+    ),
+    github_actor: str = typer.Option(
+        "",
+        "--github-actor",
+        envvar="GITHUB_ACTOR",
+        help="GitHub actor (username) who triggered the workflow.",
     ),
     show_progress: bool = typer.Option(
         True,
@@ -632,8 +710,16 @@ def main(
         os.environ["GERRIT_SERVER_PORT"] = str(gerrit_server_port)
     if gerrit_project:
         os.environ["GERRIT_PROJECT"] = gerrit_project
-    if issue_id:
-        os.environ["ISSUE_ID"] = issue_id
+
+    # Handle Issue-ID lookup from JSON if provided
+    resolved_issue_id = issue_id
+    if not resolved_issue_id and issue_id_lookup_json:
+        resolved_issue_id = _resolve_issue_id_from_json(
+            issue_id_lookup_json, github_actor
+        )
+
+    if resolved_issue_id:
+        os.environ["ISSUE_ID"] = resolved_issue_id
     os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
     os.environ["CI_TESTING"] = "true" if ci_testing else "false"
     os.environ["DUPLICATE_TYPES"] = duplicate_types
@@ -746,6 +832,7 @@ def _build_inputs_from_env() -> Inputs:
         ),
         gerrit_project=env_str("GERRIT_PROJECT"),
         issue_id=env_str("ISSUE_ID", ""),
+        issue_id_lookup_json=env_str("ISSUE_ID_LOOKUP_JSON", ""),
         allow_duplicates=env_bool("ALLOW_DUPLICATES", False),
         ci_testing=env_bool("CI_TESTING", False),
         duplicates_filter=env_str("DUPLICATE_TYPES", "open"),
@@ -1306,6 +1393,7 @@ def _load_effective_inputs() -> Inputs:
                     gerrit_server_port=data.gerrit_server_port,
                     gerrit_project=data.gerrit_project,
                     issue_id=data.issue_id,
+                    issue_id_lookup_json=data.issue_id_lookup_json,
                     allow_duplicates=data.allow_duplicates,
                     ci_testing=data.ci_testing,
                     duplicates_filter=data.duplicates_filter,
@@ -1863,6 +1951,12 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
         config_info["DRY_RUN"] = str(data.dry_run)
     if data.ci_testing:
         config_info["CI_TESTING"] = str(data.ci_testing)
+
+    # Show Issue ID if provided
+    if data.issue_id:
+        config_info["ISSUE_ID"] = data.issue_id
+    else:
+        config_info["ISSUE_ID"] = "❎ Not provided"
 
     # Show Gerrit settings if they have values
     if data.gerrit_server:

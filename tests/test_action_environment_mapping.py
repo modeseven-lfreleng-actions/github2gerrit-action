@@ -131,10 +131,8 @@ class TestActionEnvironmentMapping:
         env_mapping = cli_step.get("env", {})
         issue_id_env = env_mapping.get("ISSUE_ID", "")
 
-        # Should have conditional logic for ISSUE_ID
-        assert "inputs.ISSUE_ID != ''" in issue_id_env
-        assert "inputs.ISSUE_ID" in issue_id_env
-        assert "env.RESOLVED_ISSUE_ID" in issue_id_env
+        # Should directly map ISSUE_ID input (no conditional logic now)
+        assert issue_id_env == "${{ inputs.ISSUE_ID }}"
 
     def test_test_mode_environment(self, action_config):
         """Test test mode environment variable is set."""

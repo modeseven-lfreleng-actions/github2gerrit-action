@@ -382,8 +382,7 @@ jobs:
           ORGANIZATION: ${{ github.repository_owner }}
           REVIEWERS_EMAIL: ""
           ISSUE_ID: ""  # Optional: adds 'Issue-ID: ...' trailer to the commit message
-          # ISSUE_ID_LOOKUP: ${{ vars.ISSUE_ID_LOOKUP }}  # Optional: enable JSON lookup
-          # ISSUE_ID_LOOKUP_JSON: ${{ vars.ISSUE_ID_LOOKUP_JSON }}  # Optional: JSON lookup table
+          ISSUE_ID_LOOKUP_JSON: ${{ vars.ISSUE_ID_LOOKUP_JSON }}  # Optional: JSON lookup table for automatic Issue-ID resolution
 ```
 
 The action reads `.gitreview`. If `.gitreview` is absent, you must
@@ -670,8 +669,7 @@ alignment between action inputs, environment variables, and CLI flags:
 | `ALLOW_DUPLICATES` | `ALLOW_DUPLICATES` | `--allow-duplicates` | No | `"false"` | Allow submitting duplicate changes without error |
 | `CI_TESTING` | `CI_TESTING` | `--ci-testing` | No | `"false"` | Enable CI testing mode (overrides .gitreview) |
 | `ISSUE_ID` | `ISSUE_ID` | `--issue-id` | No | `""` | Issue ID to include (e.g., ABC-123) |
-| `ISSUE_ID_LOOKUP` | N/A | N/A | No | `"false"` | Enable Issue ID lookup via JSON table |
-| `ISSUE_ID_LOOKUP_JSON` | N/A | N/A | No | `"[]"` | JSON array mapping GitHub actors to Issue IDs |
+| `ISSUE_ID_LOOKUP_JSON` | `ISSUE_ID_LOOKUP_JSON` | `--issue-id-lookup-json` | No | `"[]"` | JSON array mapping GitHub actors to Issue IDs (automatic lookup if ISSUE_ID not provided) |
 | `G2G_USE_SSH_AGENT` | `G2G_USE_SSH_AGENT` | N/A | No | `"true"` | Use SSH agent for authentication |
 | `DUPLICATE_TYPES` | `DUPLICATE_TYPES` | `--duplicate-types` | No | `"open"` | Comma-separated Gerrit change states to check for duplicate detection |
 | `GERRIT_SERVER` | `GERRIT_SERVER` | `--gerrit-server` | No² | `""` | Gerrit server hostname (auto-derived if enabled) |
@@ -766,30 +764,26 @@ and missing functionality.
 
 ### Issue ID Lookup
 
-> **Migration Note**: If you were using repository variables `ISSUE_ID_LOOKUP`
-> and `ISSUE_ID_LOOKUP_JSON` directly, you now need to pass them as inputs to
-> the action. See the example below.
-
-The action supports automatic Issue ID resolution via JSON lookup when no
-explicit `ISSUE_ID` exists:
+The action supports automatic Issue ID resolution via JSON lookup when you
+omit `ISSUE_ID`. Set the `ISSUE_ID_LOOKUP_JSON` input with a valid JSON array,
+and the action will automatically look up the Issue ID based on the GitHub
+actor who created the pull request.
 
 ```yaml
 - uses: lfreleng-actions/github2gerrit-action@v1
   with:
     GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
-    # Enable Issue ID lookup (pass repository variables as inputs)
-    ISSUE_ID_LOOKUP: ${{ vars.ISSUE_ID_LOOKUP }}
+    # Automatic Issue ID lookup (pass repository variable as input)
     ISSUE_ID_LOOKUP_JSON: ${{ vars.ISSUE_ID_LOOKUP_JSON }}
     # ... other inputs
 ```
 
-**Setup Requirements:**
+**Setup:**
 
-1. Set repository variables:
-   - `ISSUE_ID_LOOKUP`: `"true"` (enables lookup feature)
-   - `ISSUE_ID_LOOKUP_JSON`: JSON mapping of GitHub usernames to Issue IDs
+Set a repository or organization variable named `ISSUE_ID_LOOKUP_JSON` with a
+JSON array mapping GitHub usernames to Issue IDs:
 
-2. **Example JSON format:**
+**Example JSON format:**
 
    ```json
    [
@@ -802,12 +796,19 @@ explicit `ISSUE_ID` exists:
 
 **Lookup Logic:**
 
-1. If `ISSUE_ID` input exists → use it directly
-2. If `ISSUE_ID` is empty AND `ISSUE_ID_LOOKUP=true` → lookup using `github.actor`
-3. If lookup fails → no Issue ID gets added (silent fallback)
+1. If you provide `ISSUE_ID` input → action uses it directly (highest priority)
+2. If `ISSUE_ID` is empty AND `ISSUE_ID_LOOKUP_JSON` is valid JSON → action automatically looks up Issue ID using `github.actor`
+3. If lookup fails or JSON is invalid → action logs a warning and skips Issue ID
+
+**Validation:**
+
+- If `ISSUE_ID_LOOKUP_JSON` contains invalid JSON, the action displays a warning: `⚠️ Warning: Issue-ID JSON was not valid`
+- Invalid JSON will not cause the workflow to fail, but the action will skip adding Issue ID
+- The warning appears in both console output and log files
 
 This feature helps organizations automatically tag commits with
-project-specific Issue IDs based on who creates the pull request.
+project-specific Issue IDs based on who creates the pull request, without
+requiring manual configuration per PR or user.
 
 ## Behavior details
 

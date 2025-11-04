@@ -55,6 +55,7 @@ class Inputs:
     gerrit_server_port: int
     gerrit_project: str
     issue_id: str
+    issue_id_lookup_json: str
     allow_duplicates: bool
     ci_testing: bool
     duplicates_filter: str = "open"
