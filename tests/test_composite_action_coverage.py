@@ -375,35 +375,20 @@ class TestIssueIdLookup:
     """Test Issue ID lookup functionality."""
 
     def test_issue_id_lookup_condition(self, action_tester):
-        """Test Issue ID lookup conditional logic."""
-        # Find the issue ID lookup steps
+        """Test that Issue ID lookup is now handled in Python, not action steps."""
+        # The action should NOT have Issue ID lookup steps anymore
+        # Lookup is now handled in the Python CLI
         lookup_steps = []
         for step in action_tester.action_config["runs"]["steps"]:
             step_name = step.get("name", "")
-            if (
-                "Issue" in step_name
-                or "lookup" in step_name.lower()
-                or "JSON" in step_name
-            ):
+            if "lookup" in step_name.lower() and "Issue" in step_name:
                 lookup_steps.append(step)
 
-        assert len(lookup_steps) >= 1  # Should have at least one lookup step
-
-        # Check conditional execution for steps that have conditions
-        conditional_steps = [step for step in lookup_steps if "if" in step]
-        # Some lookup steps may not have explicit conditions, so this is
-        # optional
-        if conditional_steps:
-            for step in conditional_steps:
-                if_condition = step.get("if", "")
-                # Check if it has issue ID related conditions
-                assert (
-                    "inputs.ISSUE_ID == ''" in if_condition
-                    or "ISSUE_ID" in if_condition
-                )
+        # Should be 0 - lookup moved to Python
+        assert len(lookup_steps) == 0
 
     def test_issue_id_priority(self, action_tester):
-        """Test Issue ID input priority over lookup."""
+        """Test Issue ID is passed directly to CLI (lookup handled in Python)."""
         cli_step = None
         for step in action_tester.action_config["runs"]["steps"]:
             if step.get("name") == "Run github2gerrit Python CLI":
@@ -412,10 +397,12 @@ class TestIssueIdLookup:
 
         env_mapping = cli_step.get("env", {})
         issue_id_env = env_mapping.get("ISSUE_ID", "")
+        issue_id_lookup_json_env = env_mapping.get("ISSUE_ID_LOOKUP_JSON", "")
 
-        # Should prioritize input over resolved
-        assert "inputs.ISSUE_ID != '' && inputs.ISSUE_ID" in issue_id_env
-        assert "env.RESOLVED_ISSUE_ID" in issue_id_env
+        # Should pass ISSUE_ID directly (no conditional logic)
+        assert issue_id_env == "${{ inputs.ISSUE_ID }}"
+        # Should pass JSON for Python to handle lookup
+        assert issue_id_lookup_json_env == "${{ inputs.ISSUE_ID_LOOKUP_JSON }}"
 
 
 class TestOutputCapture:

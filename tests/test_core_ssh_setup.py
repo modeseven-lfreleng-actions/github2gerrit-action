@@ -84,6 +84,7 @@ def minimal_inputs() -> Inputs:
         gerrit_server_port="29418",
         gerrit_project="",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -180,6 +181,7 @@ def test_ssh_setup_skips_when_credentials_missing(tmp_path: Path) -> None:
         gerrit_server_port="29418",
         gerrit_project="example/project",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -337,6 +339,7 @@ def test_ssh_auto_discovery_integration(
         gerrit_server_port="29418",
         gerrit_project="",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -404,6 +407,7 @@ def test_ssh_auto_discovery_fallback_when_discovery_fails(
         gerrit_server_port="29418",
         gerrit_project="",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -466,6 +470,7 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
         gerrit_server_port="29418",
         gerrit_project="",
         issue_id="",
+        issue_id_lookup_json="",
         allow_duplicates=False,
         ci_testing=False,
     )

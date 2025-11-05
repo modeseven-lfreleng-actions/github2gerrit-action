@@ -109,12 +109,10 @@ inputs:
     description: "Optional Gerrit HTTP password/token (for REST authentication)"
     required: false
     default: ""
-  ISSUE_ID_LOOKUP:
-    description: "Enable Issue ID lookup via JSON table"
-    required: false
-    default: "false"
   ISSUE_ID_LOOKUP_JSON:
-    description: "JSON array mapping GitHub actors to Issue IDs"
+    description: >-
+      JSON array mapping GitHub actors to Issue IDs
+      (format: [{"key": "username", "value": "ISSUE-ID"}])
     required: false
     default: "[]"
 
@@ -141,6 +139,8 @@ runs:
     - name: "Setup uv"
       # yamllint disable-line rule:line-length
       uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41  # v7.1.2
+      with:
+        enable-cache: false
 
     - name: "Checkout repository"
       # yamllint disable-line rule:line-length
@@ -149,42 +149,6 @@ runs:
         fetch-depth: ${{ inputs.FETCH_DEPTH }}
         # Ensure we are on the PR's head SHA when triggered by PR events
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-    - name: "Set key to use for JSON lookup"
-      if: ${{ inputs.ISSUE_ID == '' && inputs.ISSUE_ID_LOOKUP == 'true' }}
-      shell: bash
-      run: |
-        # Set key to use for JSON lookup
-        ACTOR="${{ github.actor }}"
-        ACTOR_ID="${{ github.actor_id }}"
-        echo "Using GitHub actor as lookup key: $ACTOR [$ACTOR_ID]"
-        echo "key=$ACTOR" >> "$GITHUB_ENV"
-
-    - name: "Get ticket from JSON lookup table"
-      if: ${{ inputs.ISSUE_ID == '' && inputs.ISSUE_ID_LOOKUP == 'true' }}
-      id: json-lookup
-      uses: lfreleng-actions/json-key-value-lookup-action@ed95008d49173ba450865d6c8faad0aabf07a39c  # v0.1.0
-      with:
-        json: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
-        key: ${{ env.key }}
-
-    - name: "Set IssueID in GITHUB_ENV"
-      if: ${{ inputs.ISSUE_ID == '' && inputs.ISSUE_ID_LOOKUP == 'true' }}
-      shell: bash
-      # yamllint disable rule:line-length
-      run: |
-        # Set IssueID in GITHUB_ENV
-        set -euo pipefail
-        val="${{ steps.json-lookup.outputs.value }}"
-        if [ -z "$val" ]; then
-          alt="${{ env.value }}"
-          if [ -n "$alt" ]; then
-            val="$alt"
-          fi
-        fi
-        if [ -n "$val" ]; then
-          echo "RESOLVED_ISSUE_ID=$val" >> "$GITHUB_ENV"
-        fi
 
     - name: "Setup github2gerrit"
       shell: bash
@@ -282,7 +246,8 @@ runs:
         PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
         DRY_RUN: ${{ inputs.DRY_RUN }}
         ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
-        ISSUE_ID: ${{ inputs.ISSUE_ID != '' && inputs.ISSUE_ID || env.RESOLVED_ISSUE_ID }}
+        ISSUE_ID: ${{ inputs.ISSUE_ID }}
+        ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
         CI_TESTING: ${{ inputs.CI_TESTING }}
         DUPLICATE_TYPES: ${{ inputs.DUPLICATE_TYPES }}
         NORMALISE_COMMIT: ${{ inputs.NORMALISE_COMMIT }}
@@ -308,6 +273,7 @@ runs:
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_BASE_REF: ${{ github.base_ref }}
         GITHUB_HEAD_REF: ${{ github.head_ref }}
+        GITHUB_ACTOR: ${{ github.actor }}
         SYNC_ALL_OPEN_PRS: ${{ env.SYNC_ALL_OPEN_PRS }}
         PR_NUMBER: ${{ env.PR_NUMBER }}
         G2G_TEST_MODE: "false"
