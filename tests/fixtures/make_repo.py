@@ -82,7 +82,16 @@ def _run_git(
         shell=False,  # inputs are controlled in tests
     )
     if check and proc.returncode != 0:
-        raise RuntimeError()
+        cmd_str = " ".join(full_cmd)
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Git command failed: {cmd_str}\n"
+            f"Return code: {proc.returncode}\n"
+            f"Working directory: {cwd}\n"
+            f"stdout: {stdout}\n"
+            f"stderr: {stderr}"
+        )
     return proc
 
 

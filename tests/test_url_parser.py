@@ -26,49 +26,49 @@ from github2gerrit.cli import _parse_github_target
         # Standard PR URLs
         (
             "https://github.com/onap/portal-ng-bff/pull/33",
-            ("onap", "portal-ng-bff", 33),
+            ("github_pr", "onap", "portal-ng-bff", 33),
         ),
         (
             "https://www.github.com/onap/portal-ng-bff/pull/33",
-            ("onap", "portal-ng-bff", 33),
+            ("github_pr", "onap", "portal-ng-bff", 33),
         ),
         # Repo URL (no PR number)
         (
             "https://github.com/onap/portal-ng-bff",
-            ("onap", "portal-ng-bff", None),
+            ("github_repo", "onap", "portal-ng-bff", None),
         ),
         # 'pulls' accepted as well
         (
             "https://github.com/onap/portal-ng-bff/pulls/33",
-            ("onap", "portal-ng-bff", 33),
+            ("github_pr", "onap", "portal-ng-bff", 33),
         ),
         # Trailing slashes should be fine
         (
             "https://github.com/onap/portal-ng-bff/",
-            ("onap", "portal-ng-bff", None),
+            ("github_repo", "onap", "portal-ng-bff", None),
         ),
         # Query string and fragment should be ignored by parsing
         (
             "https://github.com/onap/portal-ng-bff/pull/33?foo=bar#section",
-            ("onap", "portal-ng-bff", 33),
+            ("github_pr", "onap", "portal-ng-bff", 33),
         ),
         # Non-integer PR number: pr component should become None
         (
             "https://github.com/onap/portal-ng-bff/pull/not-a-number",
-            ("onap", "portal-ng-bff", None),
+            ("github_repo", "onap", "portal-ng-bff", None),
         ),
         # Non-GitHub domain: reject
         (
             "https://gitlab.com/onap/portal-ng-bff/pull/33",
-            (None, None, None),
+            ("github_repo", None, None, None),
         ),
         # Insufficient path parts: reject
-        ("https://github.com/onap", (None, None, None)),
-        ("https://github.com/", (None, None, None)),
-        ("https://github.com", (None, None, None)),
+        ("https://github.com/onap", ("github_repo", None, None, None)),
+        ("https://github.com/", ("github_repo", None, None, None)),
+        ("https://github.com", ("github_repo", None, None, None)),
     ],
 )
 def test_parse_github_target(
-    url: str, expected: tuple[object, object, object]
+    url: str, expected: tuple[object, object, object, object]
 ) -> None:
     assert _parse_github_target(url) == expected

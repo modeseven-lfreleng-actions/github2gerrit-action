@@ -146,3 +146,32 @@ def disable_github_ci_mode(monkeypatch, request):
         not in request.node.name
     ):
         monkeypatch.setenv("G2G_AUTO_SAVE_CONFIG", "false")
+
+
+@pytest.fixture(autouse=True)
+def isolate_git_environment(monkeypatch):
+    """
+    Isolate git environment for each test to prevent cross-test contamination.
+
+    This ensures that:
+    - Git operations don't inherit SSH agent state from the host or other tests
+    - Git identity is consistent across tests
+    - Git operations use non-interactive SSH
+    """
+    # Clear SSH-related environment variables to ensure clean state
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+
+    # Set consistent git identity for all tests
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test Bot")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test-bot@example.org")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test Bot")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test-bot@example.org")
+
+    # Configure non-interactive SSH for git operations
+    monkeypatch.setenv(
+        "GIT_SSH_COMMAND",
+        "ssh -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes "
+        "-o PreferredAuthentications=publickey -o StrictHostKeyChecking=yes "
+        "-o PasswordAuthentication=no -o ConnectTimeout=5",
+    )

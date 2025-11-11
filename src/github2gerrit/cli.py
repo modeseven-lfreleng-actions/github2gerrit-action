@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable
@@ -44,6 +45,7 @@ from .error_codes import exit_for_pr_not_found
 from .error_codes import exit_for_pr_state_error
 from .error_codes import exit_with_error
 from .error_codes import is_github_api_permission_error
+from .gerrit_pr_closer import process_recent_commits_for_pr_closure
 from .github_api import build_client
 from .github_api import get_pr_title_body
 from .github_api import get_pull
@@ -191,17 +193,47 @@ class ConfigurationError(Exception):
     """
 
 
-def _parse_github_target(url: str) -> tuple[str | None, str | None, int | None]:
+def _parse_target_url(
+    url: str,
+) -> tuple[str, str | None, str | None, int | str | None]:
+    """
+    Parse a GitHub or Gerrit URL.
+
+    Returns:
+      (url_type, org, repo, pr_number/change_url)
+      - url_type: "github_pr", "github_repo", or "gerrit_change"
+      - For GitHub: (type, org, repo, pr_number)
+        where pr_number may be None for repo URLs
+      - For Gerrit: ("gerrit_change", None, None, change_url)
+        where change_url is the full Gerrit URL
+    """
+    # Check if it's a Gerrit change URL
+    # Pattern: https://gerrit.example.com/c/project/+/12345
+    # Also handles URLs with subpaths like: https://gerrit.example.com/infra/c/project/+/12345
+    # NOTE: Keep in sync with gerrit_pr_closer.py:extract_change_number_from_url
+    gerrit_pattern = r"https?://[^/]+/(?:.*/)?c/[^+]+/\+/\d+"
+    if re.match(gerrit_pattern, url):
+        return "gerrit_change", None, None, url
+
+    # Otherwise, parse as GitHub URL
+    return _parse_github_target(url)
+
+
+def _parse_github_target(
+    url: str,
+) -> tuple[str, str | None, str | None, int | None]:
     """
     Parse a GitHub repository or pull request URL.
 
     Returns:
-      (org, repo, pr_number) where pr_number may be None for repo URLs.
+      (url_type, org, repo, pr_number)
+      where pr_number may be None for repo URLs.
+      url_type is "github_pr" or "github_repo"
     """
     try:
         u = urlparse(url)
     except Exception:
-        return None, None, None
+        return "github_repo", None, None, None
 
     allow_ghe = env_bool("ALLOW_GHE_URLS", False)
     bad_hosts = {
@@ -211,13 +243,13 @@ def _parse_github_target(url: str) -> tuple[str | None, str | None, int | None]:
         "www.bitbucket.org",
     }
     if u.netloc in bad_hosts:
-        return None, None, None
+        return "github_repo", None, None, None
     if not allow_ghe and u.netloc not in ("github.com", "www.github.com"):
-        return None, None, None
+        return "github_repo", None, None, None
 
     parts = [p for p in (u.path or "").split("/") if p]
     if len(parts) < 2:
-        return None, None, None
+        return "github_repo", None, None, None
 
     owner, repo = parts[0], parts[1]
     pr_number: int | None = None
@@ -226,8 +258,10 @@ def _parse_github_target(url: str) -> tuple[str | None, str | None, int | None]:
             pr_number = int(parts[3])
         except Exception:
             pr_number = None
+        else:
+            return "github_pr", owner, repo, pr_number
 
-    return owner, repo, pr_number
+    return "github_repo", owner, repo, pr_number
 
 
 APP_NAME = "github2gerrit"
@@ -339,7 +373,10 @@ app: typer.Typer = typer.Typer(
     no_args_is_help=False,
     cls=cast(Any, _SingleUsageGroup),
     rich_markup_mode="rich",
-    help="Tool to convert GitHub pull requests into Gerrit changes",
+    help=(
+        "Tool to convert GitHub pull requests into Gerrit changes "
+        "and close merged PRs"
+    ),
 )
 
 
@@ -402,7 +439,7 @@ def main(
     ctx: typer.Context,
     target_url: str | None = typer.Argument(
         None,
-        help="GitHub repository or PR URL",
+        help="GitHub PR/repo URL or Gerrit change URL",
         metavar="TARGET_URL",
     ),
     allow_duplicates: bool = typer.Option(
@@ -429,6 +466,21 @@ def main(
         envvar="CI_TESTING",
         help="Enable CI testing mode (overrides .gitreview, handles "
         "unrelated repos).",
+    ),
+    close_merged_prs: bool = typer.Option(
+        False,
+        "--close-merged-prs",
+        envvar="CLOSE_MERGED_PRS",
+        help="Close GitHub PRs when corresponding Gerrit changes are merged.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        envvar="FORCE",
+        help=(
+            "Force PR closure regardless of Gerrit change status "
+            "(abandoned, etc)."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -604,9 +656,10 @@ def main(
     """
     Tool to convert GitHub pull requests into Gerrit changes
 
-    - PR URL: converts the pull request to Gerrit change
-    - Repo URL: converts all open pull requests to Gerrit changes
-    - No arguments: uses environment variables (CI/CD mode)
+    - GitHub PR URL: creates a Gerrit change from the given pull request
+    - Gerrit Change URL: finds and closes the source GitHub pull request
+    - GitHub Repo URL: converts all open pull requests to Gerrit changes
+    - No arguments: environment variables determine behaviour (CI/CD mode)
     """
 
     # Handle version flag first
@@ -722,6 +775,8 @@ def main(
         os.environ["ISSUE_ID"] = resolved_issue_id
     os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
     os.environ["CI_TESTING"] = "true" if ci_testing else "false"
+    os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"
+    os.environ["FORCE"] = "true" if force else "false"
     os.environ["DUPLICATE_TYPES"] = duplicate_types
     if reuse_strategy:
         os.environ["REUSE_STRATEGY"] = reuse_strategy
@@ -736,23 +791,40 @@ def main(
     os.environ["LOG_RECONCILE_JSON"] = "true" if log_reconcile_json else "false"
     # URL mode handling
     if target_url:
-        org, repo, pr = _parse_github_target(target_url)
-        log.debug("Parsed GitHub URL: org=%s, repo=%s, pr=%s", org, repo, pr)
-        if org:
-            os.environ["ORGANIZATION"] = org
-            log.debug("Set ORGANIZATION=%s", org)
-        if org and repo:
-            github_repo = f"{org}/{repo}"
-            os.environ["GITHUB_REPOSITORY"] = github_repo
-            log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
-        if pr:
-            os.environ["PR_NUMBER"] = str(pr)
-            os.environ["SYNC_ALL_OPEN_PRS"] = "false"
-            log.debug("Set PR_NUMBER=%s", pr)
+        url_type, org, repo, pr_or_change = _parse_target_url(target_url)
+        log.debug(
+            "Parsed URL: type=%s, org=%s, repo=%s, pr_or_change=%s",
+            url_type,
+            org,
+            repo,
+            pr_or_change,
+        )
+
+        if url_type == "gerrit_change":
+            # Gerrit change URL - set flag to trigger close mode
+            os.environ["CLOSE_MERGED_PRS"] = "true"
+            os.environ["G2G_GERRIT_CHANGE_URL"] = str(pr_or_change)
+            log.debug("Set CLOSE_MERGED_PRS=true for Gerrit change URL")
         else:
-            os.environ["SYNC_ALL_OPEN_PRS"] = "true"
-            log.debug("Set SYNC_ALL_OPEN_PRS=true")
-        os.environ["G2G_TARGET_URL"] = "1"
+            # GitHub URL
+            if org:
+                os.environ["ORGANIZATION"] = org
+                log.debug("Set ORGANIZATION=%s", org)
+            if org and repo:
+                github_repo = f"{org}/{repo}"
+                os.environ["GITHUB_REPOSITORY"] = github_repo
+                log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
+            if pr_or_change:
+                os.environ["PR_NUMBER"] = str(pr_or_change)
+                os.environ["SYNC_ALL_OPEN_PRS"] = "false"
+                log.debug("Set PR_NUMBER=%s", pr_or_change)
+            else:
+                os.environ["SYNC_ALL_OPEN_PRS"] = "true"
+                log.debug("Set SYNC_ALL_OPEN_PRS=true")
+
+        # Store the target URL in env for downstream use
+        os.environ["G2G_TARGET_URL"] = target_url
+        os.environ["G2G_TARGET_URL_TYPE"] = url_type
     # Debug: Show environment at CLI startup
     log.debug("CLI startup environment check:")
     for key in ["DRY_RUN", "CI_TESTING", "GERRIT_SERVER", "GERRIT_PROJECT"]:
@@ -1445,6 +1517,221 @@ def _augment_pr_refs_if_needed(gh: GitHubContext) -> GitHubContext:
     return gh
 
 
+def _process_close_gerrit_change(
+    data: Inputs, gh: GitHubContext, gerrit_change_url: str
+) -> None:
+    """
+    Process a single Gerrit change URL to close its source GitHub PR.
+
+    Args:
+        data: Input configuration
+        gh: GitHub context
+        gerrit_change_url: Full Gerrit change URL to process
+
+    This function verifies the Gerrit change status before closing the PR
+    unless --force is specified. It reports status but does not raise errors
+    if PRs are not found or already closed.
+    """
+    from .gerrit_pr_closer import check_gerrit_change_status
+    from .gerrit_pr_closer import extract_pr_url_from_gerrit_change
+
+    log.info("Processing Gerrit change: %s", gerrit_change_url)
+
+    # Check if force mode is enabled
+    force = env_bool("FORCE", False)
+
+    # Verify Gerrit change status unless force is enabled
+    if not force:
+        status = check_gerrit_change_status(gerrit_change_url)
+        if status == "ABANDONED":
+            log.error(
+                "Gerrit change was ABANDONED, not closing GitHub PR. "
+                "Use --force to close anyway."
+            )
+            return
+        elif status == "NEW":
+            log.warning(
+                "Gerrit change is still NEW (not merged yet), but proceeding"
+            )
+        elif status == "UNKNOWN":
+            log.warning(
+                "Cannot verify Gerrit change status; proceeding with caution"
+            )
+        elif status == "MERGED":
+            log.info("Gerrit change confirmed as MERGED")
+
+    # Extract PR URL from Gerrit change
+    pr_url = extract_pr_url_from_gerrit_change(gerrit_change_url)
+    if not pr_url:
+        log.info("No GitHub PR URL found in Gerrit change")
+        return
+
+    log.info("Found GitHub PR URL: %s", pr_url)
+
+    # Use the existing close logic
+    from .gerrit_pr_closer import parse_pr_url
+
+    parsed = parse_pr_url(pr_url)
+    if not parsed:
+        log.error("Failed to parse PR URL: %s", pr_url)
+        return
+
+    owner, repo, pr_number = parsed
+    log.info("Closing GitHub PR: %s/%s#%d", owner, repo, pr_number)
+
+    # Auto-discover organization from PR URL if not already set
+    if not data.organization and owner:
+        log.info("Auto-discovered organization from PR URL: %s", owner)
+        os.environ["ORGANIZATION"] = owner
+
+    # Close the GitHub PR using the gerrit_pr_closer module
+    from .gerrit_pr_closer import extract_pr_info_for_display
+    from .github_api import build_client
+    from .github_api import close_pr
+    from .github_api import get_pull
+    from .rich_display import display_pr_info
+
+    try:
+        # Build GitHub client and get repository
+        client = build_client()
+        repo_obj = client.get_repo(f"{owner}/{repo}")
+
+        # Fetch the pull request
+        try:
+            pr_obj = get_pull(repo_obj, pr_number)
+        except Exception as exc:
+            if "404" in str(exc) or "Not Found" in str(exc):
+                log.info(
+                    "GitHub PR #%d not found in %s/%s - may have been deleted",
+                    pr_number,
+                    owner,
+                    repo,
+                )
+            else:
+                log.warning(
+                    "Could not fetch GitHub PR #%d: %s - skipping",
+                    pr_number,
+                    exc,
+                )
+            return
+
+        # Check if PR is already closed
+        pr_state = getattr(pr_obj, "state", "unknown")
+        if pr_state == "closed":
+            log.info(
+                "GitHub PR #%d is already closed - nothing to do", pr_number
+            )
+            return
+
+        # Extract and display PR information
+        pr_info = extract_pr_info_for_display(pr_obj, owner, repo, pr_number)
+        display_pr_info(pr_info, "Pull Request Details", None)
+
+        if data.dry_run:
+            log.info("DRY-RUN: Would close PR #%d with comment", pr_number)
+            return
+
+        # Build the closure comment
+        from .gerrit_pr_closer import _build_closure_comment
+
+        comment = _build_closure_comment(gerrit_change_url)
+
+        # Close the PR with a comment
+        log.info("Closing GitHub PR #%d...", pr_number)
+        close_pr(pr_obj, comment=comment)
+        log.info("✅ Successfully closed GitHub PR #%d", pr_number)
+
+    except Exception:
+        log.exception("Failed to close GitHub PR #%d", pr_number)
+
+
+def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
+    """
+    Process mode for closing GitHub PRs when Gerrit changes are merged.
+
+    This mode is triggered when a Gerrit change is merged and synced to
+    GitHub. It extracts the GitHub PR URL from recent commits and closes
+    the corresponding PRs.
+
+    This function is designed to be non-fatal - it reports status but does
+    not raise errors if PRs are not found or already closed.
+    """
+    from .gitutils import git
+
+    log.info("🔄 Processing merged Gerrit changes to close GitHub PRs")
+
+    # Initialize progress tracker
+    show_progress = env_bool("G2G_SHOW_PROGRESS", True)
+    progress_tracker: Any = None
+    target = gh.repository
+
+    if show_progress:
+        progress_tracker = G2GProgressTracker(target)
+        progress_tracker.start()
+        progress_tracker.update_operation("Analyzing recent commits...")
+    else:
+        progress_tracker = DummyProgressTracker("Gerrit PR Closer", target)
+
+    try:
+        # Get recent commits from the current branch
+        # We'll look at the last few commits to find ones with
+        # GitHub-PR trailers
+        log.debug("Fetching recent commits to check for GitHub PR trailers")
+
+        # Get the last 10 commits
+        result = git(["log", "-10", "--format=%H"])
+        commit_shas = [
+            line.strip()
+            for line in result.stdout.strip().split("\n")
+            if line.strip()
+        ]
+
+        if not commit_shas:
+            log.info("No recent commits found")
+            if progress_tracker:
+                progress_tracker.stop()
+            return
+
+        log.info("Found %d recent commit(s) to analyze", len(commit_shas))
+
+        if progress_tracker:
+            progress_tracker.update_operation(
+                f"Processing {len(commit_shas)} commit(s) for PR closure..."
+            )
+
+        # Process commits and close PRs (non-fatal)
+        dry_run = data.dry_run
+        force = env_bool("FORCE", False)
+        closed_count = process_recent_commits_for_pr_closure(
+            commit_shas,
+            dry_run=dry_run,
+            progress_tracker=progress_tracker,
+            force=force,
+        )
+
+        if progress_tracker:
+            progress_tracker.stop()
+
+        # Report final status - always successful
+        if dry_run:
+            if closed_count > 0:
+                log.info("DRY-RUN: Would close %d GitHub PR(s)", closed_count)
+            else:
+                log.info("DRY-RUN: No GitHub PRs would be closed")
+        else:
+            if closed_count > 0:
+                log.info("SUCCESS: Closed %d GitHub PR(s)", closed_count)
+            else:
+                log.info("No GitHub PRs needed closing")
+
+    except Exception as exc:
+        # Even on unexpected errors, log as warning but don't fail the workflow
+        if progress_tracker:
+            progress_tracker.stop()
+        log.warning("Error during PR closure reconciliation: %s", exc)
+        log.info("PR closure reconciliation completed with warnings")
+
+
 def _process() -> None:
     data = _load_effective_inputs()
 
@@ -1458,6 +1745,23 @@ def _process() -> None:
 
     gh = _read_github_context()
     _display_effective_config(data, gh)
+
+    # Close merged PRs: handle Gerrit-merged changes closing GitHub PRs
+    # This runs in two scenarios:
+    # 1. Push events (when Gerrit syncs back to GitHub)
+    #    with CLOSE_MERGED_PRS enabled
+    # 2. Direct Gerrit change URL provided in CLI
+    gerrit_change_url = os.getenv("G2G_GERRIT_CHANGE_URL")
+    if gerrit_change_url:
+        log.info("🔄 Gerrit change URL provided: %s", gerrit_change_url)
+        log.info("Finding and closing source GitHub pull request")
+        _process_close_gerrit_change(data, gh, gerrit_change_url)
+        return
+    elif gh.event_name == "push" and env_bool("CLOSE_MERGED_PRS", False):
+        log.info("🔄 Detected push event with CLOSE_MERGED_PRS enabled")
+        log.info("Processing merged Gerrit changes to close GitHub PRs")
+        _process_close_merged_prs(data, gh)
+        return
 
     # Test mode: short-circuit after validation
     if env_bool("G2G_TEST_MODE", False):
@@ -1888,9 +2192,29 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     """Display effective configuration in a formatted table."""
     from .rich_display import display_pr_info
 
-    # Detect GitHub mode and display prominently
+    # Detect mode and display prominently
     github_mode = _is_github_mode()
-    github_mode_status = "✅" if github_mode else "❎"
+    mode_label = "GITHUB_MODE" if github_mode else "CLI_MODE"
+
+    # Determine operation mode based on context and target URL
+    target_url_type = os.getenv("G2G_TARGET_URL_TYPE", "")
+    close_merged_prs = env_bool("CLOSE_MERGED_PRS", False)
+
+    # Determine if we're in "close PR" mode (not creating Gerrit changes)
+    is_closing_pr_mode = (
+        gh.event_name == "push" and close_merged_prs
+    ) or target_url_type == "gerrit_change"
+
+    if is_closing_pr_mode:
+        mode_description = "✅ Closing GitHub pull request"
+    elif target_url_type == "github_pr" or gh.pr_number:
+        mode_description = "✅ Gerrit change from pull request"
+    elif target_url_type == "github_repo":
+        mode_description = "✅ Gerrit changes from repository"
+    elif github_mode:
+        mode_description = "✅ GitHub Actions mode"
+    else:
+        mode_description = "✅ CLI mode"
 
     # Avoid displaying sensitive values - use context-appropriate indicators
     # For known hosts: ❎ in local mode (normal), ❌ in CI mode (error)
@@ -1913,67 +2237,80 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     ssh_agent_status = _get_ssh_agent_status()
 
     # Build configuration data, filtering out empty/default values
-    # Order items logically: GitHub mode first, then behavioral settings,
+    # Order items logically: Mode first, then behavioral settings,
     # then credentials
     config_info = {}
 
-    # GitHub mode first - always show
-    config_info["GITHUB_MODE"] = github_mode_status
+    # Mode first - always show
+    config_info[mode_label] = mode_description
 
-    # Only show non-default boolean values
-    if data.submit_single_commits:
-        config_info["SUBMIT_SINGLE_COMMITS"] = str(data.submit_single_commits)
-    if data.use_pr_as_commit:
-        config_info["USE_PR_AS_COMMIT"] = str(data.use_pr_as_commit)
-    if data.dry_run:
-        config_info["DRY_RUN"] = str(data.dry_run)
+    if is_closing_pr_mode:
+        # In PR closing mode, only show minimal relevant config
+        if data.dry_run:
+            config_info["DRY_RUN"] = str(data.dry_run)
 
-    # Only show non-default fetch depth
-    if data.fetch_depth != 10:
-        config_info["FETCH_DEPTH"] = str(data.fetch_depth)
+        # Show organization if set (helps identify which GitHub org to query)
+        if data.organization:
+            config_info["ORGANIZATION"] = data.organization
 
-    # SSH user and email first
-    if data.gerrit_ssh_user_g2g:
-        config_info["GERRIT_SSH_USER_G2G"] = data.gerrit_ssh_user_g2g
-    if data.gerrit_ssh_user_g2g_email:
-        config_info["GERRIT_SSH_USER_G2G_EMAIL"] = (
-            data.gerrit_ssh_user_g2g_email
-        )
-    if data.organization:
-        config_info["ORGANIZATION"] = data.organization
-    if data.reviewers_email:
-        config_info["REVIEWERS_EMAIL"] = data.reviewers_email
-
-    # Only show non-default boolean values
-    if data.preserve_github_prs:
-        config_info["PRESERVE_GITHUB_PRS"] = str(data.preserve_github_prs)
-    if data.dry_run:
-        config_info["DRY_RUN"] = str(data.dry_run)
-    if data.ci_testing:
-        config_info["CI_TESTING"] = str(data.ci_testing)
-
-    # Show Issue ID if provided
-    if data.issue_id:
-        config_info["ISSUE_ID"] = data.issue_id
+        # Show GitHub token status (required for closing PRs)
+        config_info["GITHUB_TOKEN"] = github_token_status
     else:
-        config_info["ISSUE_ID"] = "❎ Not provided"
+        # In Gerrit change creation mode, show full config
+        # Only show non-default boolean values
+        if data.submit_single_commits:
+            config_info["SUBMIT_SINGLE_COMMITS"] = str(
+                data.submit_single_commits
+            )
+        if data.use_pr_as_commit:
+            config_info["USE_PR_AS_COMMIT"] = str(data.use_pr_as_commit)
+        if data.dry_run:
+            config_info["DRY_RUN"] = str(data.dry_run)
 
-    # Show Gerrit settings if they have values
-    if data.gerrit_server:
-        config_info["GERRIT_SERVER"] = data.gerrit_server
-    # Only show non-default port (29418 is default)
-    if data.gerrit_server_port and data.gerrit_server_port != 29418:
-        config_info["GERRIT_SERVER_PORT"] = str(data.gerrit_server_port)
-    if data.gerrit_project:
-        config_info["GERRIT_PROJECT"] = data.gerrit_project
+        # Only show non-default fetch depth
+        if data.fetch_depth != 10:
+            config_info["FETCH_DEPTH"] = str(data.fetch_depth)
 
-    # Move credentials to bottom of table
-    # Always show known hosts status
-    if data.gerrit_known_hosts or not data.gerrit_known_hosts:
-        config_info["GERRIT_KNOWN_HOSTS"] = known_hosts_status
-    config_info["GERRIT_SSH_PRIVKEY_G2G"] = privkey_status
-    config_info["GITHUB_TOKEN"] = github_token_status
-    config_info["SSH_AGENT"] = ssh_agent_status
+        # SSH user and email first
+        if data.gerrit_ssh_user_g2g:
+            config_info["GERRIT_SSH_USER_G2G"] = data.gerrit_ssh_user_g2g
+        if data.gerrit_ssh_user_g2g_email:
+            config_info["GERRIT_SSH_USER_G2G_EMAIL"] = (
+                data.gerrit_ssh_user_g2g_email
+            )
+        if data.organization:
+            config_info["ORGANIZATION"] = data.organization
+        if data.reviewers_email:
+            config_info["REVIEWERS_EMAIL"] = data.reviewers_email
+
+        # Only show non-default boolean values
+        if data.preserve_github_prs:
+            config_info["PRESERVE_GITHUB_PRS"] = str(data.preserve_github_prs)
+        if data.ci_testing:
+            config_info["CI_TESTING"] = str(data.ci_testing)
+
+        # Show Issue ID if provided
+        if data.issue_id:
+            config_info["ISSUE_ID"] = data.issue_id
+        else:
+            config_info["ISSUE_ID"] = "❎ Not provided"
+
+        # Show Gerrit settings if they have values
+        if data.gerrit_server:
+            config_info["GERRIT_SERVER"] = data.gerrit_server
+        # Only show non-default port (29418 is default)
+        if data.gerrit_server_port and data.gerrit_server_port != 29418:
+            config_info["GERRIT_SERVER_PORT"] = str(data.gerrit_server_port)
+        if data.gerrit_project:
+            config_info["GERRIT_PROJECT"] = data.gerrit_project
+
+        # Move credentials to bottom of table
+        # Always show known hosts status
+        if data.gerrit_known_hosts or not data.gerrit_known_hosts:
+            config_info["GERRIT_KNOWN_HOSTS"] = known_hosts_status
+        config_info["GERRIT_SSH_PRIVKEY_G2G"] = privkey_status
+        config_info["GITHUB_TOKEN"] = github_token_status
+        config_info["SSH_AGENT"] = ssh_agent_status
 
     # Display the configuration table
     display_pr_info(config_info, "GitHub2Gerrit Configuration")

@@ -34,6 +34,52 @@ Gerrit `Change-Id` trailers to create or update changes.
 - Comment on the GitHub PR with the Gerrit change URL(s).
 - Optionally close the PR (mirrors the shell action policy).
 
+## Close Merged PRs Feature
+
+GitHub2Gerrit now includes **automatic PR closure** when Gerrit merges changes
+and syncs them back to GitHub. This completes the lifecycle for automation PRs
+(like Dependabot).
+
+**How it works:**
+
+1. A bot (e.g., Dependabot) creates a GitHub PR
+2. GitHub2Gerrit converts it to a Gerrit change with tracking information
+3. When the Gerrit change is **merged** and synced to GitHub, the original PR is automatically closed
+
+**Key characteristics:**
+
+- **Enabled by default** via `CLOSE_MERGED_PRS=true`
+- **Non-fatal operation** - the tool logs missing or already-closed PRs as
+  info, not errors
+- Works on `push` events when Gerrit syncs changes to GitHub mirrors
+- **Safety checks**: When a Gerrit change URL is available, the tool verifies
+  that the change has MERGED status (not ABANDONED) before closing the PR
+- **Force option**: Use `--force` to close PRs regardless of Gerrit change status
+
+**Gerrit change status handling:**
+
+| Scenario | Default Behavior | With `--force` |
+|----------|------------------|----------------|
+| Change has MERGED status | ✅ Closes PR | ✅ Closes PR |
+| Change has ABANDONED status | ❌ Refuses to close PR | ✅ Closes PR anyway |
+| Change is NEW/OPEN | ⚠️ Closes PR with a warning | ✅ Closes PR |
+| Status UNKNOWN | ⚠️ Closes PR with a warning | ✅ Closes PR |
+
+**Status reporting examples:**
+
+```text
+No GitHub PR URL found in commit abc123de - skipping
+GitHub PR #42 is already closed - nothing to do
+Gerrit change confirmed as MERGED
+SUCCESS: Closed GitHub PR #42
+```
+
+**Safety example (refused closure):**
+
+```text
+ERROR: Gerrit change has ABANDONED status, not closing GitHub PR. Use --force to close anyway.
+```
+
 ## Requirements
 
 - Repository contains a `.gitreview` file. If you cannot provide it,
