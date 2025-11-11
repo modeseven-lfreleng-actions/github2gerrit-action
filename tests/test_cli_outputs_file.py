@@ -81,6 +81,8 @@ def _base_env_with_event(tmp_path: Path) -> dict[str, str]:
         "GITHUB_HEAD_REF": "feature",
         # Ensure real execution path (not short-circuited)
         "G2G_TEST_MODE": "false",
+        # Disable automation-only mode for tests
+        "AUTOMATION_ONLY": "false",
     }
 
 
