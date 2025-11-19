@@ -55,6 +55,9 @@ class ExitCode(IntEnum):
     VALIDATION_ERROR = 9
     """Input validation failed."""
 
+    GERRIT_CHANGE_ALREADY_FINAL = 10
+    """Gerrit change is already in a final state (MERGED/ABANDONED)."""
+
 
 # Error message templates
 ERROR_MESSAGES = {
@@ -82,6 +85,9 @@ ERROR_MESSAGES = {
     ),
     ExitCode.VALIDATION_ERROR: (
         "❌ Input validation failed; check parameter values"
+    ),
+    ExitCode.GERRIT_CHANGE_ALREADY_FINAL: (
+        "❌ Gerrit change is already in a final state; use --force to override"
     ),
     ExitCode.GENERAL_ERROR: "❌ Operation failed; check logs for details",
 }

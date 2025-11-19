@@ -31,6 +31,8 @@ def _base_env() -> dict[str, str]:
         # Token not needed since we mock build_client for bulk mode
         "GITHUB_TOKEN": "dummy",
         "DRY_RUN": "true",
+        # Disable automation-only mode for tests
+        "AUTOMATION_ONLY": "false",
     }
 
 

@@ -32,7 +32,106 @@ Gerrit `Change-Id` trailers to create or update changes.
 - Query Gerrit for the resulting URL, change number, and patchset SHA.
 - Add a back‑reference comment in Gerrit to the GitHub PR and run URL.
 - Comment on the GitHub PR with the Gerrit change URL(s).
-- Optionally close the PR (mirrors the shell action policy).
+- By default, the tool preserves PRs after submission; set `PRESERVE_GITHUB_PRS=false` to close them.
+
+## Close Merged PRs Feature
+
+GitHub2Gerrit now includes **automatic PR closure** when Gerrit merges changes
+and syncs them back to GitHub. This completes the lifecycle for automation PRs
+(like Dependabot).
+
+**How it works:**
+
+1. A bot (e.g., Dependabot) creates a GitHub PR
+2. GitHub2Gerrit converts it to a Gerrit change with tracking information
+3. When the Gerrit change is **merged** and synced to GitHub, the original PR is automatically closed
+4. When the Gerrit change is **abandoned**, the tool handles the PR based on `CLOSE_MERGED_PRS`:
+   - If `CLOSE_MERGED_PRS=true` (default): The tool closes the PR with an abandoned comment ⛔️
+   - If `CLOSE_MERGED_PRS=false`: PR remains open, but receives an abandoned notification comment ⛔️
+
+**Key characteristics:**
+
+- **Enabled by default** via `CLOSE_MERGED_PRS=true`
+- **Non-fatal operation** - the tool logs missing or already-closed PRs as
+  info, not errors
+- Works on `push` events when Gerrit syncs changes to GitHub mirrors
+- **Abandoned change handling**: The tool closes PRs or adds comments based on the `CLOSE_MERGED_PRS` setting
+
+**Gerrit change status handling:**
+
+| Scenario | `CLOSE_MERGED_PRS=true` (default) | `CLOSE_MERGED_PRS=false` |
+|----------|-----------------------------------|--------------------------|
+| Change has MERGED status | ✅ Closes PR with merged comment | ⏭️ No action |
+| Change has ABANDONED status | ✅ Closes PR with abandoned comment ⛔️ | 💬 Adds abandoned notification comment (PR stays open) |
+| Change is NEW/OPEN | ⚠️ Closes PR with a warning | ⏭️ No action |
+| Status UNKNOWN | ⚠️ Closes PR with a warning | ⏭️ No action |
+
+**Status reporting examples:**
+
+```text
+No GitHub PR URL found in commit abc123de - skipping
+GitHub PR #42 is already closed - nothing to do
+Gerrit change confirmed as MERGED
+SUCCESS: Closed GitHub PR #42
+```
+
+**Abandoned change examples:**
+
+With `CLOSE_MERGED_PRS=true`:
+
+```text
+Gerrit change ABANDONED; will close PR with abandoned comment
+SUCCESS: Closed GitHub PR #42
+```
+
+With `CLOSE_MERGED_PRS=false`:
+
+```text
+Gerrit change ABANDONED; will add comment (CLOSE_MERGED_PRS=false)
+SUCCESS: Added comment to PR #42 (PR remains open)
+```
+
+## Restrict PRs to Automation Tools
+
+GitHub2Gerrit can restrict pull request processing to known automation tools.
+Use this for GitHub mirrors where you want contributors to submit changes via
+Gerrit, while still accepting automated dependency updates from tools like
+Dependabot.
+
+**Configuration:**
+
+Set `AUTOMATION_ONLY=true` (default) to enable, or `AUTOMATION_ONLY=false`
+to accept all PRs.
+
+**Recognized automation tools:**
+
+| Tool | GitHub Username(s) |
+|------|-------------------|
+| Dependabot | `dependabot[bot]`, `dependabot` |
+| Pre-commit.ci | `pre-commit-ci[bot]`, `pre-commit-ci` |
+
+**What happens when enabled:**
+
+The tool rejects PRs from non-automation users by:
+
+1. Logging a warning message
+2. Closing the PR with this comment:
+
+   ```text
+   This GitHub mirror does not accept pull requests.
+   Please submit changes to the project's Gerrit server.
+   ```
+
+3. Exiting with code 1
+
+**Example:**
+
+```yaml
+- uses: lfit/github2gerrit-action@main
+  with:
+    AUTOMATION_ONLY: "true"  # default, accepts automation PRs
+    GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY }}
+```
 
 ## Requirements
 
@@ -664,7 +763,7 @@ alignment between action inputs, environment variables, and CLI flags:
 | `ORGANIZATION` | `ORGANIZATION` | `--organization` | No | `${{ github.repository_owner }}` | GitHub organization/owner |
 | `REVIEWERS_EMAIL` | `REVIEWERS_EMAIL` | `--reviewers-email` | No | `""` | Comma-separated reviewer emails |
 | `ALLOW_GHE_URLS` | `ALLOW_GHE_URLS` | `--allow-ghe-urls` | No | `"false"` | Allow GitHub Enterprise URLs in direct URL mode |
-| `PRESERVE_GITHUB_PRS` | `PRESERVE_GITHUB_PRS` | `--preserve-github-prs` | No | `"false"` | Do not close GitHub PRs after pushing to Gerrit |
+| `PRESERVE_GITHUB_PRS` | `PRESERVE_GITHUB_PRS` | `--preserve-github-prs` | No | `"true"` | Do not close GitHub PRs after pushing to Gerrit |
 | `DRY_RUN` | `DRY_RUN` | `--dry-run` | No | `"false"` | Check settings/PR metadata; do not write to Gerrit |
 | `ALLOW_DUPLICATES` | `ALLOW_DUPLICATES` | `--allow-duplicates` | No | `"false"` | Allow submitting duplicate changes without error |
 | `CI_TESTING` | `CI_TESTING` | `--ci-testing` | No | `"false"` | Enable CI testing mode (overrides .gitreview) |
@@ -943,8 +1042,8 @@ requiring manual configuration per PR or user.
   - Adds a back‑reference comment in Gerrit with the GitHub PR and run
     URL. Adds a comment on the GitHub PR with the Gerrit change URL(s).
 - Closing PRs
-  - On `pull_request_target`, the workflow may close the PR after submission to
-    match the shell action’s behavior.
+  - By default, PRs are **preserved** after submission (`PRESERVE_GITHUB_PRS=true`).
+  - Set `PRESERVE_GITHUB_PRS=false` to close PRs after submission on `pull_request_target` events.
 
 ## Security notes
 

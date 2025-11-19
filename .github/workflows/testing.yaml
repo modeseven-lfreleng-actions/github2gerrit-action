@@ -40,6 +40,7 @@ jobs:
           GERRIT_KNOWN_HOSTS: 'dummy-host ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC...'
           GERRIT_SSH_PRIVKEY_G2G: 'dummy-key'
           DRY_RUN: 'true'
+          AUTOMATION_ONLY: 'false'
 
       # yamllint disable-line rule:line-length
       - name: "Running local action: ${{ github.repository }} [Failure]"
@@ -53,6 +54,7 @@ jobs:
           GERRIT_KNOWN_HOSTS: "dummy-host ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC..."
           GERRIT_SSH_PRIVKEY_G2G: ""
           DRY_RUN: 'true'
+          AUTOMATION_ONLY: 'false'
 
       # Failure testing is also important
       - name: "Error if step above did NOT fail"
