@@ -223,9 +223,6 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6.0.0
-
       - name: 'Test PyPI publishing'
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/pypi-publish-action@81a056957ed050f8305760055b1fd8103a916989  # v0.1.1
@@ -252,9 +249,6 @@ jobs:
       - uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2  # v2.13.2
         with:
           egress-policy: 'audit'
-
-      # yamllint disable-line rule:line-length
-      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6.0.0
 
       - name: 'PyPI release'
         # yamllint disable-line rule:line-length
