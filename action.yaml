@@ -170,6 +170,11 @@ runs:
 
     - name: "Setup github2gerrit"
       shell: bash
+      env:
+        # Provide version for hatch-vcs (via setuptools-scm)
+        # when git metadata is unavailable
+        # GitHub Actions shallow checkout doesn't include .git history
+        SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0+dev"
       run: |
         # Setup github2gerrit
         set -euo pipefail
