@@ -58,6 +58,10 @@ def _run_git(
     merged_env = dict(os.environ)
     if env:
         merged_env.update(env)
+    # Isolate test repos from parent repo state (important when running under pre-commit)
+    merged_env.pop("GIT_INDEX_FILE", None)
+    merged_env.pop("GIT_DIR", None)
+    merged_env.pop("GIT_WORK_TREE", None)
     # Force agent-less, non-interactive SSH for tests
     merged_env["SSH_AUTH_SOCK"] = ""
     merged_env["SSH_AGENT_PID"] = ""
@@ -138,7 +142,7 @@ class Repo:
 
     def add_commit(self, message: str, paths: Iterable[str | Path]) -> None:
         self.add(paths)
-        self.git(["commit", "-m", message])
+        self.git(["commit", "--no-verify", "-m", message])
 
     def current_branch(self) -> str:
         cp = self.git(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -173,7 +177,7 @@ def _initial_commit(repo: Repo, *, default_branch: str) -> None:
     # Create a minimal initial commit
     repo.write(".gitignore", "# test fixture\n")
     repo.git(["add", ".gitignore"])
-    repo.git(["commit", "-m", "Initial commit"])
+    repo.git(["commit", "--no-verify", "-m", "Initial commit"])
 
 
 def init_repo(

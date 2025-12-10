@@ -111,12 +111,15 @@ def safe_console_print(
             progress_tracker.suspend()
 
         try:
-            if RICH_AVAILABLE and not err:
+            if err:
+                # Use typer.echo for stderr to ensure CliRunner captures it
+                import typer
+
+                typer.echo(message, err=True)
+            elif RICH_AVAILABLE:
                 console.print(message, style=style)
             else:
-                print(
-                    message, file=None if not err else __import__("sys").stderr
-                )
+                print(message)
         finally:
             if progress_tracker:
                 progress_tracker.resume()

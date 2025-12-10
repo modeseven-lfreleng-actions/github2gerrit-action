@@ -6,7 +6,7 @@ name = "github2gerrit"
 dynamic = ["version"]
 description = "Submit a GitHub pull request to a Gerrit repository."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
   { name = "Matthew Watkins", email = "mwatkins@linuxfoundation.org" }
@@ -21,28 +21,29 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
   "Topic :: Software Development :: Version Control",
   "Typing :: Typed",
 ]
 dependencies = [
   # CLI framework (Typer)
-  "typer>=0.12.5",
+  "typer>=0.20.0",
 
   # Rich formatting for CLI output
-  "rich>=13.0.0",
+  "rich>=14.2.0",
 
   # GitHub API client
-  "PyGithub>=2.3.0",
+  "PyGithub>=2.8.1",
 
   # Gerrit REST client
-  "pygerrit2>=2.0.0",
+  "pygerrit2>=2.0.15",
 
   # git-review CLI used for pushing to Gerrit
-  "git-review>=2.3.1",
+  "git-review>=2.5.0",
 
   # YAML parsing for commit normalization
-  "PyYAML>=6.0.1",
+  "PyYAML>=6.0.3",
 ]
 
 [project.urls]
@@ -80,17 +81,17 @@ exclude = [
 [project.optional-dependencies]
 dev = [
   # Test
-  "pytest>=8.3.2",
-  "pytest-cov>=5.0.0",
-  "coverage[toml]>=7.6.1",
-  "responses>=0.25.0",
+  "pytest>=9.0.2",
+  "pytest-cov>=7.0.0",
+  "coverage[toml]>=7.6.9",
+  "responses>=0.25.8",
 
   # Lint/format
   "ruff>=0.6.3",
-  "mypy>=1.11.2",
+  "mypy>=1.17.1",
 
   # Type checking helpers
-  "pytest-mock>=3.14.0",
+  "pytest-mock>=3.15.1",
   "types-requests>=2.31.0",
   "types-click>=7.1.8",
 ]
