@@ -33,6 +33,10 @@ def temp_workspace():
         env = dict(os.environ)
         env.pop("SSH_AUTH_SOCK", None)
         env.pop("SSH_AGENT_PID", None)
+        # Isolate test repos from parent repo state (important when running under pre-commit)
+        env.pop("GIT_INDEX_FILE", None)
+        env.pop("GIT_DIR", None)
+        env.pop("GIT_WORK_TREE", None)
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_SYSTEM"] = "/dev/null"
 
@@ -69,7 +73,7 @@ def temp_workspace():
             env=env.copy(),
         )
         subprocess.run(
-            ["git", "commit", "-m", "Initial test commit"],
+            ["git", "commit", "--no-verify", "-m", "Initial test commit"],
             cwd=workspace,
             check=True,
             env=env.copy(),
@@ -220,6 +224,10 @@ def test_git_operations_exclude_ssh_artifacts(temp_workspace):
     env = dict(os.environ)
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("SSH_AGENT_PID", None)
+    # Isolate test repos from parent repo state (important when running under pre-commit)
+    env.pop("GIT_INDEX_FILE", None)
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_SYSTEM"] = "/dev/null"
 
@@ -234,7 +242,7 @@ def test_git_operations_exclude_ssh_artifacts(temp_workspace):
         env=env.copy(),
     )
     subprocess.run(
-        ["git", "commit", "-m", "Add test file"],
+        ["git", "commit", "--no-verify", "-m", "Add test file"],
         cwd=temp_workspace,
         check=True,
         env=env.copy(),
