@@ -11,7 +11,7 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "Chore"
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     open-pull-requests-limit: 15
     directory: "/"
     schedule:
