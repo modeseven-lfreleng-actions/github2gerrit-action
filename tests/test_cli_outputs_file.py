@@ -19,6 +19,23 @@ from github2gerrit.cli import app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def clean_env_between_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clean up environment variables that might leak between tests."""
+    # Remove any environment variables that tests might set
+    env_vars_to_clean = [
+        "GERRIT_COMMIT_SHA",
+        "ORGANIZATION",
+        "REVIEWERS_EMAIL",
+        "GERRIT_SERVER",
+        "PRESERVE_GITHUB_PRS",
+        "SYNC_ALL_OPEN_PRS",
+        "PR_NUMBER",
+    ]
+    for var in env_vars_to_clean:
+        monkeypatch.delenv(var, raising=False)
+
+
 class _DummyResult:
     def __init__(
         self, urls: list[str], nums: list[str], shas: list[str] | None = None
@@ -33,12 +50,10 @@ class _DummyOrchestratorSingle:
         self.workspace = workspace
 
     def execute(self, *, inputs: Any, gh: Any) -> Any:
-        # Simulate the orchestrator also exporting commit sha(s) in the
-        # environment
-        # so the CLI writes them to $GITHUB_OUTPUT.
-        os.environ["GERRIT_COMMIT_SHA"] = (
-            "deadbeefcafebabe1234abcd5678ef90aabbccdd"
-        )
+        # This dummy orchestrator intentionally does NOT set GERRIT_COMMIT_SHA
+        # in os.environ. Tests that require this variable will set it via
+        # monkeypatch, and the clean_env_between_tests fixture ensures proper
+        # cleanup of any environment variables between tests.
         return _DummyResult(
             urls=["https://gerrit.example.org/c/repo/+/101"],
             nums=["101"],
@@ -63,7 +78,10 @@ def _base_env_with_event(tmp_path: Path) -> dict[str, str]:
     event_path = tmp_path / "event.json"
     event = {"action": "opened", "pull_request": {"number": 77}}
     event_path.write_text(json.dumps(event), encoding="utf-8")
-    return {
+
+    # Start with a minimal clean environment to avoid pollution
+    # Only include essential environment variables needed for the test
+    base = {
         # Required inputs
         "GERRIT_KNOWN_HOSTS": "example.com ssh-rsa AAAAB3Nza...",
         "GERRIT_SSH_PRIVKEY_G2G": "-----BEGIN KEY-----\nabc\n-----END KEY-----",
@@ -84,6 +102,7 @@ def _base_env_with_event(tmp_path: Path) -> dict[str, str]:
         # Disable automation-only mode for tests
         "AUTOMATION_ONLY": "false",
     }
+    return base
 
 
 @responses.activate
@@ -94,6 +113,11 @@ def test_single_pr_path_writes_outputs_file(
     outputs_file = tmp_path / "gh_output.txt"
     env = _base_env_with_event(tmp_path)
     env["GITHUB_OUTPUT"] = str(outputs_file)
+
+    # Ensure no environment pollution from previous tests
+    for key in list(os.environ.keys()):
+        if key not in env:
+            monkeypatch.delenv(key, raising=False)
 
     # Mock GitHub API calls
     responses.add(
@@ -126,6 +150,11 @@ def test_single_pr_path_writes_outputs_file(
 
     # Patch Orchestrator used by CLI to a dummy that returns a single result
     monkeypatch.setattr(cli_mod, "Orchestrator", _DummyOrchestratorSingle)
+
+    # Set GERRIT_COMMIT_SHA via monkeypatch to ensure proper cleanup
+    monkeypatch.setenv(
+        "GERRIT_COMMIT_SHA", "deadbeefcafebabe1234abcd5678ef90aabbccdd"
+    )
 
     # Invoke the CLI root to use the single-PR path
     result = runner.invoke(app, [], env=env)
@@ -177,6 +206,11 @@ def test_multi_pr_url_mode_writes_aggregated_outputs(
         "G2G_TEST_MODE": "false",
         "GITHUB_OUTPUT": str(outputs_file),
     }
+
+    # Ensure no environment pollution from previous tests
+    for key in list(os.environ.keys()):
+        if key not in env:
+            monkeypatch.delenv(key, raising=False)
 
     # Patch Orchestrator to our multi-PR dummy
     monkeypatch.setattr(cli_mod, "Orchestrator", _DummyOrchestratorMulti)

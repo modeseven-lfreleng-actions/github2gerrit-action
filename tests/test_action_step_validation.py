@@ -522,7 +522,11 @@ class TestActionValidationScripts:
         def run_extraction(
             event_name: str, event_pr: str, existing_pr: str = ""
         ) -> subprocess.CompletedProcess[str]:
-            env = os.environ.copy()
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("PR_NUMBER", "SYNC_ALL_OPEN_PRS")
+            }
             if existing_pr:
                 env["PR_NUMBER"] = existing_pr
 

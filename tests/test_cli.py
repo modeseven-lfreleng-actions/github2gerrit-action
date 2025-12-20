@@ -93,32 +93,43 @@ def _base_env(tmp_path: Path) -> dict[str, str]:
     event = {"action": "opened", "pull_request": {"number": 7}}
     event_path.write_text(json.dumps(event), encoding="utf-8")
 
-    return {
-        # Required inputs
-        "GERRIT_KNOWN_HOSTS": "example.com ssh-rsa AAAAB3Nza...",
-        "GERRIT_SSH_PRIVKEY_G2G": "-----BEGIN KEY-----\nabc\n-----END KEY-----",
-        "GERRIT_SSH_USER_G2G": "gerrit-bot",
-        "GERRIT_SSH_USER_G2G_EMAIL": "gerrit-bot@example.org",
-        # Optional inputs
-        "ORGANIZATION": "example",
-        "REVIEWERS_EMAIL": "",
-        # Boolean flags
-        "DRY_RUN": "false",
-        "PRESERVE_GITHUB_PRS": "true",
-        "ALLOW_DUPLICATES": "false",
-        "CI_TESTING": "false",
-        # GitHub context
-        "GITHUB_EVENT_NAME": "pull_request_target",
-        "GITHUB_EVENT_PATH": str(event_path),
-        "GITHUB_REPOSITORY": "example/repo",
-        "GITHUB_REPOSITORY_OWNER": "example",
-        "GITHUB_SERVER_URL": "https://github.com",
-        "GITHUB_RUN_ID": "12345",
-        "GITHUB_SHA": "deadbeef",
-        "GITHUB_BASE_REF": "main",
-        "GITHUB_HEAD_REF": "feature",
-        "G2G_TEST_MODE": "true",
+    # Start with clean base environment, excluding PR_NUMBER and SYNC_ALL_OPEN_PRS
+    base = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PR_NUMBER", "SYNC_ALL_OPEN_PRS")
     }
+
+    # Override with test-specific values
+    base.update(
+        {
+            # Required inputs
+            "GERRIT_KNOWN_HOSTS": "example.com ssh-rsa AAAAB3Nza...",
+            "GERRIT_SSH_PRIVKEY_G2G": "-----BEGIN KEY-----\nabc\n-----END KEY-----",
+            "GERRIT_SSH_USER_G2G": "gerrit-bot",
+            "GERRIT_SSH_USER_G2G_EMAIL": "gerrit-bot@example.org",
+            # Optional inputs
+            "ORGANIZATION": "example",
+            "REVIEWERS_EMAIL": "",
+            # Boolean flags
+            "DRY_RUN": "false",
+            "PRESERVE_GITHUB_PRS": "true",
+            "ALLOW_DUPLICATES": "false",
+            "CI_TESTING": "false",
+            # GitHub context
+            "GITHUB_EVENT_NAME": "pull_request_target",
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_REPOSITORY": "example/repo",
+            "GITHUB_REPOSITORY_OWNER": "example",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_RUN_ID": "12345",
+            "GITHUB_SHA": "deadbeef",
+            "GITHUB_BASE_REF": "main",
+            "GITHUB_HEAD_REF": "feature",
+            "G2G_TEST_MODE": "true",
+        }
+    )
+    return base
 
 
 def test_conflicting_options_exits_2(tmp_path: Path) -> None:
@@ -171,6 +182,8 @@ def test_no_pr_context_exits_2(tmp_path: Path) -> None:
     env.pop("G2G_TEST_MODE", None)
     # Force non-bulk path to avoid GitHub API token requirement
     env["SYNC_ALL_OPEN_PRS"] = "false"
+    # Set PR_NUMBER to empty to trigger validation error
+    env["PR_NUMBER"] = ""
 
     result = runner.invoke(app, [], env=env)
     assert result.exit_code == 2

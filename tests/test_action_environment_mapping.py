@@ -196,13 +196,17 @@ class TestEnvironmentVariableProcessing:
             event_pr: str = "",
             env_vars: dict[str, str] | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            test_env = os.environ.copy()
+            base_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("PR_NUMBER", "SYNC_ALL_OPEN_PRS")
+            }
             if env_vars:
-                test_env.update(env_vars)
+                base_env.update(env_vars)
 
             return subprocess.run(
                 ["bash", "-c", script, "--", event_name, input_pr, event_pr],
-                env=test_env,
+                env=base_env,
                 text=True,
                 capture_output=True,
                 check=False,
