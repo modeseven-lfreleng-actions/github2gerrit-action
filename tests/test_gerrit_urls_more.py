@@ -12,6 +12,17 @@ from github2gerrit.gerrit_urls import GerritUrlBuilder
 from github2gerrit.gerrit_urls import create_gerrit_url_builder
 
 
+@pytest.fixture(autouse=True)
+def clear_cache_between_tests() -> None:
+    """Clear the base path cache between tests to prevent pollution."""
+    _clear_builder_cache()
+
+
+def _clear_builder_cache() -> None:
+    # Ensure base-path discovery cache does not bleed across tests
+    urls_mod._BASE_PATH_CACHE.clear()  # pyright: ignore[reportPrivateUsage]
+
+
 class _FakeResp:
     def __init__(
         self, code: int, headers: dict[str, str] | None = None
@@ -36,11 +47,6 @@ class _FakeOpener:
         if isinstance(result, BaseException):
             raise result
         return result
-
-
-def _clear_builder_cache() -> None:
-    # Ensure base-path discovery cache does not bleed across tests
-    urls_mod._BASE_PATH_CACHE.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 def test_builder_env_base_path_override(
@@ -151,9 +157,8 @@ def test_repr_contains_host_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_discover_base_path_returns_empty_on_200_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Clear env and cache to exercise discovery
+    # Clear env to exercise discovery
     monkeypatch.delenv("GERRIT_HTTP_BASE_PATH", raising=False)
-    _clear_builder_cache()
 
     # For '/dashboard/self', return 200 OK (no base path)
     def decide(url: str) -> _FakeResp | BaseException:
@@ -181,7 +186,6 @@ def test_discover_base_path_3xx_location_relative_and_absolute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GERRIT_HTTP_BASE_PATH", raising=False)
-    _clear_builder_cache()
 
     # Simulate 302 to a relative '/r/dashboard/self'
     # and ensure discovery extracts 'r' as base path.
@@ -202,7 +206,9 @@ def test_discover_base_path_3xx_location_relative_and_absolute(
     assert b1.web_url("dashboard").startswith("https://gerrit.example.org/r/")
 
     # Now simulate absolute URL in Location header
-    _clear_builder_cache()
+    # Cache is cleared automatically by the autouse fixture between test sections
+    # when we create a new builder
+    urls_mod._BASE_PATH_CACHE.clear()  # pyright: ignore[reportPrivateUsage]
 
     def decide_abs(url: str) -> _FakeResp | BaseException:
         if url.endswith("/dashboard/self"):
@@ -226,7 +232,6 @@ def test_discover_base_path_known_endpoint_does_not_become_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GERRIT_HTTP_BASE_PATH", raising=False)
-    _clear_builder_cache()
 
     # If redirected to '/changes/1', the first segment 'changes' is known
     # and should not be treated as a base path -> expect empty base path.
@@ -251,7 +256,6 @@ def test_discover_base_path_network_error_fallback_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GERRIT_HTTP_BASE_PATH", raising=False)
-    _clear_builder_cache()
 
     # Simulate raising an exception (non-HTTPError) during open to trigger
     # fallback behavior. The discovery should continue and eventually return ''.
@@ -273,7 +277,6 @@ def test_discover_base_path_network_error_fallback_empty(
 def test_empty_host_short_circuit(monkeypatch: pytest.MonkeyPatch) -> None:
     # Explicitly set env so builder does not attempt discovery
     monkeypatch.setenv("GERRIT_HTTP_BASE_PATH", "")
-    _clear_builder_cache()
 
     # Creating a builder with empty host would be a misuse, but
     # we can still directly call the discovery helper by simulating its effect:

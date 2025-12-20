@@ -17,6 +17,7 @@ Scenarios covered:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import textwrap
 
@@ -84,6 +85,7 @@ def _run_action_logic(
 ) -> subprocess.CompletedProcess[str]:
     """
     Execute the embedded action logic snippet and return the process result.
+    Sanitizes environment to avoid interference from existing PR_NUMBER or SYNC_ALL_OPEN_PRS.
     """
     cmd = [
         "bash",
@@ -94,11 +96,17 @@ def _run_action_logic(
         pr_input,
         event_pr_number or "",
     ]
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PR_NUMBER", "SYNC_ALL_OPEN_PRS")
+    }
     return subprocess.run(
         cmd,
         text=True,
         capture_output=True,
         check=False,
+        env=clean_env,
     )
 
 
