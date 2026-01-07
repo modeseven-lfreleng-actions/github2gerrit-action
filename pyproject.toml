@@ -44,6 +44,9 @@ dependencies = [
 
   # YAML parsing for commit normalization
   "PyYAML>=6.0.3",
+
+  # Security: Fix CVE-2025-69277 (libsodium vulnerability)
+  "PyNaCl>=1.6.2",
 ]
 
 [project.urls]
