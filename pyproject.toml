@@ -47,6 +47,9 @@ dependencies = [
 
   # Security: Fix CVE-2025-69277 (libsodium vulnerability)
   "PyNaCl>=1.6.2",
+
+  # Security: Fix CVE-2026-21441 (decompression-bomb vulnerability)
+  "urllib3>=2.6.3",
 ]
 
 [project.urls]
