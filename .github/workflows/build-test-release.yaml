@@ -39,7 +39,8 @@ jobs:
         uses: lfreleng-actions/repository-metadata-action@ceabcd987d13d7bfefd2372e01eebb0ddac45956  # v0.2.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          generate_summary: 'false'
+          github_summary: 'true'
+          gerrit_summary: 'false'
           artifact_upload: 'true'
           artifact_formats: 'json'
 
@@ -47,7 +48,7 @@ jobs:
     name: 'Validate Tag Push'
     runs-on: 'ubuntu-latest'
     permissions:
-      contents: read
+      contents: write  # Needed to draft a release
     timeout-minutes: 1
     outputs:
       tag: "${{ steps.tag-validate.outputs.tag_name }}"
@@ -70,9 +71,11 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: lfreleng-actions/tag-validate-action@57c522eff7b5ff797094c054a9614f45e0c5ef17  # v0.3.0
         with:
-          require_type: 'semver'
-          require_signed: 'true'
           token: "${{ secrets.GITHUB_TOKEN }}"
+          require_type: 'semver'
+          require_github: 'true'
+          # yamllint disable-line rule:line-length
+          require_signed: 'ssh,gpg-unverifiable'  # Cannot verify GPG without key
 
       - name: 'Reject development tags'
         if: steps.tag-validate.outputs.development_tag == 'true'
@@ -229,6 +232,9 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: anchore/scan-action@62b74fb7bb810d2c45b1865f47a77655621862a5  # v7.2.3
         id: grype-sarif
+        # The first Grype audit should not be blocking and should never fail
+        # That way we always get the required artefact; the second job will
+        # exit with an error, as required (below)
         continue-on-error: true
         with:
           sbom: "${{ steps.sbom.outputs.sbom_json_path }}"
@@ -278,7 +284,7 @@ jobs:
       name: 'development'
     permissions:
       contents: read
-      id-token: write # IMPORTANT: mandatory for trusted publishing
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
     timeout-minutes: 5
     steps:
       # Harden the runner used by this workflow
@@ -305,7 +311,7 @@ jobs:
       name: 'production'
     permissions:
       contents: read
-      id-token: write # IMPORTANT: mandatory for trusted publishing
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
     timeout-minutes: 5
     steps:
       # Harden the runner used by this workflow
@@ -334,7 +340,7 @@ jobs:
       - 'pypi'
     # yamllint disable-line rule:line-length
     permissions:
-      contents: write # IMPORTANT: needed to edit release, attach artefacts
+      contents: write  # IMPORTANT: needed to edit release, attach artefacts
     timeout-minutes: 5
     env:
       GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
