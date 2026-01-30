@@ -307,28 +307,20 @@ class Orchestrator:
             return True
 
         try:
-            # Get credentials if available
-            http_user = (
-                os.getenv("GERRIT_HTTP_USER", "").strip()
-                or os.getenv("GERRIT_SSH_USER_G2G", "").strip()
-            )
-            http_pass = os.getenv("GERRIT_HTTP_PASSWORD", "").strip()
-
-            if not http_user or not http_pass:
-                log.debug(
-                    "Cannot update Gerrit change metadata: "
-                    "GERRIT_HTTP_USER/PASSWORD not configured"
-                )
-                return False
-
-            # Use centralized URL builder
+            # Use centralized URL builder with automatic credential resolution.
+            # Credential priority: CLI args > .netrc > environment variables.
+            # This call uses .netrc > environment (no CLI args passed).
             from .gerrit_rest import build_client_for_host
 
-            client = build_client_for_host(
-                gerrit.host,
-                http_user=http_user,
-                http_password=http_pass,
-            )
+            client = build_client_for_host(gerrit.host)
+
+            # Check if client has authentication
+            if not client.is_authenticated:
+                log.debug(
+                    "Cannot update Gerrit change metadata: "
+                    "No credentials found (check .netrc or environment)"
+                )
+                return False
 
             encoded_id = urllib.parse.quote(change_id, safe="")
 
@@ -4229,14 +4221,9 @@ class Orchestrator:
         # Create centralized URL builder (auto-discovers base path)
         url_builder = create_gerrit_url_builder(gerrit.host)
 
-        # Get authentication credentials
-        http_user = (
-            os.getenv("GERRIT_HTTP_USER", "").strip()
-            or os.getenv("GERRIT_SSH_USER_G2G", "").strip()
-        )
-        http_pass = os.getenv("GERRIT_HTTP_PASSWORD", "").strip()
-
         # Query changes using centralized REST client
+        # Credential priority: CLI args > .netrc > environment variables.
+        # This call uses .netrc > environment (no CLI args passed).
         urls: list[str] = []
         nums: list[str] = []
         shas: list[str] = []
@@ -4256,8 +4243,6 @@ class Orchestrator:
                 gerrit.host,
                 timeout=8.0,
                 max_attempts=5,
-                http_user=http_user or None,
-                http_password=http_pass or None,
             )
             try:
                 log.debug("Gerrit API base URL (discovered): %s", api_base_url)
@@ -5349,13 +5334,9 @@ class Orchestrator:
             raise OrchestratorError(msg) from exc
 
         # Gerrit REST reachability and optional auth check
+        # Credential priority: CLI args > .netrc > environment variables.
         base_path = os.getenv("GERRIT_HTTP_BASE_PATH", "").strip().strip("/")
-        http_user = (
-            os.getenv("GERRIT_HTTP_USER", "").strip()
-            or os.getenv("GERRIT_SSH_USER_G2G", "").strip()
-        )
-        http_pass = os.getenv("GERRIT_HTTP_PASSWORD", "").strip()
-        self._verify_gerrit_rest(gerrit.host, base_path, http_user, http_pass)
+        self._verify_gerrit_rest(gerrit.host, base_path)
 
         # GitHub token and metadata checks
         try:
@@ -5403,33 +5384,28 @@ class Orchestrator:
         self,
         host: str,
         base_path: str,
-        http_user: str,
-        http_pass: str,
     ) -> None:
         """Probe Gerrit REST endpoint with optional auth.
 
         Uses the centralized gerrit_rest client to ensure proper base path
         handling and consistent API interactions.
+
+        Credential priority: CLI args > .netrc > environment variables.
         """
         from .gerrit_rest import build_client_for_host
 
         try:
-            # Use centralized client builder that handles base path correctly
+            # Use centralized client builder for base path and credentials
             client = build_client_for_host(
                 host,
                 timeout=8.0,
                 max_attempts=3,
-                http_user=http_user,
-                http_password=http_pass,
             )
 
             # Test connectivity with appropriate endpoint
-            if http_user and http_pass:
+            if client.is_authenticated:
                 _ = client.get("/accounts/self")
-                log.debug(
-                    "Gerrit REST authenticated access verified for user '%s'",
-                    http_user,
-                )
+                log.debug("Gerrit REST authenticated access verified")
             else:
                 _ = client.get("/dashboard/self")
                 log.debug("Gerrit REST endpoint reachable (unauthenticated)")

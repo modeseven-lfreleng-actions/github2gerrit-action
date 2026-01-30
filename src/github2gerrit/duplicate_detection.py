@@ -268,22 +268,23 @@ class DuplicateDetector:
         return None
 
     def _build_gerrit_rest_client(self, gerrit_host: str) -> Any | None:
-        """Build a Gerrit REST API client using centralized framework."""
-        from .gerrit_rest import build_client_for_host
+        """Build a Gerrit REST API client using centralized framework.
 
-        http_user = (
-            os.getenv("GERRIT_HTTP_USER", "").strip()
-            or os.getenv("GERRIT_SSH_USER_G2G", "").strip()
-        )
-        http_pass = os.getenv("GERRIT_HTTP_PASSWORD", "").strip()
+        Credential resolution is handled by build_client_for_host with priority:
+        1. Explicit CLI arguments (if passed to build_client_for_host)
+        2. .netrc file
+        3. Environment variables (GERRIT_HTTP_USER/GERRIT_HTTP_PASSWORD)
+
+        This method does not pass explicit credentials, so only .netrc and
+        environment variables are used.
+        """
+        from .gerrit_rest import build_client_for_host
 
         try:
             return build_client_for_host(
                 gerrit_host,
                 timeout=8.0,
                 max_attempts=3,
-                http_user=http_user or None,
-                http_password=http_pass or None,
             )
         except Exception as exc:
             log.debug("Failed to create Gerrit REST client: %s", exc)

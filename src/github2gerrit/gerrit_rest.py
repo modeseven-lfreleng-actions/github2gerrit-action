@@ -30,11 +30,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from typing import Final
 from urllib.parse import urljoin
@@ -43,6 +43,8 @@ from .external_api import ApiType
 from .external_api import RetryPolicy
 from .external_api import external_api_call
 from .gerrit_urls import create_gerrit_url_builder
+from .netrc import GerritCredentials
+from .netrc import resolve_gerrit_credentials
 from .utils import log_exception_conditionally
 
 
@@ -155,6 +157,11 @@ class GerritRestClient:
         )
 
     # Public API
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Return True if client has authentication credentials."""
+        return self._auth is not None
 
     def get(self, path: str) -> Any:
         """HTTP GET, returning parsed JSON."""
@@ -290,37 +297,72 @@ def build_client_for_host(
     max_attempts: int = 5,
     http_user: str | None = None,
     http_password: str | None = None,
+    use_netrc: bool = True,
+    netrc_file: Path | None = None,
+    credentials: GerritCredentials | None = None,
 ) -> GerritRestClient:
     """
     Build a GerritRestClient for a given host using the centralized URL builder.
 
     - Uses auto-discovered or environment-provided base path.
-    - Reads HTTP auth from arguments or environment:
-      GERRIT_HTTP_USER / GERRIT_HTTP_PASSWORD
-      If user is not provided, falls back to GERRIT_SSH_USER_G2G per project
-      norms.
+    - Reads HTTP auth from multiple sources in priority order:
+      1. Pre-resolved GerritCredentials object (if provided)
+      2. Explicit http_user/http_password arguments
+      3. .netrc file (if use_netrc=True)
+      4. Environment variables: GERRIT_HTTP_USER / GERRIT_HTTP_PASSWORD
+         If user is not provided, falls back to GERRIT_SSH_USER_G2G per project
+         norms.
 
     Args:
       host: Gerrit hostname (no scheme)
       timeout: Request timeout in seconds.
       max_attempts: Max retry attempts for transient failures.
-      http_user: Optional HTTP user.
-      http_password: Optional HTTP password/token.
+      http_user: Optional HTTP user (deprecated, use credentials).
+      http_password: Optional HTTP password/token (deprecated, use credentials).
+      use_netrc: Whether to try .netrc for credentials (default: True).
+      netrc_file: Explicit path to a .netrc file (optional).
+      credentials: Pre-resolved GerritCredentials object (preferred).
 
     Returns:
       Configured GerritRestClient.
     """
     builder = create_gerrit_url_builder(host)
     base_url = builder.api_url()
-    user = (
-        (http_user or "").strip()
-        or os.getenv("GERRIT_HTTP_USER", "").strip()
-        or os.getenv("GERRIT_SSH_USER_G2G", "").strip()
+
+    # Use pre-resolved credentials if provided
+    if credentials is not None and credentials.is_valid:
+        log.debug(
+            "Using pre-resolved credentials from %s",
+            credentials.auth_method_display(),
+        )
+        auth: tuple[str, str] | None = (
+            credentials.username,
+            credentials.password,
+        )
+        return GerritRestClient(
+            base_url=base_url,
+            auth=auth,
+            timeout=timeout,
+            max_attempts=max_attempts,
+        )
+
+    # Otherwise, resolve credentials using centralized function
+    resolved = resolve_gerrit_credentials(
+        host=host,
+        explicit_username=http_user,
+        explicit_password=http_password,
+        use_netrc=use_netrc,
+        netrc_file=netrc_file,
+        env_username_var="GERRIT_HTTP_USER",
+        env_password_var="GERRIT_HTTP_PASSWORD",  # noqa: S106
+        fallback_env_username_var="GERRIT_SSH_USER_G2G",
+        fallback_env_password_var=None,
     )
-    passwd = (http_password or "").strip() or os.getenv(
-        "GERRIT_HTTP_PASSWORD", ""
-    ).strip()
-    auth: tuple[str, str] | None = (user, passwd) if user and passwd else None
+
+    auth = None
+    if resolved is not None and resolved.is_valid:
+        auth = (resolved.username, resolved.password)
+
     return GerritRestClient(
         base_url=base_url, auth=auth, timeout=timeout, max_attempts=max_attempts
     )

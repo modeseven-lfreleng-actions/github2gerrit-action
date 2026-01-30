@@ -69,6 +69,8 @@ from .gitutils import enumerate_reviewer_emails
 from .gitutils import git
 from .models import GitHubContext
 from .models import Inputs
+from .netrc import NetrcParseError
+from .netrc import get_credentials_for_host
 from .rich_display import RICH_AVAILABLE
 from .rich_display import DummyProgressTracker
 from .rich_display import G2GProgressTracker
@@ -778,6 +780,29 @@ def main(
         envvar="AUTOMATION_ONLY",
         help="Accept pull requests from known automation tools.",
     ),
+    no_netrc: bool = typer.Option(
+        False,
+        "--no-netrc",
+        help="Disable .netrc credential lookup for Gerrit HTTP authentication",
+        envvar="G2G_NO_NETRC",
+    ),
+    netrc_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--netrc-file",
+        help="Explicit path to .netrc file for Gerrit HTTP credentials",
+        envvar="G2G_NETRC_FILE",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+    netrc_optional: bool = typer.Option(
+        True,
+        "--netrc-optional/--netrc-required",
+        help="Whether to fail if .netrc file is not found (default: optional)",
+        envvar="G2G_NETRC_OPTIONAL",
+    ),
 ) -> None:
     """
     Tool to convert GitHub pull requests into Gerrit changes
@@ -835,6 +860,46 @@ def main(
 
     if os.getenv("AUTOMATION_ONLY"):
         automation_only = parse_bool_env(os.getenv("AUTOMATION_ONLY"))
+
+    # Store netrc options in environment for use by processing functions
+    os.environ["G2G_NO_NETRC"] = "true" if no_netrc else "false"
+    if netrc_file:
+        os.environ["G2G_NETRC_FILE"] = str(netrc_file)
+    os.environ["G2G_NETRC_OPTIONAL"] = "true" if netrc_optional else "false"
+
+    # Handle netrc credential loading if enabled
+    if not no_netrc:
+        # Get the Gerrit server from environment or CLI
+        gerrit_host = gerrit_server or os.getenv("GERRIT_SERVER", "")
+        if gerrit_host:
+            try:
+                netrc_creds = get_credentials_for_host(
+                    host=gerrit_host,
+                    netrc_file=netrc_file,
+                    use_netrc=True,
+                    netrc_optional=netrc_optional,
+                )
+                if netrc_creds:
+                    # Set HTTP credentials from netrc if not already set
+                    if not os.getenv("GERRIT_HTTP_USER"):
+                        os.environ["GERRIT_HTTP_USER"] = netrc_creds.login
+                    if not os.getenv("GERRIT_HTTP_PASSWORD"):
+                        os.environ["GERRIT_HTTP_PASSWORD"] = (
+                            netrc_creds.password
+                        )
+                    log.debug(
+                        "Loaded Gerrit HTTP credentials for %s from .netrc",
+                        gerrit_host,
+                    )
+            except FileNotFoundError:
+                if not netrc_optional:
+                    safe_typer_echo(
+                        "❌ No .netrc file found and --netrc-required set"
+                    )
+                    sys.exit(int(ExitCode.CONFIGURATION_ERROR))
+            except NetrcParseError as e:
+                safe_typer_echo(f"❌ Failed to parse .netrc file: {e}")
+                sys.exit(int(ExitCode.CONFIGURATION_ERROR))
 
     # Set up logging level based on verbose flag
     if verbose:
