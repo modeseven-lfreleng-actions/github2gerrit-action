@@ -1225,6 +1225,47 @@ GERRIT_HTTP_USER = "bot-user"
 GERRIT_HTTP_PASSWORD = "${ENV:ODL_GERRIT_TOKEN}"
 ```
 
+### Using .netrc Files
+
+GitHub2Gerrit supports loading Gerrit credentials from `.netrc` files, following
+the standard format used by curl and other tools.
+
+**Search order:**
+
+1. `.netrc` in the current directory
+2. `~/.netrc` in your home directory
+3. `~/_netrc` (Windows fallback)
+
+**Example `.netrc` file:**
+
+```text
+machine gerrit.onap.org login myuser password mytoken
+machine gerrit.opendaylight.org login myuser password anothertoken
+```
+
+**CLI options:**
+
+| Option | Description |
+| ------ | ----------- |
+| `--no-netrc` | Disable .netrc file lookup |
+| `--netrc-file PATH` | Use a specific .netrc file |
+| `--netrc-optional` | Do not fail if .netrc file is missing (default) |
+| `--netrc-required` | Require a .netrc file and fail if missing |
+
+By default, `.netrc` lookup is optional (`--netrc-optional`): if the tool
+finds no `.netrc` file, it continues and falls back to environment variables.
+Use `--netrc-required` to enforce that a `.netrc` file must be present.
+
+When a `.netrc` file is present, the tool loads credentials automatically.
+Explicit environment variables or CLI arguments take precedence over `.netrc`
+entries.
+
+**Credential Priority Order:**
+
+1. **CLI arguments** (highest priority)
+2. **`.netrc` file** (if not disabled with `--no-netrc`)
+3. **Environment variables** (e.g., `GERRIT_HTTP_USER`, `GERRIT_HTTP_PASSWORD`)
+
 The tool loads configuration from `~/.config/github2gerrit/configuration.txt`
 by default, or from the path specified in the `G2G_CONFIG_PATH` environment
 variable.
