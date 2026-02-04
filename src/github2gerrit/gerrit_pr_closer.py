@@ -1492,6 +1492,16 @@ def cleanup_closed_github_prs(
                 )
                 continue
 
+    except GerritRestError as exc:
+        # Wrap in GitHub2GerritError to ensure SSL/connection errors
+        # fail the workflow
+        log.exception("Failed to perform Gerrit cleanup for closed GitHub PRs")
+        raise GitHub2GerritError(
+            ExitCode.GERRIT_CONNECTION_ERROR,
+            message="❌ Gerrit REST API error during cleanup",
+            details=str(exc),
+            original_exception=exc,
+        ) from exc
     except Exception:
         log.exception("Failed to perform Gerrit cleanup for closed GitHub PRs")
         return 0
