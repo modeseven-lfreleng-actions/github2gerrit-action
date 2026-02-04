@@ -283,7 +283,7 @@ def _extract_and_display_pr_info(
             pr_info["Files Changed"] = "unknown"
 
         # Display the PR information
-        display_pr_info(pr_info, "Pull Request Details", progress_tracker)
+        display_pr_info(pr_info, "Pull Request Details", progress_tracker=progress_tracker)
 
     except GitHub2GerritError:
         # Let our structured errors propagate
