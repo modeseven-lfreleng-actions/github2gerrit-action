@@ -51,8 +51,8 @@ _LOGGER_NAME = "github2gerrit.git"
 log = logging.getLogger(_LOGGER_NAME)
 if not log.handlers:
     # Provide a minimal default if the app has not configured logging.
-    level_name = os.getenv("G2G_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    level_name = os.getenv("G2G_LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
     fmt = (
         "%(asctime)s %(levelname)-8s %(name)s %(filename)s:%(lineno)d | "
         "%(message)s"
