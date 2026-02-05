@@ -283,7 +283,9 @@ def _extract_and_display_pr_info(
             pr_info["Files Changed"] = "unknown"
 
         # Display the PR information
-        display_pr_info(pr_info, "Pull Request Details", progress_tracker)
+        display_pr_info(
+            pr_info, "Pull Request Details", progress_tracker=progress_tracker
+        )
 
     except GitHub2GerritError:
         # Let our structured errors propagate
@@ -1099,8 +1101,8 @@ def main(
 
 
 def _setup_logging() -> logging.Logger:
-    level_name = os.getenv("G2G_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    level_name = os.getenv("G2G_LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
     fmt = (
         "%(asctime)s %(levelname)-8s %(name)s %(filename)s:%(lineno)d | "
         "%(message)s"
@@ -1111,8 +1113,8 @@ def _setup_logging() -> logging.Logger:
 
 def _reconfigure_logging() -> None:
     """Reconfigure logging level based on current environment variables."""
-    level_name = os.getenv("G2G_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    level_name = os.getenv("G2G_LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
     logging.getLogger().setLevel(level)
     for handler in logging.getLogger().handlers:
         handler.setLevel(level)

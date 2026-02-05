@@ -2547,9 +2547,10 @@ class Orchestrator:
     def _ensure_workspace_prepared(self, branch: str) -> None:
         """Ensure workspace is prepared with latest remote state.
 
-        Performs a single git fetch to avoid redundant SSH operations.
-        This consolidates multiple fetch operations that were causing
-        excessive SSH agent prompts.
+        Performs a git fetch to get the latest branch state. Does NOT
+        proactively unshallow to avoid performance impact on large repos.
+        If checkout later fails due to missing commits in shallow clone,
+        _checkout_with_unshallow_fallback() will handle it reactively.
 
         Args:
             branch: The branch to fetch from origin
@@ -2574,6 +2575,169 @@ class Orchestrator:
             log.warning("Failed to fetch from origin: %s", exc)
             # Don't mark as prepared if fetch failed
             raise
+
+    def _is_shallow_clone(self) -> bool:
+        """Check if the current workspace is a shallow clone.
+
+        Returns:
+            True if the repository is a shallow clone, False otherwise.
+        """
+        shallow_file = self.workspace / ".git" / "shallow"
+        if shallow_file.exists():
+            return True
+        # Also check via git command for edge cases (e.g., worktrees)
+        try:
+            result = run_cmd(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=self.workspace,
+                check=False,
+            )
+            return result.stdout.strip().lower() == "true"
+        except Exception:
+            return False
+
+    def _unshallow_repository(self) -> bool:
+        """Unshallow the repository to get full history.
+
+        Returns:
+            True if unshallowing succeeded or repo is already full,
+            False if unshallowing failed.
+        """
+        if not self._is_shallow_clone():
+            log.debug("Repository is not shallow, no unshallow needed")
+            return True
+
+        log.info("Unshallowing repository to fetch full history...")
+        try:
+            run_cmd(
+                ["git", "fetch", "--unshallow", "origin"],
+                cwd=self.workspace,
+                env=self._ssh_env(),
+            )
+        except CommandError as exc:
+            log.warning("Failed to unshallow repository: %s", exc)
+            return False
+        else:
+            log.debug("Repository unshallowed successfully")
+            return True
+
+    def _deepen_repository(self, depth: int = 100) -> bool:
+        """Deepen the repository history by fetching more commits.
+
+        This is a lighter alternative to full unshallow, fetching only
+        the specified number of additional commits.
+
+        Args:
+            depth: Number of additional commits to fetch (default: 100)
+
+        Returns:
+            True if deepening succeeded, False otherwise.
+        """
+        if not self._is_shallow_clone():
+            log.debug("Repository is not shallow, no deepening needed")
+            return True
+
+        log.debug("Deepening repository by %d commits...", depth)
+        try:
+            run_cmd(
+                ["git", "fetch", f"--deepen={depth}", "origin"],
+                cwd=self.workspace,
+                env=self._ssh_env(),
+            )
+        except CommandError as exc:
+            log.debug("Failed to deepen repository: %s", exc)
+            return False
+        else:
+            log.debug("Repository deepened by %d commits", depth)
+            return True
+
+    def _checkout_with_unshallow_fallback(
+        self,
+        branch_name: str,
+        start_point: str,
+        create_branch: bool = True,
+    ) -> None:
+        """Checkout a branch with graduated deepening fallback.
+
+        If the initial checkout fails because the start_point SHA is not
+        available (common in shallow clones), this method will:
+        1. First try to deepen the repository (fetch 100 more commits)
+        2. If that fails, fully unshallow the repository
+        3. Retry the checkout after each attempt
+
+        This graduated approach minimizes performance impact for most cases
+        while still handling edge cases where full history is needed.
+
+        Args:
+            branch_name: Name of the branch to checkout or create
+            start_point: The SHA or ref to start the branch from
+            create_branch: If True, create a new branch (-b flag)
+
+        Raises:
+            CommandError: If checkout fails even after unshallowing
+        """
+        cmd = ["git", "checkout"]
+        if create_branch:
+            cmd.extend(["-b", branch_name, start_point])
+        else:
+            cmd.append(branch_name)
+
+        checkout_exc: CommandError | None = None
+        try:
+            run_cmd(cmd, cwd=self.workspace)
+        except CommandError as exc:
+            checkout_exc = exc
+
+        if checkout_exc is None:
+            return  # Success on first attempt
+
+        # Analyze the failure
+        error_msg = str(checkout_exc).lower()
+        # Check if failure is due to missing commit (shallow clone issue)
+        is_missing_commit = (
+            "not a commit" in error_msg
+            or "cannot be created from" in error_msg
+            or "bad revision" in error_msg
+            or "unknown revision" in error_msg
+            or "invalid reference" in error_msg
+        )
+
+        if not is_missing_commit:
+            # Not a shallow clone issue, re-raise immediately
+            raise checkout_exc
+
+        log.warning(
+            "Checkout failed, SHA %s not available in shallow clone. "
+            "Attempting graduated deepening...",
+            start_point,
+        )
+
+        # Step 1: Try deepening first (cheaper than full unshallow)
+        if self._deepen_repository(depth=100):
+            log.debug("Retrying checkout after deepening...")
+            try:
+                run_cmd(cmd, cwd=self.workspace)
+            except CommandError as deepen_exc:
+                log.debug(
+                    "Checkout still failed after deepening: %s", deepen_exc
+                )
+            else:
+                log.info("Checkout succeeded after deepening repository")
+                return
+
+        # Step 2: Full unshallow as last resort
+        log.info("Deepening insufficient, performing full unshallow...")
+        if not self._unshallow_repository():
+            log.error(
+                "Failed to unshallow repository. Cannot checkout SHA: %s",
+                start_point,
+            )
+            raise checkout_exc
+
+        # Retry the checkout after full unshallow
+        log.debug("Retrying checkout after full unshallow...")
+        run_cmd(cmd, cwd=self.workspace)
+        log.info("Checkout succeeded after full unshallow")
 
     def _cleanup_ssh(self) -> None:
         """Clean up temporary SSH files created by this tool.
@@ -2787,8 +2951,10 @@ class Orchestrator:
         ).stdout.strip()
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
         os.environ["G2G_TMP_BRANCH"] = tmp_branch
-        run_cmd(
-            ["git", "checkout", "-b", tmp_branch, base_sha], cwd=self.workspace
+        self._checkout_with_unshallow_fallback(
+            branch_name=tmp_branch,
+            start_point=base_sha,
+            create_branch=True,
         )
         change_ids: list[str] = []
         for idx, csha in enumerate(commit_list):
@@ -2938,8 +3104,10 @@ class Orchestrator:
         except Exception as debug_exc:
             log.warning("Failed to analyze merge situation: %s", debug_exc)
 
-        run_cmd(
-            ["git", "checkout", "-b", tmp_branch, base_sha], cwd=self.workspace
+        self._checkout_with_unshallow_fallback(
+            branch_name=tmp_branch,
+            start_point=base_sha,
+            create_branch=True,
         )
 
         # Show git status before attempting merge

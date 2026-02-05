@@ -63,9 +63,17 @@ def is_verbose_mode() -> bool:
     """Check if verbose mode is enabled via environment variable.
 
     Returns:
-        True if G2G_VERBOSE environment variable is set to a truthy value
+        True if G2G_VERBOSE environment variable is set to a truthy value,
+        or if GitHub Actions debug mode is enabled (RUNNER_DEBUG=1 or
+        ACTIONS_STEP_DEBUG=true)
     """
-    return os.getenv("G2G_VERBOSE", "").lower() in ("true", "1", "yes")
+    if os.getenv("G2G_VERBOSE", "").lower() in ("true", "1", "yes"):
+        return True
+    # GitHub Actions sets RUNNER_DEBUG=1 when re-running with debug logging
+    if os.getenv("RUNNER_DEBUG", "") == "1":
+        return True
+    # GitHub Actions also sets ACTIONS_STEP_DEBUG=true for step-level debugging
+    return os.getenv("ACTIONS_STEP_DEBUG", "").lower() == "true"
 
 
 def log_exception_conditionally(

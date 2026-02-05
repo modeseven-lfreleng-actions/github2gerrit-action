@@ -946,7 +946,7 @@ Common issues and solutions:
 The comprehensive [Inputs](#inputs) table above documents all environment variables.
 Key variables for CLI usage include:
 
-- `G2G_LOG_LEVEL`: Set to `DEBUG` for verbose output (default: `INFO`)
+- `G2G_LOG_LEVEL`: Set to `DEBUG` for verbose output (default: `WARNING`)
 - `G2G_VERBOSE`: Set to `true` to enable debug logging (same as `--verbose` flag)
 - `GERRIT_SSH_PRIVKEY_G2G`: SSH private key content
 - `GERRIT_KNOWN_HOSTS`: SSH known hosts entries
@@ -1159,7 +1159,7 @@ The following environment variables control internal behavior but are not action
 
 | Environment Variable         | Description                                    | Default                                    |
 | ---------------------------- | ---------------------------------------------- | ------------------------------------------ |
-| `G2G_LOG_LEVEL`              | Logging level (DEBUG, INFO, WARNING, ERROR)    | `"INFO"`                                   |
+| `G2G_LOG_LEVEL`              | Logging level (DEBUG, INFO, WARNING, ERROR)    | `"WARNING"`                                |
 | `G2G_ENABLE_DERIVATION`      | Enable auto-derivation of Gerrit parameters    | `"true"`                                   |
 | `G2G_CONFIG_PATH`            | Path to organization configuration file        | `~/.config/github2gerrit/config.ini`       |
 | `G2G_AUTO_SAVE_CONFIG`       | Auto-save derived parameters to config         | `"false"` (GitHub Actions), `"true"` (CLI) |

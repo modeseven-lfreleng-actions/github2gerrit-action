@@ -198,6 +198,85 @@ class TestIsVerboseMode:
         monkeypatch.setenv("G2G_VERBOSE", "True")
         assert is_verbose_mode() is True
 
+    def test_is_verbose_mode_runner_debug(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that RUNNER_DEBUG=1 enables verbose mode.
+
+        GitHub Actions sets RUNNER_DEBUG=1 when re-running with debug logging.
+        """
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("ACTIONS_STEP_DEBUG", raising=False)
+        monkeypatch.setenv("RUNNER_DEBUG", "1")
+        assert is_verbose_mode() is True
+
+    def test_is_verbose_mode_runner_debug_other_values(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that RUNNER_DEBUG with non-1 values does not enable verbose."""
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("ACTIONS_STEP_DEBUG", raising=False)
+        # Only "1" should trigger verbose mode
+        for value in ["0", "true", "yes", ""]:
+            monkeypatch.setenv("RUNNER_DEBUG", value)
+            assert is_verbose_mode() is False
+
+    def test_is_verbose_mode_actions_step_debug(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that ACTIONS_STEP_DEBUG=true enables verbose mode.
+
+        GitHub Actions sets ACTIONS_STEP_DEBUG=true for step-level debugging.
+        """
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("RUNNER_DEBUG", raising=False)
+        monkeypatch.setenv("ACTIONS_STEP_DEBUG", "true")
+        assert is_verbose_mode() is True
+
+    def test_is_verbose_mode_actions_step_debug_case_insensitive(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that ACTIONS_STEP_DEBUG is case insensitive."""
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("RUNNER_DEBUG", raising=False)
+        for value in ["TRUE", "True", "true"]:
+            monkeypatch.setenv("ACTIONS_STEP_DEBUG", value)
+            assert is_verbose_mode() is True
+
+    def test_is_verbose_mode_actions_step_debug_false_values(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Test that ACTIONS_STEP_DEBUG with non-true values does not enable."""
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("RUNNER_DEBUG", raising=False)
+        for value in ["false", "0", "no", ""]:
+            monkeypatch.setenv("ACTIONS_STEP_DEBUG", value)
+            assert is_verbose_mode() is False
+
+    def test_is_verbose_mode_priority(self, monkeypatch: MonkeyPatch) -> None:
+        """Test that G2G_VERBOSE takes precedence over debug variables.
+
+        When G2G_VERBOSE is set to a truthy value, verbose mode should be
+        enabled regardless of the debug variables.
+        """
+        monkeypatch.setenv("G2G_VERBOSE", "true")
+        monkeypatch.delenv("RUNNER_DEBUG", raising=False)
+        monkeypatch.delenv("ACTIONS_STEP_DEBUG", raising=False)
+        assert is_verbose_mode() is True
+
+        # G2G_VERBOSE=true should enable even without debug vars
+        monkeypatch.setenv("G2G_VERBOSE", "true")
+        monkeypatch.setenv("RUNNER_DEBUG", "0")
+        monkeypatch.setenv("ACTIONS_STEP_DEBUG", "false")
+        assert is_verbose_mode() is True
+
+    def test_is_verbose_mode_all_unset(self, monkeypatch: MonkeyPatch) -> None:
+        """Test verbose mode is False when all relevant env vars are unset."""
+        monkeypatch.delenv("G2G_VERBOSE", raising=False)
+        monkeypatch.delenv("RUNNER_DEBUG", raising=False)
+        monkeypatch.delenv("ACTIONS_STEP_DEBUG", raising=False)
+        assert is_verbose_mode() is False
+
 
 class TestLogExceptionConditionally:
     """Test the log_exception_conditionally function."""
