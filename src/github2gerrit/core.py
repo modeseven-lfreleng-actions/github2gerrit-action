@@ -2717,8 +2717,10 @@ class Orchestrator:
             log.debug("Retrying checkout after deepening...")
             try:
                 run_cmd(cmd, cwd=self.workspace)
-            except CommandError:
-                log.debug("Checkout still failed after deepening")
+            except CommandError as deepen_exc:
+                log.debug(
+                    "Checkout still failed after deepening: %s", deepen_exc
+                )
             else:
                 log.info("Checkout succeeded after deepening repository")
                 return
@@ -2736,8 +2738,6 @@ class Orchestrator:
         log.debug("Retrying checkout after full unshallow...")
         run_cmd(cmd, cwd=self.workspace)
         log.info("Checkout succeeded after full unshallow")
-
-
 
     def _cleanup_ssh(self) -> None:
         """Clean up temporary SSH files created by this tool.

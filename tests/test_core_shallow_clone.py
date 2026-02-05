@@ -222,7 +222,13 @@ class TestCheckoutWithUnshallowFallback:
         # Only checkout command should be called
         checkout_calls = [c for c in call_log if c[:2] == ["git", "checkout"]]
         assert len(checkout_calls) == 1
-        assert checkout_calls[0] == ["git", "checkout", "-b", "test_branch", "abc123"]
+        assert checkout_calls[0] == [
+            "git",
+            "checkout",
+            "-b",
+            "test_branch",
+            "abc123",
+        ]
 
     def test_checkout_fails_then_deepen_succeeds(self, tmp_path: Path) -> None:
         """Checkout fails due to missing SHA, deepen fixes it."""
@@ -304,7 +310,9 @@ class TestCheckoutWithUnshallowFallback:
         # 1. Initial (fail), 2. After deepen (fail), 3. After unshallow (success)
         assert checkout_attempts[0] == 3
 
-    def test_checkout_fails_non_shallow_error_raises(self, tmp_path: Path) -> None:
+    def test_checkout_fails_non_shallow_error_raises(
+        self, tmp_path: Path
+    ) -> None:
         """Checkout fails with non-shallow error, raises immediately."""
         git_dir = tmp_path / ".git"
         git_dir.mkdir()
@@ -329,7 +337,9 @@ class TestCheckoutWithUnshallowFallback:
 
         assert "already exists" in str(exc_info.value)
 
-    def test_checkout_fails_all_recovery_fails_raises(self, tmp_path: Path) -> None:
+    def test_checkout_fails_all_recovery_fails_raises(
+        self, tmp_path: Path
+    ) -> None:
         """Checkout fails, deepen and unshallow both fail, raises original error."""
         git_dir = tmp_path / ".git"
         git_dir.mkdir()
@@ -454,7 +464,9 @@ class TestEnsureWorkspacePrepared:
         assert len(fetch_calls) == 1
         assert fetch_calls[0] == ["git", "fetch", "origin", "master"]
 
-    def test_workspace_prepared_flag_prevents_refetch(self, tmp_path: Path) -> None:
+    def test_workspace_prepared_flag_prevents_refetch(
+        self, tmp_path: Path
+    ) -> None:
         """Once prepared, subsequent calls don't refetch."""
         git_dir = tmp_path / ".git"
         git_dir.mkdir()
