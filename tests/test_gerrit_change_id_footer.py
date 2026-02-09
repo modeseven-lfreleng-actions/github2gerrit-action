@@ -99,7 +99,7 @@ def test_apply_pr_title_body_preserves_change_id_footer(
     )
 
     # Stub GitHub API helpers used by _apply_pr_title_body_if_requested
-    monkeypatch.setattr("github2gerrit.core.build_client", lambda: object())
+    monkeypatch.setattr("github2gerrit.core.build_client", object)
     monkeypatch.setattr(
         "github2gerrit.core.get_repo_from_env", lambda client: object()
     )

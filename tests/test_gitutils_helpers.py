@@ -151,7 +151,7 @@ def test_git_retries_on_transient_error_then_succeeds(
 ) -> None:
     # Make sleep a no-op and record delays
     sleeps: list[float] = []
-    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("time.sleep", sleeps.append)
 
     attempts = {"n": 0}
 

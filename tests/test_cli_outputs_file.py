@@ -232,7 +232,7 @@ def test_multi_pr_url_mode_writes_aggregated_outputs(
         def __init__(self, number: int) -> None:
             self.number = number
 
-    monkeypatch.setattr(cli_mod, "build_client", lambda: object())
+    monkeypatch.setattr(cli_mod, "build_client", object)
     monkeypatch.setattr(cli_mod, "get_repo_from_env", lambda _client: object())
     monkeypatch.setattr(
         cli_mod,

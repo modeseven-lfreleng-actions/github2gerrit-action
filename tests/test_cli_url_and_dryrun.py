@@ -168,7 +168,7 @@ def test_repo_url_dry_run_invokes_for_each_open_pr(
     monkeypatch.setattr(cli_mod, "Orchestrator", _DummyOrchestrator)
 
     # Patch PyGithub wrapper functions used by CLI bulk path
-    monkeypatch.setattr(cli_mod, "build_client", lambda: object())
+    monkeypatch.setattr(cli_mod, "build_client", object)
     monkeypatch.setattr(cli_mod, "get_repo_from_env", lambda _client: object())
     monkeypatch.setattr(
         cli_mod, "iter_open_pulls", lambda _repo: iter(dummy_prs)
@@ -212,7 +212,7 @@ def test_url_mode_sets_environment_for_config_resolution(
     monkeypatch.setattr(cli_mod, "Orchestrator", _DummyOrchestrator)
 
     # Minimal patches for bulk flow
-    monkeypatch.setattr(cli_mod, "build_client", lambda: object())
+    monkeypatch.setattr(cli_mod, "build_client", object)
     monkeypatch.setattr(cli_mod, "get_repo_from_env", lambda _client: object())
     monkeypatch.setattr(
         cli_mod,
