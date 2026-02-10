@@ -45,27 +45,6 @@ _EMOJI_PATTERN = re.compile(r":[a-z_]+:")  # GitHub emoji codes like :sparkles:
 
 
 @dataclass
-class FilterConfig:
-    """Configuration for PR content filtering."""
-
-    # Global options
-    enabled: bool = True
-    remove_emoji_codes: bool = True
-    deduplicate_title_in_body: bool = True
-
-    # Author-specific filtering
-    author_rules: dict[str, str] = field(default_factory=dict)
-
-    # Rule-specific configurations
-    dependabot_config: DependabotConfig = field(
-        default_factory=lambda: DependabotConfig()
-    )
-    precommit_config: PrecommitConfig = field(
-        default_factory=lambda: PrecommitConfig()
-    )
-
-
-@dataclass
 class DependabotConfig:
     """Configuration for Dependabot PR filtering."""
 
@@ -83,6 +62,25 @@ class PrecommitConfig:
 
     enabled: bool = True
     # Future: add pre-commit.ci specific options
+
+
+@dataclass
+class FilterConfig:
+    """Configuration for PR content filtering."""
+
+    # Global options
+    enabled: bool = True
+    remove_emoji_codes: bool = True
+    deduplicate_title_in_body: bool = True
+
+    # Author-specific filtering
+    author_rules: dict[str, str] = field(default_factory=dict)
+
+    # Rule-specific configurations
+    dependabot_config: DependabotConfig = field(
+        default_factory=DependabotConfig
+    )
+    precommit_config: PrecommitConfig = field(default_factory=PrecommitConfig)
 
 
 class FilterRule(ABC):

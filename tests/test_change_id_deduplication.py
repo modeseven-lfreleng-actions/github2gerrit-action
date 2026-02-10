@@ -275,7 +275,7 @@ Change-Id: {reused_change_id}
     monkeypatch.setattr("github2gerrit.core.run_cmd", mock_run_cmd)
 
     # Mock GitHub API for Change-ID reuse
-    monkeypatch.setattr("github2gerrit.core.build_client", lambda: object())
+    monkeypatch.setattr("github2gerrit.core.build_client", object)
     monkeypatch.setattr(
         "github2gerrit.core.get_repo_from_env", lambda _: object()
     )

@@ -102,9 +102,7 @@ def test_close_pr_invoked_for_pull_request_target_event(
             self.closed_state: str | None = None
 
     # Patch the GitHub helper functions used by the close path
-    monkeypatch.setattr(
-        "github2gerrit.core.build_client", lambda: DummyClient()
-    )
+    monkeypatch.setattr("github2gerrit.core.build_client", DummyClient)
     monkeypatch.setattr(
         "github2gerrit.core.get_repo_from_env", lambda _c: DummyRepo()
     )

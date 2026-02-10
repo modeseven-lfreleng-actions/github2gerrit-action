@@ -237,7 +237,7 @@ def test_prepare_squashed_commit_reuses_change_id_from_comments(
     monkeypatch.setattr("github2gerrit.core.run_cmd", fake_run_cmd)
 
     # GitHub API helpers used to fetch PR comments
-    monkeypatch.setattr("github2gerrit.core.build_client", lambda: object())
+    monkeypatch.setattr("github2gerrit.core.build_client", object)
     monkeypatch.setattr(
         "github2gerrit.core.get_repo_from_env", lambda _c: object()
     )
