@@ -2739,6 +2739,113 @@ class Orchestrator:
         run_cmd(cmd, cwd=self.workspace)
         log.info("Checkout succeeded after full unshallow")
 
+    def _merge_squash_with_unshallow_fallback(self, head_sha: str) -> None:
+        """Perform git merge --squash with graduated deepening fallback.
+
+        If the initial merge fails because the shallow clone lacks a common
+        ancestor between the base and head (causing "refusing to merge
+        unrelated histories"), this method will:
+        1. First try to deepen the repository (fetch 100 more commits)
+        2. If that fails, fully unshallow the repository
+        3. Retry the merge after each attempt
+
+        This mirrors the graduated approach used by
+        ``_checkout_with_unshallow_fallback`` but for merge operations,
+        which are equally susceptible to shallow clone limitations.
+
+        Args:
+            head_sha: The SHA to merge (PR head commit)
+
+        Raises:
+            CommandError: If merge fails even after unshallowing, or if
+                the failure is not related to shallow clone history
+        """
+        merge_cmd = ["git", "merge", "--squash", head_sha]
+
+        merge_exc: CommandError | None = None
+        try:
+            run_cmd(merge_cmd, cwd=self.workspace)
+        except CommandError as exc:
+            merge_exc = exc
+
+        if merge_exc is None:
+            return  # Success on first attempt
+
+        # Check if the failure is due to unrelated histories in a shallow clone
+        error_str = str(merge_exc).lower()
+        stderr_str = (merge_exc.stderr or "").lower()
+        combined = f"{error_str} {stderr_str}"
+
+        is_unrelated_histories = (
+            "refusing to merge unrelated histories" in combined
+            or "unrelated histories" in combined
+            or "no common ancestor" in combined
+        )
+
+        if not is_unrelated_histories or not self._is_shallow_clone():
+            # Not a shallow clone issue — let the caller handle the error
+            raise merge_exc
+
+        log.warning(
+            "Merge --squash failed due to unrelated histories in shallow "
+            "clone. Attempting graduated deepening to recover..."
+        )
+
+        # Step 1: Try deepening first (cheaper than full unshallow)
+        if self._deepen_repository(depth=100):
+            log.debug("Retrying merge --squash after deepening...")
+            # Reset the failed merge state before retrying
+            run_cmd(
+                ["git", "merge", "--abort"],
+                cwd=self.workspace,
+                check=False,
+            )
+            try:
+                run_cmd(merge_cmd, cwd=self.workspace)
+            except CommandError as deepen_exc:
+                log.debug(
+                    "Merge --squash still failed after deepening: %s",
+                    deepen_exc,
+                )
+                # Re-check whether this is still a shallow-history problem;
+                # if the error has changed (e.g. real merge conflict), an
+                # expensive full unshallow cannot help — propagate immediately.
+                deepen_combined = (
+                    f"{deepen_exc} {deepen_exc.stderr or ''}".lower()
+                )
+                deepen_is_unrelated = (
+                    "refusing to merge unrelated histories" in deepen_combined
+                    or "unrelated histories" in deepen_combined
+                    or "no common ancestor" in deepen_combined
+                )
+                if not deepen_is_unrelated:
+                    raise
+            else:
+                log.info("Merge --squash succeeded after deepening repository")
+                return
+
+        # Step 2: Full unshallow as last resort
+        log.info(
+            "Deepening insufficient, performing full unshallow for merge..."
+        )
+        # Reset the failed merge state before retrying
+        run_cmd(
+            ["git", "merge", "--abort"],
+            cwd=self.workspace,
+            check=False,
+        )
+        if not self._unshallow_repository():
+            log.error(
+                "Failed to unshallow repository. Cannot merge SHA: %s",
+                head_sha,
+            )
+            raise merge_exc
+
+        # Retry the merge after full unshallow
+        log.debug("Retrying merge --squash after full unshallow...")
+        run_cmd(merge_cmd, cwd=self.workspace)
+        log.info("Merge --squash succeeded after full unshallow")
+
     def _cleanup_ssh(self) -> None:
         """Clean up temporary SSH files created by this tool.
 
@@ -3103,6 +3210,15 @@ class Orchestrator:
 
         except Exception as debug_exc:
             log.warning("Failed to analyze merge situation: %s", debug_exc)
+            # Proactively deepen if merge-base fails in a shallow clone,
+            # as this strongly indicates the shallow history is insufficient
+            # for the upcoming merge --squash operation.
+            if self._is_shallow_clone():
+                log.info(
+                    "merge-base failed in shallow clone — proactively "
+                    "deepening repository to improve merge success chances"
+                )
+                self._deepen_repository(depth=100)
 
         self._checkout_with_unshallow_fallback(
             branch_name=tmp_branch,
@@ -3134,7 +3250,7 @@ class Orchestrator:
 
         log.debug("About to run: git merge --squash %s", head_sha)
         try:
-            run_cmd(["git", "merge", "--squash", head_sha], cwd=self.workspace)
+            self._merge_squash_with_unshallow_fallback(head_sha)
         except CommandError as merge_exc:
             # Enhanced error handling for git merge failures
             error_details = self._analyze_merge_failure(
