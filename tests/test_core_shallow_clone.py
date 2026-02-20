@@ -485,3 +485,342 @@ class TestEnsureWorkspacePrepared:
         # Should only have fetched once
         fetch_calls = [c for c in call_log if c[:2] == ["git", "fetch"]]
         assert len(fetch_calls) == 1
+
+
+class TestMergeSquashWithUnshallowFallback:
+    """Tests for _merge_squash_with_unshallow_fallback method."""
+
+    def test_merge_success_first_attempt(self, tmp_path: Path) -> None:
+        """Merge succeeds on first attempt without any deepening."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+
+        call_log: list[list[str]] = []
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            call_log.append(cmd)
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Should have called merge --squash exactly once
+        merge_calls = [c for c in call_log if "merge" in c and "--squash" in c]
+        assert len(merge_calls) == 1
+        assert merge_calls[0] == ["git", "merge", "--squash", "abc123"]
+
+        # No deepen or unshallow calls
+        deepen_calls = [c for c in call_log if "--deepen=" in str(c)]
+        assert len(deepen_calls) == 0
+        unshallow_calls = [c for c in call_log if "--unshallow" in c]
+        assert len(unshallow_calls) == 0
+
+    def test_merge_fails_unrelated_histories_deepen_succeeds(
+        self, tmp_path: Path
+    ) -> None:
+        """Merge fails with unrelated histories, deepen fixes it."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        merge_attempts = [0]
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                merge_attempts[0] += 1
+                if merge_attempts[0] == 1:
+                    raise CommandError(
+                        "fatal: refusing to merge unrelated histories",
+                        returncode=128,
+                        stderr="fatal: refusing to merge unrelated histories",
+                    )
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Should have attempted merge twice (before and after deepen)
+        assert merge_attempts[0] == 2
+
+    def test_merge_fails_unrelated_histories_deepen_insufficient_unshallow_succeeds(
+        self, tmp_path: Path
+    ) -> None:
+        """Merge fails, deepen insufficient, full unshallow fixes it."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        merge_attempts = [0]
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                merge_attempts[0] += 1
+                if merge_attempts[0] <= 2:
+                    raise CommandError(
+                        "fatal: refusing to merge unrelated histories",
+                        returncode=128,
+                        stderr="fatal: refusing to merge unrelated histories",
+                    )
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if cmd[:3] == ["git", "fetch", "--unshallow"]:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Should have attempted merge 3 times:
+        # 1. Initial (fail), 2. After deepen (fail), 3. After unshallow (success)
+        assert merge_attempts[0] == 3
+
+    def test_merge_fails_non_shallow_error_raises_immediately(
+        self, tmp_path: Path
+    ) -> None:
+        """Merge fails with non-shallow error, raises immediately."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                raise CommandError(
+                    "Merge conflict in file.txt",
+                    returncode=1,
+                    stderr="CONFLICT (content): Merge conflict in file.txt",
+                )
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            with pytest.raises(CommandError) as exc_info:
+                orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        assert "conflict" in str(exc_info.value).lower()
+
+    def test_merge_fails_unrelated_histories_not_shallow_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Unrelated histories in a non-shallow clone raises immediately."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        # No shallow file — not a shallow clone
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                raise CommandError(
+                    "fatal: refusing to merge unrelated histories",
+                    returncode=128,
+                    stderr="fatal: refusing to merge unrelated histories",
+                )
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="false\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            with pytest.raises(CommandError) as exc_info:
+                orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        assert "unrelated histories" in str(exc_info.value).lower()
+
+    def test_merge_fails_all_recovery_fails_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Merge fails, deepen and unshallow both fail, raises original error."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                raise CommandError(
+                    "fatal: refusing to merge unrelated histories",
+                    returncode=128,
+                    stderr="fatal: refusing to merge unrelated histories",
+                )
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                raise CommandError("deepen failed", returncode=1)
+            if cmd[:3] == ["git", "fetch", "--unshallow"]:
+                raise CommandError("unshallow failed", returncode=1)
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            with pytest.raises(CommandError) as exc_info:
+                orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        assert "unrelated histories" in str(exc_info.value).lower()
+
+    def test_merge_abort_called_before_retry(self, tmp_path: Path) -> None:
+        """Ensure git merge --abort is called before retrying merge."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        call_log: list[list[str]] = []
+        merge_attempts = [0]
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            call_log.append(list(cmd))
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                merge_attempts[0] += 1
+                if merge_attempts[0] == 1:
+                    raise CommandError(
+                        "fatal: refusing to merge unrelated histories",
+                        returncode=128,
+                        stderr="fatal: refusing to merge unrelated histories",
+                    )
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Find the position of the abort call and the second merge call
+        abort_indices = [
+            i
+            for i, c in enumerate(call_log)
+            if c[:2] == ["git", "merge"] and "--abort" in c
+        ]
+        second_merge_indices = [
+            i
+            for i, c in enumerate(call_log)
+            if c == ["git", "merge", "--squash", "abc123"]
+        ]
+        # abort should come before the second merge attempt
+        assert len(abort_indices) >= 1
+        assert len(second_merge_indices) == 2
+        assert abort_indices[0] < second_merge_indices[1]
+
+    @pytest.mark.parametrize(
+        "error_message,stderr_message",
+        [
+            (
+                "fatal: refusing to merge unrelated histories",
+                "fatal: refusing to merge unrelated histories",
+            ),
+            (
+                "merge failed: unrelated histories",
+                "unrelated histories detected",
+            ),
+            (
+                "no common ancestor found",
+                "fatal: no common ancestor",
+            ),
+        ],
+    )
+    def test_recognizes_unrelated_history_errors(
+        self,
+        tmp_path: Path,
+        error_message: str,
+        stderr_message: str,
+    ) -> None:
+        """All variations of unrelated history errors trigger deepening."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        merge_attempts = [0]
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                merge_attempts[0] += 1
+                if merge_attempts[0] == 1:
+                    raise CommandError(
+                        error_message,
+                        returncode=128,
+                        stderr=stderr_message,
+                    )
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Should have attempted merge twice (before and after deepen)
+        assert merge_attempts[0] == 2
+
+    def test_deepen_changes_error_to_conflict_raises_without_unshallow(
+        self, tmp_path: Path
+    ) -> None:
+        """After deepen, if error changes from unrelated histories to a merge
+        conflict, raise immediately instead of attempting expensive unshallow."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "shallow").touch()
+
+        merge_attempts = [0]
+        call_log: list[list[str]] = []
+
+        def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+            call_log.append(list(cmd))
+            if cmd[:2] == ["git", "merge"] and "--squash" in cmd:
+                merge_attempts[0] += 1
+                if merge_attempts[0] == 1:
+                    # First attempt: unrelated histories (shallow clone issue)
+                    raise CommandError(
+                        "fatal: refusing to merge unrelated histories",
+                        returncode=128,
+                        stderr="fatal: refusing to merge unrelated histories",
+                    )
+                # Second attempt after deepen: now a real merge conflict
+                raise CommandError(
+                    "Merge conflict in file.txt",
+                    returncode=1,
+                    stderr="CONFLICT (content): Merge conflict in file.txt",
+                )
+            if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "--deepen=" in str(cmd):
+                return CommandResult(returncode=0, stdout="", stderr="")
+            if "is-shallow-repository" in cmd:
+                return CommandResult(returncode=0, stdout="true\n", stderr="")
+            return CommandResult(returncode=0, stdout="", stderr="")
+
+        with patch("github2gerrit.core.run_cmd", side_effect=fake_run_cmd):
+            orch = Orchestrator(workspace=tmp_path)
+            with pytest.raises(CommandError) as exc_info:
+                orch._merge_squash_with_unshallow_fallback(head_sha="abc123")
+
+        # Should have raised the conflict error, not the original
+        assert "conflict" in str(exc_info.value).lower()
+
+        # Should have attempted merge twice only (no third attempt after unshallow)
+        assert merge_attempts[0] == 2
+
+        # Should NOT have attempted unshallow
+        unshallow_calls = [c for c in call_log if "--unshallow" in c]
+        assert len(unshallow_calls) == 0
