@@ -50,6 +50,9 @@ dependencies = [
 
   # Security: Fix CVE-2026-21441 (decompression-bomb vulnerability)
   "urllib3>=2.6.3",
+
+  # Security: Fix CVE-2026-26007 (SECT curve subgroup attack)
+  "cryptography>=46.0.5",
 ]
 
 [project.urls]
