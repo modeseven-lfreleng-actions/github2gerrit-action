@@ -425,7 +425,10 @@ project=test/project.git
 
             responses.add(
                 responses.GET,
-                re.compile(r"https://gerrit\.example\.org/a?/?changes/\?.*"),
+                re.compile(
+                    r"https://gerrit\.example\.org"
+                    r"(/[a-z]+)?/a?/?changes/\?.*"
+                ),
                 json=gerrit_response,
                 status=200,
             )
@@ -435,6 +438,7 @@ project=test/project.git
                 {
                     "GERRIT_SERVER": "gerrit.example.org",
                     "GERRIT_PROJECT": "test/project",
+                    "GERRIT_HTTP_BASE_PATH": "r",
                 },
             ):
                 with pytest.raises(DuplicateChangeError) as exc_info:
@@ -489,7 +493,10 @@ project=test/project.git
 
             responses.add(
                 responses.GET,
-                re.compile(r"https://gerrit\.example\.org/a?/?changes/\?.*"),
+                re.compile(
+                    r"https://gerrit\.example\.org"
+                    r"(/[a-z]+)?/a?/?changes/\?.*"
+                ),
                 json=gerrit_response,
                 status=200,
             )
@@ -499,6 +506,7 @@ project=test/project.git
                 {
                     "GERRIT_SERVER": "gerrit.example.org",
                     "GERRIT_PROJECT": "test/project",
+                    "GERRIT_HTTP_BASE_PATH": "r",
                 },
             ):
                 # Should NOT raise when allow_duplicates=True
