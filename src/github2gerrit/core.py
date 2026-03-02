@@ -5560,9 +5560,7 @@ class Orchestrator:
                     and not self._use_ssh_agent
                     and os.environ.get("SSH_AUTH_SOCK")
                 ):
-                    ssh_run_env["SSH_AUTH_SOCK"] = os.environ[
-                        "SSH_AUTH_SOCK"
-                    ]
+                    ssh_run_env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
                     log.debug(
                         "Preserving system SSH_AUTH_SOCK for "
                         "agent-based authentication"

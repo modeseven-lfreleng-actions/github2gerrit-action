@@ -557,7 +557,7 @@ def main(
     ),
     allow_duplicates: bool = typer.Option(
         True,
-        "--allow-duplicates",
+        "--allow-duplicates/--no-allow-duplicates",
         envvar="ALLOW_DUPLICATES",
         help="Allow submitting duplicate changes without error.",
     ),
@@ -582,7 +582,7 @@ def main(
     ),
     close_merged_prs: bool = typer.Option(
         True,
-        "--close-merged-prs",
+        "--close-merged-prs/--no-close-merged-prs",
         envvar="CLOSE_MERGED_PRS",
         help="Close GitHub PRs when corresponding Gerrit changes are merged.",
     ),
@@ -700,7 +700,7 @@ def main(
     ),
     preserve_github_prs: bool = typer.Option(
         True,
-        "--preserve-github-prs",
+        "--preserve-github-prs/--no-preserve-github-prs",
         envvar="PRESERVE_GITHUB_PRS",
         help="Do not close GitHub PRs after pushing to Gerrit.",
     ),
