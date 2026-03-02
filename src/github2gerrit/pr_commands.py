@@ -27,7 +27,7 @@ Design principles
 
 Supported commands
 ──────────────────
-``create missing change`` (alias ``create-missing``)
+``create missing change`` (aliases ``create missing``, ``create-missing``)
     Instructs the tool to create a new Gerrit change when an UPDATE
     operation cannot locate an existing one.  This addresses the
     scenario where the original ``opened`` event failed and subsequent
@@ -262,7 +262,9 @@ def parse_commands(comment_bodies: list[str]) -> CommandParseResult:
                 )
 
     result = CommandParseResult(
-        matches=list(seen.values()),
+        # Sort by the comment index of the *winning* occurrence so that
+        # results are in comment order (oldest → newest) as documented.
+        matches=sorted(seen.values(), key=lambda m: m.comment_index),
         unrecognised=unrecognised,
     )
 

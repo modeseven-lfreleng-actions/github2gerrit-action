@@ -173,7 +173,7 @@ github2gerrit \
 Or set the environment variable:
 
 ```shell
-export G2G_CREATE_MISSING=true
+export CREATE_MISSING=true
 github2gerrit https://github.com/MyOrg/my-repo/pull/42
 ```
 

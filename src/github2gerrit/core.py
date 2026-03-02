@@ -1659,6 +1659,14 @@ class Orchestrator:
         self._prepared_branch = None
         self._git_review_initialized = False
 
+        # Capture the system SSH_AUTH_SOCK before the non-interactive
+        # environment blanks it.  This is needed later for the Gerrit
+        # back-reference comment fallback in local/CLI mode where
+        # agent-based keys (e.g. Secretive, 1Password) should still work.
+        self._original_ssh_auth_sock: str | None = (
+            os.environ.get("SSH_AUTH_SOCK") or None
+        )
+
         # Establish baseline non-interactive SSH/Git environment
         # for all child processes
         os.environ.update(self._ssh_env())
@@ -5555,12 +5563,13 @@ class Orchestrator:
                 # preserve the system SSH_AUTH_SOCK so agent-based keys
                 # (e.g. Secretive, 1Password) can authenticate.
                 ssh_run_env = self._ssh_env()
+                saved_sock = getattr(self, "_original_ssh_auth_sock", None)
                 if (
                     not self._ssh_key_path
                     and not self._use_ssh_agent
-                    and os.environ.get("SSH_AUTH_SOCK")
+                    and saved_sock
                 ):
-                    ssh_run_env["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
+                    ssh_run_env["SSH_AUTH_SOCK"] = saved_sock
                     log.debug(
                         "Preserving system SSH_AUTH_SOCK for "
                         "agent-based authentication"

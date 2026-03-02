@@ -788,11 +788,11 @@ class TestInputsCreateMissing:
 
 
 class TestCreateMissingEnvVar:
-    """Tests for G2G_CREATE_MISSING environment variable handling."""
+    """Tests for CREATE_MISSING environment variable handling."""
 
     def test_build_inputs_from_env_default(self, monkeypatch):
-        """Default value when G2G_CREATE_MISSING is not set."""
-        monkeypatch.delenv("G2G_CREATE_MISSING", raising=False)
+        """Default value when CREATE_MISSING is not set."""
+        monkeypatch.delenv("CREATE_MISSING", raising=False)
 
         from github2gerrit.cli import _build_inputs_from_env
 
@@ -802,8 +802,8 @@ class TestCreateMissingEnvVar:
         assert inputs.create_missing is False
 
     def test_build_inputs_from_env_true(self, monkeypatch):
-        """G2G_CREATE_MISSING=true sets create_missing."""
-        monkeypatch.setenv("G2G_CREATE_MISSING", "true")
+        """CREATE_MISSING=true sets create_missing."""
+        monkeypatch.setenv("CREATE_MISSING", "true")
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from github2gerrit.cli import _build_inputs_from_env
@@ -812,8 +812,8 @@ class TestCreateMissingEnvVar:
         assert inputs.create_missing is True
 
     def test_build_inputs_from_env_false(self, monkeypatch):
-        """G2G_CREATE_MISSING=false keeps create_missing off."""
-        monkeypatch.setenv("G2G_CREATE_MISSING", "false")
+        """CREATE_MISSING=false keeps create_missing off."""
+        monkeypatch.setenv("CREATE_MISSING", "false")
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from github2gerrit.cli import _build_inputs_from_env
