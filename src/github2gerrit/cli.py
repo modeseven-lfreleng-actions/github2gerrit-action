@@ -1456,7 +1456,7 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
     if show_progress and RICH_AVAILABLE:
         summary = progress_tracker.get_summary()
         safe_console_print(
-            f"⏱️ Total time: {summary.get('elapsed_time', 'unknown')}"
+            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
         )
         safe_console_print(f"📊 PRs processed: {processed_count}")
         safe_console_print(f"✅ Succeeded: {succeeded_count}")
@@ -1501,7 +1501,7 @@ def _process_single(
 
         try:
             if progress_tracker:
-                progress_tracker.update_operation("📋 Preparing local checkout")
+                progress_tracker.update_operation("📂 Preparing local checkout")
             log.debug(
                 "Preparing workspace checkout in temporary directory: %s",
                 workspace,
@@ -1533,7 +1533,9 @@ def _process_single(
         )
 
         if progress_tracker:
-            progress_tracker.update_operation("⬆️ Extracting commit information")
+            progress_tracker.update_operation(
+                "🔍 Extracting commit information"
+            )
 
         log.debug("Extracting commit information from PR")
         log.debug("PR commits range: base_sha..head_sha (not available)")
@@ -1875,7 +1877,7 @@ def _process_close_gerrit_change(
     pr_url = extract_pr_url_from_gerrit_change(gerrit_change_url)
     if not pr_url:
         no_action_msg = (
-            "☑️ No action required: Gerrit change did NOT originate in GitHub"
+            "✅ No action required: Gerrit change did NOT originate in GitHub"
         )
         log.debug(no_action_msg)
         safe_console_print(no_action_msg)
@@ -2588,7 +2590,7 @@ def _process() -> None:
             style="green" if pipeline_success else "red",
         )
         safe_console_print(
-            f"⏱️ Total time: {summary.get('elapsed_time', 'unknown')}"
+            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
         )
         if summary.get("prs_processed", 0) > 0:
             safe_console_print(f"📊 PRs processed: {summary['prs_processed']}")
@@ -2820,13 +2822,13 @@ def _get_ssh_agent_status() -> str:
     elif has_private_key:
         # SSH key explicitly provided - don't use agent
         if agent_running:
-            return "☑️ Available, Unused"
+            return "✅ Available, Unused"
         else:
             return "❎ Unavailable, Unused"
     elif use_ssh_agent and agent_running:
         return "✅ Available, Used"
     elif agent_running:
-        return "☑️ Available, Unused"
+        return "✅ Available, Unused"
     else:
         return "❎ Unavailable, Unused"
 
@@ -2963,11 +2965,11 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
 
         # Show cleanup abandoned status if enabled
         if cleanup_abandoned:
-            config_info["CLEANUP_ABANDONED"] = "☑️"
+            config_info["CLEANUP_ABANDONED"] = "✅"
 
         # Show Gerrit cleanup status if enabled
         if cleanup_gerrit:
-            config_info["CLEANUP_GERRIT"] = "☑️"
+            config_info["CLEANUP_GERRIT"] = "✅"
 
     # Display the configuration table
     display_pr_info(config_info, "GitHub2Gerrit Configuration")
