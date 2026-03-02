@@ -3327,7 +3327,7 @@ class Orchestrator:
                 log.debug("Found %d commits to merge", commit_count)
 
         except Exception as debug_exc:
-            log.warning("Failed to analyze merge situation: %s", debug_exc)
+            log.debug("Failed to analyze merge situation: %s", debug_exc)
             # Proactively deepen if merge-base fails in a shallow clone,
             # as this strongly indicates the shallow history is insufficient
             # for the upcoming merge --squash operation.
@@ -5516,23 +5516,25 @@ class Orchestrator:
                         ),
                     ]
                 else:
-                    # Fallback - minimal SSH command (for tests)
+                    # Fallback - use user's SSH config and agent
+                    # (local/CLI mode where no private key or managed
+                    # agent is configured). Do NOT use -F /dev/null or
+                    # IdentityAgent=none here, as that blocks
+                    # agent-based keys (e.g. Secretive, 1Password).
                     ssh_cmd = [
                         "ssh",
-                        "-F",
-                        "/dev/null",
-                        "-o",
-                        "IdentitiesOnly=yes",
-                        "-o",
-                        "IdentityAgent=none",
                         "-o",
                         "BatchMode=yes",
+                        "-o",
+                        "PreferredAuthentications=publickey",
                         "-o",
                         "StrictHostKeyChecking=yes",
                         "-o",
                         "PasswordAuthentication=no",
                         "-o",
                         "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                        "-o",
+                        "ConnectTimeout=10",
                         "-n",
                         "-p",
                         str(gerrit.port),
@@ -5549,10 +5551,26 @@ class Orchestrator:
                     ]
 
                 log.debug("Final SSH command: %s", " ".join(ssh_cmd))
+                # In local/CLI mode (no private key, no managed agent),
+                # preserve the system SSH_AUTH_SOCK so agent-based keys
+                # (e.g. Secretive, 1Password) can authenticate.
+                ssh_run_env = self._ssh_env()
+                if (
+                    not self._ssh_key_path
+                    and not self._use_ssh_agent
+                    and os.environ.get("SSH_AUTH_SOCK")
+                ):
+                    ssh_run_env["SSH_AUTH_SOCK"] = os.environ[
+                        "SSH_AUTH_SOCK"
+                    ]
+                    log.debug(
+                        "Preserving system SSH_AUTH_SOCK for "
+                        "agent-based authentication"
+                    )
                 run_cmd(
                     ssh_cmd,
                     cwd=self.workspace,
-                    env=self._ssh_env(),
+                    env=ssh_run_env,
                 )
                 log.debug(
                     "Successfully added back-reference comment for %s: %s",
