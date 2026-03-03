@@ -1170,6 +1170,101 @@ class Orchestrator:
                 exc,
             )
 
+    # ------------------------------------------------------------------
+    # Create-missing fallback helpers
+    # ------------------------------------------------------------------
+
+    def _should_create_missing(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+    ) -> bool:
+        """Decide whether to fall back from UPDATE to CREATE.
+
+        Returns ``True`` when either the ``--create-missing`` CLI flag
+        is active **or** a ``@github2gerrit create missing change``
+        comment is present on the PR.
+        """
+        # 1. Explicit CLI / environment flag
+        if inputs.create_missing:
+            log.info(
+                "✅ --create-missing flag is set; authorising CREATE fallback"
+            )
+            return True
+
+        # 2. Scan PR comments for the directive
+        if not gh.pr_number:
+            return False
+
+        try:
+            from .pr_commands import CMD_CREATE_MISSING
+            from .pr_commands import find_command
+
+            client_gh = build_client()
+            repo = get_repo_from_env(client_gh)
+            pr_obj = get_pull(repo, int(gh.pr_number))
+
+            issue = pr_obj.as_issue()
+            comment_bodies = [c.body or "" for c in issue.get_comments()]
+
+            match = find_command(comment_bodies, CMD_CREATE_MISSING.name)
+            if match is not None:
+                log.info(
+                    "✅ Found '@github2gerrit %s' in PR #%s comment #%d; "
+                    "authorising CREATE fallback",
+                    match.raw_text,
+                    gh.pr_number,
+                    match.comment_index,
+                )
+                return True
+
+            log.debug(
+                "No @github2gerrit create-missing command found in "
+                "PR #%s comments",
+                gh.pr_number,
+            )
+        except Exception as exc:
+            log.debug(
+                "Failed to check PR comments for create-missing command: %s",
+                exc,
+            )
+
+        return False
+
+    def _post_create_missing_notice(
+        self,
+        gh: GitHubContext,
+    ) -> None:
+        """Post a comment on the PR noting the CREATE fallback."""
+        if not gh.pr_number:
+            return
+        # Respect CI_TESTING
+        if os.getenv("CI_TESTING", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return
+        try:
+            client_gh = build_client()
+            repo = get_repo_from_env(client_gh)
+            pr_obj = get_pull(repo, int(gh.pr_number))
+            create_pr_comment(
+                pr_obj,
+                "🔄 **GitHub2Gerrit**: No existing Gerrit change found for "
+                "this PR.\n"
+                "Creating a new Gerrit change (fallback from UPDATE "
+                "operation).\n\n"
+                "_Triggered by `@github2gerrit create missing change` "
+                "comment or `--create-missing` flag._",
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to post create-missing notice on PR #%s: %s",
+                gh.pr_number,
+                exc,
+            )
+
     def _enforce_existing_change_for_update(
         self,
         gh: GitHubContext,
@@ -1564,6 +1659,14 @@ class Orchestrator:
         self._prepared_branch = None
         self._git_review_initialized = False
 
+        # Capture the system SSH_AUTH_SOCK before the non-interactive
+        # environment blanks it.  This is needed later for the Gerrit
+        # back-reference comment fallback in local/CLI mode where
+        # agent-based keys (e.g. Secretive, 1Password) should still work.
+        self._original_ssh_auth_sock: str | None = (
+            os.environ.get("SSH_AUTH_SOCK") or None
+        )
+
         # Establish baseline non-interactive SSH/Git environment
         # for all child processes
         os.environ.update(self._ssh_env())
@@ -1599,14 +1702,37 @@ class Orchestrator:
         forced_reuse_ids: list[str] = []
         if is_update_operation or is_edit_operation:
             log.debug("🔍 Searching for existing Gerrit change(s) to update...")
-            forced_reuse_ids = self._enforce_existing_change_for_update(
-                gh, gerrit
-            )
-            log.debug(
-                "✅ Will update existing change(s): %s",
-                ", ".join(forced_reuse_ids[:3])
-                + ("..." if len(forced_reuse_ids) > 3 else ""),
-            )
+            try:
+                forced_reuse_ids = self._enforce_existing_change_for_update(
+                    gh, gerrit
+                )
+                log.debug(
+                    "✅ Will update existing change(s): %s",
+                    ", ".join(forced_reuse_ids[:3])
+                    + ("..." if len(forced_reuse_ids) > 3 else ""),
+                )
+            except OrchestratorError:
+                # UPDATE found no existing Gerrit change — check whether
+                # we should fall back to CREATE instead of failing.
+                should_create = self._should_create_missing(inputs, gh)
+
+                if not should_create:
+                    raise  # propagate the original error
+
+                # --- Fall back to CREATE mode ---
+                log.warning(
+                    "🔄 Falling back from UPDATE → CREATE for PR #%s "
+                    "(create-missing authorised)",
+                    gh.pr_number,
+                )
+                is_update_operation = False
+                is_edit_operation = False
+                operation_mode = "create"
+                os.environ["G2G_OPERATION_MODE"] = "create"
+                os.environ["G2G_FALLBACK_CREATE"] = "true"
+
+                # Notify on the PR that we are creating from scratch
+                self._post_create_missing_notice(gh)
 
         # Optimization: Determine reuse Change-IDs BEFORE preparing commits.
         # This avoids redundant preparation calls - previously we prepared
@@ -3209,7 +3335,7 @@ class Orchestrator:
                 log.debug("Found %d commits to merge", commit_count)
 
         except Exception as debug_exc:
-            log.warning("Failed to analyze merge situation: %s", debug_exc)
+            log.debug("Failed to analyze merge situation: %s", debug_exc)
             # Proactively deepen if merge-base fails in a shallow clone,
             # as this strongly indicates the shallow history is insufficient
             # for the upcoming merge --squash operation.
@@ -5398,23 +5524,25 @@ class Orchestrator:
                         ),
                     ]
                 else:
-                    # Fallback - minimal SSH command (for tests)
+                    # Fallback - use user's SSH config and agent
+                    # (local/CLI mode where no private key or managed
+                    # agent is configured). Do NOT use -F /dev/null or
+                    # IdentityAgent=none here, as that blocks
+                    # agent-based keys (e.g. Secretive, 1Password).
                     ssh_cmd = [
                         "ssh",
-                        "-F",
-                        "/dev/null",
-                        "-o",
-                        "IdentitiesOnly=yes",
-                        "-o",
-                        "IdentityAgent=none",
                         "-o",
                         "BatchMode=yes",
+                        "-o",
+                        "PreferredAuthentications=publickey",
                         "-o",
                         "StrictHostKeyChecking=yes",
                         "-o",
                         "PasswordAuthentication=no",
                         "-o",
                         "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                        "-o",
+                        "ConnectTimeout=10",
                         "-n",
                         "-p",
                         str(gerrit.port),
@@ -5431,10 +5559,25 @@ class Orchestrator:
                     ]
 
                 log.debug("Final SSH command: %s", " ".join(ssh_cmd))
+                # In local/CLI mode (no private key, no managed agent),
+                # preserve the system SSH_AUTH_SOCK so agent-based keys
+                # (e.g. Secretive, 1Password) can authenticate.
+                ssh_run_env = self._ssh_env()
+                saved_sock = getattr(self, "_original_ssh_auth_sock", None)
+                if (
+                    not self._ssh_key_path
+                    and not self._use_ssh_agent
+                    and saved_sock
+                ):
+                    ssh_run_env["SSH_AUTH_SOCK"] = saved_sock
+                    log.debug(
+                        "Preserving system SSH_AUTH_SOCK for "
+                        "agent-based authentication"
+                    )
                 run_cmd(
                     ssh_cmd,
                     cwd=self.workspace,
-                    env=self._ssh_env(),
+                    env=ssh_run_env,
                 )
                 log.debug(
                     "Successfully added back-reference comment for %s: %s",

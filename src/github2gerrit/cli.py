@@ -557,7 +557,7 @@ def main(
     ),
     allow_duplicates: bool = typer.Option(
         True,
-        "--allow-duplicates",
+        "--allow-duplicates/--no-allow-duplicates",
         envvar="ALLOW_DUPLICATES",
         help="Allow submitting duplicate changes without error.",
     ),
@@ -582,7 +582,7 @@ def main(
     ),
     close_merged_prs: bool = typer.Option(
         True,
-        "--close-merged-prs",
+        "--close-merged-prs/--no-close-merged-prs",
         envvar="CLOSE_MERGED_PRS",
         help="Close GitHub PRs when corresponding Gerrit changes are merged.",
     ),
@@ -700,7 +700,7 @@ def main(
     ),
     preserve_github_prs: bool = typer.Option(
         True,
-        "--preserve-github-prs",
+        "--preserve-github-prs/--no-preserve-github-prs",
         envvar="PRESERVE_GITHUB_PRS",
         help="Do not close GitHub PRs after pushing to Gerrit.",
     ),
@@ -776,6 +776,16 @@ def main(
         "--version",
         help="Show version and exit.",
     ),
+    create_missing: bool = typer.Option(
+        False,
+        "--create-missing/--no-create-missing",
+        envvar="CREATE_MISSING",
+        help=(
+            "Create a Gerrit change when an UPDATE operation cannot find "
+            "an existing one. Also triggered by '@github2gerrit create "
+            "missing change' PR comment."
+        ),
+    ),
     automation_only: bool = typer.Option(
         True,
         "--automation-only/--no-automation-only",
@@ -824,44 +834,59 @@ def main(
             typer.echo("Version information not available")
         sys.exit(int(ExitCode.SUCCESS))
 
-    # Override boolean parameters with properly parsed environment variables
-    # This ensures that string "false" from GitHub Actions is handled correctly
-    if os.getenv("SUBMIT_SINGLE_COMMITS"):
-        submit_single_commits = parse_bool_env(
-            os.getenv("SUBMIT_SINGLE_COMMITS")
-        )
+    # Override boolean parameters with properly parsed environment variables.
+    # This ensures that string "false" from GitHub Actions is handled
+    # correctly (Typer/Click treats any non-empty string as truthy).
+    #
+    # We only apply the env-var override when the parameter was NOT
+    # explicitly provided on the command line, so that CLI flags always
+    # take precedence over environment variables.
+    def _env_bool_override(
+        param_name: str, env_var: str, current: bool
+    ) -> bool:
+        """Return *current* if the CLI flag was explicit, else parse env."""
+        source = ctx.get_parameter_source(param_name)
+        if source == click.core.ParameterSource.COMMANDLINE:
+            return current
+        env_val = os.getenv(env_var)
+        if env_val is not None:
+            return parse_bool_env(env_val)
+        return current
 
-    if os.getenv("USE_PR_AS_COMMIT"):
-        use_pr_as_commit = parse_bool_env(os.getenv("USE_PR_AS_COMMIT"))
-
-    if os.getenv("PRESERVE_GITHUB_PRS"):
-        preserve_github_prs = parse_bool_env(os.getenv("PRESERVE_GITHUB_PRS"))
-
-    if os.getenv("DRY_RUN"):
-        dry_run = parse_bool_env(os.getenv("DRY_RUN"))
-
-    if os.getenv("ALLOW_DUPLICATES"):
-        allow_duplicates = parse_bool_env(os.getenv("ALLOW_DUPLICATES"))
-
-    if os.getenv("CI_TESTING"):
-        ci_testing = parse_bool_env(os.getenv("CI_TESTING"))
-
-    if os.getenv("SIMILARITY_FILES"):
-        similarity_files = parse_bool_env(os.getenv("SIMILARITY_FILES"))
-
-    if os.getenv("ALLOW_ORPHAN_CHANGES"):
-        allow_orphan_changes = parse_bool_env(os.getenv("ALLOW_ORPHAN_CHANGES"))
-
-    if os.getenv("PERSIST_SINGLE_MAPPING_COMMENT"):
-        persist_single_mapping_comment = parse_bool_env(
-            os.getenv("PERSIST_SINGLE_MAPPING_COMMENT")
-        )
-
-    if os.getenv("LOG_RECONCILE_JSON"):
-        log_reconcile_json = parse_bool_env(os.getenv("LOG_RECONCILE_JSON"))
-
-    if os.getenv("AUTOMATION_ONLY"):
-        automation_only = parse_bool_env(os.getenv("AUTOMATION_ONLY"))
+    submit_single_commits = _env_bool_override(
+        "submit_single_commits", "SUBMIT_SINGLE_COMMITS", submit_single_commits
+    )
+    use_pr_as_commit = _env_bool_override(
+        "use_pr_as_commit", "USE_PR_AS_COMMIT", use_pr_as_commit
+    )
+    preserve_github_prs = _env_bool_override(
+        "preserve_github_prs", "PRESERVE_GITHUB_PRS", preserve_github_prs
+    )
+    dry_run = _env_bool_override("dry_run", "DRY_RUN", dry_run)
+    allow_duplicates = _env_bool_override(
+        "allow_duplicates", "ALLOW_DUPLICATES", allow_duplicates
+    )
+    ci_testing = _env_bool_override("ci_testing", "CI_TESTING", ci_testing)
+    similarity_files = _env_bool_override(
+        "similarity_files", "SIMILARITY_FILES", similarity_files
+    )
+    allow_orphan_changes = _env_bool_override(
+        "allow_orphan_changes", "ALLOW_ORPHAN_CHANGES", allow_orphan_changes
+    )
+    persist_single_mapping_comment = _env_bool_override(
+        "persist_single_mapping_comment",
+        "PERSIST_SINGLE_MAPPING_COMMENT",
+        persist_single_mapping_comment,
+    )
+    log_reconcile_json = _env_bool_override(
+        "log_reconcile_json", "LOG_RECONCILE_JSON", log_reconcile_json
+    )
+    create_missing = _env_bool_override(
+        "create_missing", "CREATE_MISSING", create_missing
+    )
+    automation_only = _env_bool_override(
+        "automation_only", "AUTOMATION_ONLY", automation_only
+    )
 
     # Store netrc options in environment for use by processing functions
     os.environ["G2G_NO_NETRC"] = "true" if no_netrc else "false"
@@ -1002,6 +1027,7 @@ def main(
         "true" if persist_single_mapping_comment else "false"
     )
     os.environ["LOG_RECONCILE_JSON"] = "true" if log_reconcile_json else "false"
+    os.environ["CREATE_MISSING"] = "true" if create_missing else "false"
     os.environ["AUTOMATION_ONLY"] = "true" if automation_only else "false"
     # URL mode handling
     if target_url:
@@ -1161,6 +1187,7 @@ def _build_inputs_from_env() -> Inputs:
             "PERSIST_SINGLE_MAPPING_COMMENT", True
         ),
         log_reconcile_json=env_bool("LOG_RECONCILE_JSON", True),
+        create_missing=env_bool("CREATE_MISSING", False),
     )
 
 
@@ -1441,7 +1468,7 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
     if show_progress and RICH_AVAILABLE:
         summary = progress_tracker.get_summary()
         safe_console_print(
-            f"⏱️ Total time: {summary.get('elapsed_time', 'unknown')}"
+            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
         )
         safe_console_print(f"📊 PRs processed: {processed_count}")
         safe_console_print(f"✅ Succeeded: {succeeded_count}")
@@ -1486,7 +1513,7 @@ def _process_single(
 
         try:
             if progress_tracker:
-                progress_tracker.update_operation("📋 Preparing local checkout")
+                progress_tracker.update_operation("📂 Preparing local checkout")
             log.debug(
                 "Preparing workspace checkout in temporary directory: %s",
                 workspace,
@@ -1518,7 +1545,9 @@ def _process_single(
         )
 
         if progress_tracker:
-            progress_tracker.update_operation("⬆️ Extracting commit information")
+            progress_tracker.update_operation(
+                "🔍 Extracting commit information"
+            )
 
         log.debug("Extracting commit information from PR")
         log.debug("PR commits range: base_sha..head_sha (not available)")
@@ -1781,6 +1810,7 @@ def _load_effective_inputs() -> Inputs:
                     allow_orphan_changes=data.allow_orphan_changes,
                     persist_single_mapping_comment=data.persist_single_mapping_comment,
                     log_reconcile_json=data.log_reconcile_json,
+                    create_missing=data.create_missing,
                 )
                 log.debug("Derived reviewers: %s", data.reviewers_email)
         except Exception as exc:
@@ -1859,7 +1889,7 @@ def _process_close_gerrit_change(
     pr_url = extract_pr_url_from_gerrit_change(gerrit_change_url)
     if not pr_url:
         no_action_msg = (
-            "☑️ No action required: Gerrit change did NOT originate in GitHub"
+            "✅ No action required: Gerrit change did NOT originate in GitHub"
         )
         log.debug(no_action_msg)
         safe_console_print(no_action_msg)
@@ -2572,7 +2602,7 @@ def _process() -> None:
             style="green" if pipeline_success else "red",
         )
         safe_console_print(
-            f"⏱️ Total time: {summary.get('elapsed_time', 'unknown')}"
+            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
         )
         if summary.get("prs_processed", 0) > 0:
             safe_console_print(f"📊 PRs processed: {summary['prs_processed']}")
@@ -2804,13 +2834,13 @@ def _get_ssh_agent_status() -> str:
     elif has_private_key:
         # SSH key explicitly provided - don't use agent
         if agent_running:
-            return "☑️ Available, Unused"
+            return "✅ Available, Unused"
         else:
             return "❎ Unavailable, Unused"
     elif use_ssh_agent and agent_running:
         return "✅ Available, Used"
     elif agent_running:
-        return "☑️ Available, Unused"
+        return "✅ Available, Unused"
     else:
         return "❎ Unavailable, Unused"
 
@@ -2947,11 +2977,11 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
 
         # Show cleanup abandoned status if enabled
         if cleanup_abandoned:
-            config_info["CLEANUP_ABANDONED"] = "☑️"
+            config_info["CLEANUP_ABANDONED"] = "✅"
 
         # Show Gerrit cleanup status if enabled
         if cleanup_gerrit:
-            config_info["CLEANUP_GERRIT"] = "☑️"
+            config_info["CLEANUP_GERRIT"] = "✅"
 
     # Display the configuration table
     display_pr_info(config_info, "GitHub2Gerrit Configuration")

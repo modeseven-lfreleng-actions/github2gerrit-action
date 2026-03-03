@@ -290,9 +290,9 @@ class ProgressTracker:
             if self.rich_available:
                 # Just print the new operation - don't try in-place updates
                 # with Rich
-                self.console.print(f"📋 {operation}", style="dim white")
+                self.console.print(operation, style="dim white")
             else:
-                print(f"📋 {operation}")
+                print(operation)
             self._last_operation = operation
 
     def add_error(self, message: str | None = None) -> None:
@@ -346,7 +346,7 @@ class ProgressTracker:
         # Elapsed time
         elapsed = datetime.now(UTC) - self.start_time
         text.append(
-            f"\n⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim blue"
+            f"\n⏳ Elapsed: {self._format_duration(elapsed)}", style="dim blue"
         )
 
         return text
@@ -453,7 +453,7 @@ class G2GProgressTracker(ProgressTracker):
         # Elapsed time
         elapsed = datetime.now(UTC) - self.start_time
         text.append(
-            f"\n⏱️  Elapsed: {self._format_duration(elapsed)}", style="dim blue"
+            f"\n⏳ Elapsed: {self._format_duration(elapsed)}", style="dim blue"
         )
 
         return text

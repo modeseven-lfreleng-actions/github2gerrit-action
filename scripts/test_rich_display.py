@@ -90,7 +90,7 @@ def demo_progress_tracking():
     # Show final summary
     summary = progress_tracker.get_summary()
     console.print("\n✅ Operation completed!")
-    console.print(f"⏱️  Total time: {summary.get('elapsed_time', 'unknown')}")
+    console.print(f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}")
     console.print(f"📊 PRs processed: {summary['prs_processed']}")
     console.print(f"🔄 Changes submitted: {summary['changes_submitted']}")
 
@@ -135,7 +135,7 @@ def demo_bulk_processing():
     # Show final summary
     summary = progress_tracker.get_summary()
     console.print("\n⚠️  Processing completed with some issues!")
-    console.print(f"⏱️  Total time: {summary.get('elapsed_time', 'unknown')}")
+    console.print(f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}")
     console.print(f"📊 PRs processed: {summary['prs_processed']}")
     console.print(f"✅ Changes submitted: {summary['changes_submitted']}")
     console.print(f"⏭️  Duplicates skipped: {summary['duplicates_skipped']}")
