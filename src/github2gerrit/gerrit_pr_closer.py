@@ -1496,7 +1496,11 @@ def cleanup_closed_github_prs(
         # Cleanup failures should not mark the job as failed when the
         # primary sync operation succeeded.  Log a warning instead of
         # raising a fatal GitHub2GerritError.
-        log.warning("Gerrit REST API error during cleanup (non-fatal): %s", exc)
+        log.warning(
+            "Gerrit REST API error during cleanup (non-fatal): %s",
+            exc,
+            exc_info=True,
+        )
         return 0
     except Exception:
         log.warning(

@@ -102,6 +102,35 @@ class TestReadGitreviewHostLocal:
         result = _read_gitreview_host()
         assert result == "gerrit.example.org"
 
+    def test_reads_host_with_spaces_around_equals(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Host is parsed when .gitreview uses 'host = value' with spaces."""
+        gitreview = tmp_path / ".gitreview"
+        gitreview.write_text(
+            "[gerrit]\nhost = git.opendaylight.org\nport = 29418\n"
+            "project = aaa.git\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = _read_gitreview_host()
+        assert result == "git.opendaylight.org"
+
+    def test_reads_host_case_insensitive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Host is parsed when key uses different casing (e.g. 'Host')."""
+        gitreview = tmp_path / ".gitreview"
+        gitreview.write_text(
+            "[gerrit]\nHost = gerrit.example.org\nPort = 29418\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = _read_gitreview_host()
+        assert result == "gerrit.example.org"
+
 
 # ---------------------------------------------------------------------------
 # 1b. _read_gitreview_host — remote fallback
@@ -169,6 +198,67 @@ class TestReadGitreviewHostRemote:
 
         result = _read_gitreview_host("noslash")
         assert result is None
+
+    @patch("github2gerrit.config.urllib.request.urlopen")
+    def test_prefers_github_head_ref_over_master(
+        self,
+        mock_urlopen: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GITHUB_HEAD_REF is tried before master/main branches."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+        monkeypatch.setenv("GITHUB_HEAD_REF", "feature/my-branch")
+        monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = (
+            b"[gerrit]\nhost=gerrit.example.org\nport=29418\nproject=test.git\n"
+        )
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        result = _read_gitreview_host("example/repo")
+        assert result == "gerrit.example.org"
+
+        # Verify the first URL tried uses the head ref, not master
+        first_call_url = mock_urlopen.call_args_list[0][0][0]
+        assert "feature/my-branch" in first_call_url
+
+    @patch("github2gerrit.config.urllib.request.urlopen")
+    def test_tries_base_ref_after_head_ref(
+        self,
+        mock_urlopen: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GITHUB_BASE_REF is tried after GITHUB_HEAD_REF."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+        monkeypatch.setenv("GITHUB_HEAD_REF", "feature/branch")
+        monkeypatch.setenv("GITHUB_BASE_REF", "develop")
+
+        # First call (head ref) fails, second call (base ref) succeeds
+        mock_response = MagicMock()
+        mock_response.read.return_value = (
+            b"[gerrit]\nhost=gerrit.dev.org\nport=29418\nproject=test.git\n"
+        )
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.side_effect = [
+            OSError("Not found"),
+            mock_response,
+        ]
+
+        result = _read_gitreview_host("example/repo")
+        assert result == "gerrit.dev.org"
+
+        # Verify both refs were tried in order
+        urls = [call[0][0] for call in mock_urlopen.call_args_list]
+        assert "feature/branch" in urls[0]
+        assert "develop" in urls[1]
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +356,7 @@ class TestDeriveGerritParametersGitreview:
 class TestCleanupNonFatal:
     """Verify that cleanup REST failures don't raise fatal errors."""
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_gerrit_rest_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -285,7 +375,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_connection_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -301,7 +391,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_timeout_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -317,7 +407,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_successful_cleanup_returns_count(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -342,7 +432,9 @@ class TestCleanupNonFatal:
 class TestUpdateErrorMentionsCreateMissing:
     """Verify the UPDATE-no-existing-change error message includes guidance."""
 
-    def test_error_message_contains_create_missing(self) -> None:
+    def test_error_message_contains_create_missing(
+        self, tmp_path: Path
+    ) -> None:
         """The OrchestratorError message should mention CREATE_MISSING."""
         from github2gerrit.core import GerritInfo
         from github2gerrit.core import Orchestrator
@@ -370,7 +462,7 @@ class TestUpdateErrorMentionsCreateMissing:
         )
 
         # Create a minimal orchestrator (workspace doesn't matter here)
-        orch = Orchestrator(workspace=Path("/tmp/fake"))  # noqa: S108
+        orch = Orchestrator(workspace=tmp_path)
 
         # Mock the internal change lookup to return empty (no existing change)
         with (
@@ -379,7 +471,9 @@ class TestUpdateErrorMentionsCreateMissing:
         ):
             orch._enforce_existing_change_for_update(gh, gerrit)
 
-    def test_error_message_contains_comment_command(self) -> None:
+    def test_error_message_contains_comment_command(
+        self, tmp_path: Path
+    ) -> None:
         """The error message should mention the PR comment command."""
         from github2gerrit.core import GerritInfo
         from github2gerrit.core import Orchestrator
@@ -406,7 +500,7 @@ class TestUpdateErrorMentionsCreateMissing:
             project="aaa",
         )
 
-        orch = Orchestrator(workspace=Path("/tmp/fake"))  # noqa: S108
+        orch = Orchestrator(workspace=tmp_path)
 
         with (
             patch.object(orch, "_find_existing_change_for_pr", return_value=[]),

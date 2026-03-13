@@ -470,7 +470,7 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
     Returns:
         The host string from .gitreview, or None if unavailable.
     """
-    _gitreview_host_re = re.compile(r"(?m)^host=(.+)$")
+    _gitreview_host_re = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+)$")
 
     # 1. Try local .gitreview (available after actions/checkout)
     local_path = Path(".gitreview")
@@ -493,10 +493,23 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
     if not repo_full or "/" not in repo_full:
         return None
 
-    for branch in ("master", "main"):
+    # Try PR head/base refs first, then common default branches
+    branches: list[str] = []
+    for env_var in ("GITHUB_HEAD_REF", "GITHUB_BASE_REF"):
+        ref = (os.getenv(env_var) or "").strip()
+        if ref:
+            branches.append(ref)
+    branches.extend(["master", "main"])
+
+    tried: set[str] = set()
+    for branch in branches:
+        if not branch or branch in tried:
+            continue
+        tried.add(branch)
+        safe_branch = urllib.parse.quote(branch, safe="/")
         url = (
             f"https://raw.githubusercontent.com/"
-            f"{repo_full}/refs/heads/{branch}/.gitreview"
+            f"{repo_full}/refs/heads/{safe_branch}/.gitreview"
         )
         parsed = urllib.parse.urlparse(url)
         if (
@@ -560,8 +573,11 @@ def derive_gerrit_parameters(
     config = load_org_config(org)
     configured_server = config.get("GERRIT_SERVER", "").strip()
 
-    # Read .gitreview host as intermediate fallback before heuristic
-    gitreview_host = _read_gitreview_host(repository)
+    # Read .gitreview host only when no config file entry
+    # (avoid unnecessary I/O)
+    gitreview_host = (
+        _read_gitreview_host(repository) if not configured_server else None
+    )
 
     # Priority: config file > .gitreview > heuristic fallback
     gerrit_host = configured_server or gitreview_host or f"gerrit.{org}.org"

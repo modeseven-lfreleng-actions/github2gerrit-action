@@ -128,19 +128,19 @@ def fetch_ssh_host_keys(
         )
     log.debug("✅ Host %s:%d is reachable", hostname, port)
 
-    try:
-        # Use ssh-keyscan to fetch all available key types
-        cmd = [
-            "ssh-keyscan",
-            "-p",
-            str(port),
-            "-T",
-            str(timeout),
-            "-t",
-            "rsa,ecdsa,ed25519",
-            hostname,
-        ]
+    # Use ssh-keyscan to fetch all available key types
+    cmd = [
+        "ssh-keyscan",
+        "-p",
+        str(port),
+        "-T",
+        str(timeout),
+        "-t",
+        "rsa,ecdsa,ed25519",
+        hostname,
+    ]
 
+    try:
         log.debug("🔍 Running command: %s", " ".join(cmd))
         result = run_cmd(cmd, timeout=timeout + 5)
 

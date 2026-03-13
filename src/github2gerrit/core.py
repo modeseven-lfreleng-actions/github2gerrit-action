@@ -1344,19 +1344,19 @@ class Orchestrator:
                 expected_github_hash = trailer.split(":", 1)[1].strip()
                 break
 
-            # Check if this is an update operation
-            operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
-            is_update_op = operation_mode == "update"
+        # Check if this is an update operation
+        operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+        is_update_op = operation_mode == "update"
 
-            change_ids = perform_reconciliation(
-                inputs=inputs,
-                gh=gh,
-                gerrit=gerrit,
-                local_commits=local_commits,
-                expected_pr_url=expected_pr_url,
-                expected_github_hash=expected_github_hash or None,
-                is_update_operation=is_update_op,
-            )
+        change_ids = perform_reconciliation(
+            inputs=inputs,
+            gh=gh,
+            gerrit=gerrit,
+            local_commits=local_commits,
+            expected_pr_url=expected_pr_url,
+            expected_github_hash=expected_github_hash or None,
+            is_update_operation=is_update_op,
+        )
         # Store lightweight plan snapshot (only fields needed for verify)
         try:
             self._reconciliation_plan = {
@@ -3885,17 +3885,18 @@ class Orchestrator:
         # Use our specific SSH configuration
         env = self._ssh_env()
 
+        args = [
+            "git",
+            "review",
+            "--yes",
+            "-v",
+            "-t",
+            topic,
+        ]
+        log.debug("Building git review command with topic: %s", topic)
+        collected_change_ids: list[str] = []
+
         try:
-            args = [
-                "git",
-                "review",
-                "--yes",
-                "-v",
-                "-t",
-                topic,
-            ]
-            log.debug("Building git review command with topic: %s", topic)
-            collected_change_ids: list[str] = []
             if prepared:
                 collected_change_ids.extend(prepared.all_change_ids())
             # Add any Change-Ids captured from apply_pr path (squash amend)
@@ -4944,7 +4945,7 @@ class Orchestrator:
                             blocked_ips.append(ip_str)
 
                     # Additional IPv6 specific checks
-                    elif isinstance(ip_obj, ipaddress.IPv6Address) and (
+                    elif isinstance(ip_obj, ipaddress.IPv6Address) and (  # pyright: ignore[reportUnnecessaryIsInstance]
                         ip_obj in ipaddress.IPv6Network("::1/128")  # Loopback
                         or ip_obj
                         in ipaddress.IPv6Network("fe80::/10")  # Link-local
@@ -5445,9 +5446,10 @@ class Orchestrator:
             if not csha:
                 log.debug("Empty commit SHA, skipping")
                 continue
+            # Build SSH command based on available authentication method
+            ssh_cmd: list[str] = []
             try:
                 log.debug("Executing SSH command for commit %s", csha)
-                # Build SSH command based on available authentication method
                 if self._ssh_key_path and self._ssh_known_hosts_path:
                     # File-based SSH authentication
                     ssh_cmd = [
@@ -5598,7 +5600,7 @@ class Orchestrator:
                     log.debug("SSH stdout: %s", exc.stdout)
                 log.debug(
                     "SSH command that failed: %s",
-                    " ".join(ssh_cmd) if "ssh_cmd" in locals() else "unknown",
+                    " ".join(ssh_cmd) if ssh_cmd else "unknown",
                 )
                 log.debug(
                     "Back-reference comment failed but change was successfully "
