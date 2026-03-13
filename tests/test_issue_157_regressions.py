@@ -266,7 +266,7 @@ class TestDeriveGerritParametersGitreview:
 class TestCleanupNonFatal:
     """Verify that cleanup REST failures don't raise fatal errors."""
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_gerrit_rest_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -285,7 +285,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_connection_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -301,7 +301,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_timeout_error_returns_zero(
         self, mock_build_client: MagicMock
     ) -> None:
@@ -317,7 +317,7 @@ class TestCleanupNonFatal:
         )
         assert result == 0
 
-    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    @patch("github2gerrit.gerrit_rest.build_client_for_host")
     def test_successful_cleanup_returns_count(
         self, mock_build_client: MagicMock
     ) -> None:

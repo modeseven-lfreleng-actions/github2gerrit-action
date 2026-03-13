@@ -560,8 +560,11 @@ def derive_gerrit_parameters(
     config = load_org_config(org)
     configured_server = config.get("GERRIT_SERVER", "").strip()
 
-    # Read .gitreview host as intermediate fallback before heuristic
-    gitreview_host = _read_gitreview_host(repository)
+    # Read .gitreview host only when no config file entry
+    # (avoid unnecessary I/O)
+    gitreview_host = (
+        _read_gitreview_host(repository) if not configured_server else None
+    )
 
     # Priority: config file > .gitreview > heuristic fallback
     gerrit_host = configured_server or gitreview_host or f"gerrit.{org}.org"
