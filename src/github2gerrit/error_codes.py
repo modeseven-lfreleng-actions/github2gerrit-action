@@ -293,6 +293,11 @@ def is_github_api_permission_error(exception: Exception) -> bool:
     return _matches_github_permission_patterns(exception)
 
 
+def _get_exc_attr(exc: Exception, name: str) -> object:
+    """Retrieve an arbitrary attribute from an exception (duck typing)."""
+    return getattr(exc, name, None)
+
+
 def _is_github_exception_with_permission_error(exception: Exception) -> bool:
     """Check if exception is a GitHub API exception with permission error."""
     # Check if it's a PyGithub exception type
@@ -303,13 +308,13 @@ def _is_github_exception_with_permission_error(exception: Exception) -> bool:
         and "github" in exception_type.__module__.lower()
     ):
         # Check for status code attribute (PyGithub exceptions have this)
-        if hasattr(exception, "status") and exception.status in (401, 403, 404):
+        status = _get_exc_attr(exception, "status")
+        if status in (401, 403, 404):
             return True
         # Check for data attribute with status
-        if hasattr(exception, "data") and isinstance(exception.data, dict):
-            status = exception.data.get("status")
-            if status in (401, 403, 404):
-                return True
+        data = _get_exc_attr(exception, "data")
+        if isinstance(data, dict) and data.get("status") in (401, 403, 404):
+            return True
     return False
 
 
@@ -323,12 +328,11 @@ def _has_permission_related_http_status(exception: Exception) -> bool:
                 return True
 
     # Check for requests.HTTPError or similar
-    if hasattr(exception, "response"):
-        response = exception.response
-        if hasattr(response, "status_code"):
-            status = response.status_code
-            if isinstance(status, int) and status in (401, 403, 404):
-                return True
+    response = _get_exc_attr(exception, "response")
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and status in (401, 403, 404):
+            return True
 
     return False
 

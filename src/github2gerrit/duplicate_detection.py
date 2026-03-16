@@ -185,19 +185,20 @@ class DuplicateDetector:
         self._cutoff_date = datetime.now(UTC) - timedelta(days=lookback_days)
         self.duplicates_filter = duplicates_filter
 
-    def _match_first_group(self, pattern: str, text: str) -> str:
-        """Extract first regex group match from text."""
-        match = re.search(pattern, text)
-        return match.group(1) if match else ""
-
     def _resolve_gerrit_info_from_env_or_gitreview(
         self, gh: GitHubContext
     ) -> tuple[str, str] | None:
         """Resolve Gerrit host and project from environment or .gitreview file.
 
+        Delegates remote ``.gitreview`` fetching to the shared
+        :mod:`github2gerrit.gitreview` module which consolidates parsing,
+        URL-encoding, branch deduplication, and URL validation.
+
         Returns:
             Tuple of (host, project) if found, None otherwise
         """
+        from .gitreview import fetch_gitreview_raw
+
         # First try environment variables (same as core module)
         gerrit_host = os.getenv("GERRIT_SERVER", "").strip()
         gerrit_project = os.getenv("GERRIT_PROJECT", "").strip()
@@ -205,65 +206,30 @@ class DuplicateDetector:
         if gerrit_host and gerrit_project:
             return (gerrit_host, gerrit_project)
 
-        # Skip local .gitreview check in composite action context
+        # Skip local .gitreview check in composite action context.
         # The duplicate detection runs before workspace setup, so there's no
-        # reliable local .gitreview file to check. Instead, rely on environment
-        # variables or remote fetching.
+        # reliable local .gitreview file to check.  Instead, rely on
+        # environment variables or remote fetching.
         log.debug("Skipping local .gitreview check (composite action context)")
 
-        # Try to fetch .gitreview remotely (simplified version of core logic)
-        try:
-            repo_full = gh.repository.strip() if gh.repository else ""
-            if not repo_full:
-                return None
+        repo_full = gh.repository.strip() if gh.repository else ""
+        if not repo_full:
+            return None
 
-            # Try a few common branches
-            branches = []
-            if gh.head_ref:
-                branches.append(gh.head_ref)
-            if gh.base_ref:
-                branches.append(gh.base_ref)
-            branches.extend(["master", "main"])
+        # Collect branch hints from the GitHub context
+        branches: list[str] = []
+        if gh.head_ref:
+            branches.append(gh.head_ref)
+        if gh.base_ref:
+            branches.append(gh.base_ref)
 
-            for branch in branches:
-                if not branch:
-                    continue
-
-                url = f"https://raw.githubusercontent.com/{repo_full}/{branch}/.gitreview"
-
-                parsed = urllib.parse.urlparse(url)
-                if (
-                    parsed.scheme != "https"
-                    or parsed.netloc != "raw.githubusercontent.com"
-                ):
-                    continue
-
-                try:
-                    log.debug("Fetching .gitreview from: %s", url)
-                    with urllib.request.urlopen(url, timeout=5) as resp:
-                        text_remote = resp.read().decode("utf-8")
-
-                    host = self._match_first_group(
-                        r"(?m)^host=(.+)$", text_remote
-                    )
-                    proj = self._match_first_group(
-                        r"(?m)^project=(.+)$", text_remote
-                    )
-
-                    if host and proj:
-                        project = proj.removesuffix(".git")
-                        return (host.strip(), project.strip())
-                    if host and not proj:
-                        return (host.strip(), "")
-
-                except Exception as exc:
-                    log.debug(
-                        "Failed to fetch .gitreview from %s: %s", url, exc
-                    )
-                    continue
-
-        except Exception as exc:
-            log.debug("Failed to resolve .gitreview remotely: %s", exc)
+        info = fetch_gitreview_raw(
+            repo_full,
+            branches=branches,
+            include_env_refs=False,  # caller supplies refs explicitly
+        )
+        if info:
+            return (info.host, info.project)
 
         return None
 

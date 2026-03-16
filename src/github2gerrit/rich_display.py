@@ -23,17 +23,16 @@ from .rich_logging import setup_rich_aware_logging
 
 
 try:
-    from rich.console import Console
-    from rich.live import Live
-    from rich.table import Table
-    from rich.text import Text
+    from rich.console import Console  # pyright: ignore[reportAssignmentType]
+    from rich.live import Live  # pyright: ignore[reportAssignmentType]
+    from rich.table import Table  # pyright: ignore[reportAssignmentType]
+    from rich.text import Text  # pyright: ignore[reportAssignmentType]
 
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
 
-    # Fallback classes for when Rich is not available
-    class Live:  # type: ignore
+    class Live:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
@@ -46,21 +45,21 @@ except ImportError:
         def update(self, *args: Any) -> None:
             pass
 
-    class Text:  # type: ignore
+    class Text:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         def append(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-    class Console:  # type: ignore
+    class Console:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         def print(self, *args: Any, **kwargs: Any) -> None:
             print(*args)
 
-    class Table:  # type: ignore
+    class Table:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 

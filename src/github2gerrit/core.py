@@ -54,6 +54,9 @@ from .github_api import get_pull
 from .github_api import get_recent_change_ids_from_comments
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
+from .gitreview import GerritInfo
+from .gitreview import fetch_gitreview
+from .gitreview import make_gitreview_info
 from .gitutils import CommandError
 from .gitutils import GitError
 from .gitutils import _parse_trailers
@@ -182,11 +185,11 @@ def _is_valid_change_id(value: str) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class GerritInfo:
-    host: str
-    port: int
-    project: str
+# GerritInfo is imported from .gitreview (aliased from GitReviewInfo).
+# It retains the same frozen-dataclass interface (host, port, project) plus
+# an additional optional ``base_path`` field (default ``None``).
+# The top-level import is sufficient for ``from github2gerrit.core import
+# GerritInfo`` to keep working — no explicit re-export needed.
 
 
 @dataclass(frozen=True)
@@ -1851,20 +1854,6 @@ class Orchestrator:
             raise OrchestratorError(_MSG_MISSING_PR_CONTEXT)
         log.debug("PR context OK: #%s", gh.pr_number)
 
-    def _parse_gitreview_text(self, text: str) -> GerritInfo | None:
-        host = _match_first_group(r"(?m)^host=(.+)$", text)
-        port_s = _match_first_group(r"(?m)^port=(\d+)$", text)
-        proj = _match_first_group(r"(?m)^project=(.+)$", text)
-        if host and proj:
-            project = proj.removesuffix(".git")
-            port = int(port_s) if port_s else 29418
-            return GerritInfo(
-                host=host.strip(),
-                port=port,
-                project=project.strip(),
-            )
-        return None
-
     def _read_gitreview(
         self,
         path: Path,
@@ -1872,122 +1861,103 @@ class Orchestrator:
     ) -> GerritInfo | None:
         """Read .gitreview and return GerritInfo if present.
 
+        Delegates to the shared :mod:`github2gerrit.gitreview` module
+        which consolidates parsing, local reads, GitHub API fetches,
+        and raw.githubusercontent.com fallbacks in a single place.
+
         Expected keys:
           host=<hostname>
           port=<port>
           project=<repo/path>.git
         """
-        if not path.exists():
-            log.info(".gitreview not found locally; attempting remote fetch")
-            # If invoked via direct URL or in environments with a token,
-            # attempt to read .gitreview from the repository using the API.
-            try:
-                client = build_client()
-                repo_obj: Any = get_repo_from_env(client)
-                # Prefer a specific ref when available; otherwise default branch
-                ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
-                content = (
-                    repo_obj.get_contents(".gitreview", ref=ref)
-                    if ref
-                    else repo_obj.get_contents(".gitreview")
-                )
-                text_remote = (
-                    getattr(content, "decoded_content", b"") or b""
-                ).decode("utf-8")
-                info_remote = self._parse_gitreview_text(text_remote)
-                if info_remote:
-                    log.debug("Parsed remote .gitreview: %s", info_remote)
-                    return info_remote
-                log.info("Remote .gitreview missing required keys; ignoring")
-            except Exception as exc:
-                log.debug("Remote .gitreview not available: %s", exc)
-            # Attempt raw.githubusercontent.com as a fallback
-            try:
-                repo_full = (
-                    (
-                        gh.repository
-                        if gh
-                        else os.getenv("GITHUB_REPOSITORY", "")
-                    )
-                    or ""
-                ).strip()
-                branches: list[str] = []
-                # Prefer PR head/base refs via GitHub API when running
-                # from a direct URL when a token is available
-                try:
-                    # When a target URL was provided via CLI, G2G_TARGET_URL
-                    # contains the actual URL string (truthy check)
-                    if (
-                        gh
-                        and gh.pr_number
-                        and os.getenv("G2G_TARGET_URL")
-                        and (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"))
-                    ):
-                        client = build_client()
-                        repo_obj = get_repo_from_env(client)
-                        pr_obj = get_pull(repo_obj, int(gh.pr_number))
-                        api_head = str(
-                            getattr(
-                                getattr(pr_obj, "head", object()), "ref", ""
-                            )
-                            or ""
-                        )
-                        api_base = str(
-                            getattr(
-                                getattr(pr_obj, "base", object()), "ref", ""
-                            )
-                            or ""
-                        )
-                        if api_head:
-                            branches.append(api_head)
-                        if api_base:
-                            branches.append(api_base)
-                except Exception as exc_api:
-                    log.debug(
-                        "Could not resolve PR refs via API for .gitreview: %s",
-                        exc_api,
-                    )
-                if gh and gh.head_ref:
-                    branches.append(gh.head_ref)
-                if gh and gh.base_ref:
-                    branches.append(gh.base_ref)
-                branches.extend(["master", "main"])
-                tried: set[str] = set()
-                for br in branches:
-                    if not br or br in tried:
-                        continue
-                    tried.add(br)
-                    url = f"https://raw.githubusercontent.com/{repo_full}/refs/heads/{br}/.gitreview"
-                    parsed = urllib.parse.urlparse(url)
-                    if (
-                        parsed.scheme != "https"
-                        or parsed.netloc != "raw.githubusercontent.com"
-                    ):
-                        continue
-                    log.info("Fetching .gitreview via raw URL: %s", url)
-                    with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310
-                        text_remote = resp.read().decode("utf-8")
-                    info_remote = self._parse_gitreview_text(text_remote)
-                    if info_remote:
-                        log.debug("Parsed remote .gitreview: %s", info_remote)
-                        return info_remote
-            except Exception as exc2:
-                log.debug("Raw .gitreview fetch failed: %s", exc2)
-            log.info("Remote .gitreview not available via API or HTTP")
-            log.info("Falling back to inputs/env")
-            return None
+        from .gitreview import parse_gitreview
 
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception as exc:
-            msg = f"failed to read .gitreview: {exc}"
-            raise OrchestratorError(msg) from exc
-        info_local = self._parse_gitreview_text(text)
-        if not info_local:
+        # --- Strategy 1: local file ---
+        if path.exists():
+            # Read file with explicit error handling so IO failures
+            # produce a distinct message from malformed content.
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                msg = f"failed to read .gitreview at {path}: {exc}"
+                raise OrchestratorError(msg) from exc
+
+            info_local = parse_gitreview(text)
+            if info_local:
+                if not info_local.project:
+                    msg = "invalid .gitreview: missing host/project"
+                    raise OrchestratorError(msg)
+                log.debug("Parsed .gitreview: %s", info_local)
+                return info_local
+            # File exists and is readable but is malformed
             msg = "invalid .gitreview: missing host/project"
             raise OrchestratorError(msg)
-        log.debug("Parsed .gitreview: %s", info_local)
-        return info_local
+
+        log.info(".gitreview not found locally; attempting remote fetch")
+
+        # --- Strategy 2: GitHub API (PyGithub) ---
+        repo_obj: Any | None = None
+        try:
+            client = build_client()
+            repo_obj = get_repo_from_env(client)
+        except Exception as exc:
+            log.debug("Could not build GitHub client for API fetch: %s", exc)
+
+        api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
+
+        # Collect branch names for the raw URL fallback
+        branches: list[str] = []
+        # Prefer PR head/base refs via GitHub API when running from a
+        # direct URL and a token is available
+        try:
+            if (
+                gh
+                and gh.pr_number
+                and os.getenv("G2G_TARGET_URL")
+                and (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"))
+                and repo_obj is not None
+            ):
+                pr_obj = get_pull(repo_obj, int(gh.pr_number))
+                api_head = str(
+                    getattr(getattr(pr_obj, "head", object()), "ref", "") or ""
+                )
+                api_base = str(
+                    getattr(getattr(pr_obj, "base", object()), "ref", "") or ""
+                )
+                if api_head:
+                    branches.append(api_head)
+                if api_base:
+                    branches.append(api_base)
+        except Exception as exc_api:
+            log.debug(
+                "Could not resolve PR refs via API for .gitreview: %s",
+                exc_api,
+            )
+        if gh and gh.head_ref:
+            branches.append(gh.head_ref)
+        if gh and gh.base_ref:
+            branches.append(gh.base_ref)
+
+        repo_full = (
+            (gh.repository if gh else os.getenv("GITHUB_REPOSITORY", "")) or ""
+        ).strip()
+
+        info = fetch_gitreview(
+            skip_local=True,
+            repo_obj=repo_obj,
+            api_ref=api_ref,
+            repo_full=repo_full,
+            branches=branches,
+        )
+        if info:
+            if not info.project:
+                log.warning("Remote .gitreview missing project field; ignoring")
+            else:
+                return info
+
+        log.info("Remote .gitreview not available via API or HTTP")
+        log.info("Falling back to inputs/env")
+        return None
 
     def _derive_repo_names(
         self,
@@ -2068,7 +2038,7 @@ class Orchestrator:
             else:
                 raise OrchestratorError(_MSG_MISSING_GERRIT_PROJECT)
 
-        info = GerritInfo(host=host, port=port, project=project)
+        info = make_gitreview_info(host=host, port=port, project=project)
         log.debug("Resolved Gerrit info: %s", info)
         return info
 

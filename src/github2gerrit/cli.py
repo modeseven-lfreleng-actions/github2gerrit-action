@@ -22,6 +22,7 @@ from typing import cast
 from urllib.parse import urlparse
 
 import click
+import click.core
 import typer
 
 from . import models
@@ -845,8 +846,8 @@ def main(
         param_name: str, env_var: str, current: bool
     ) -> bool:
         """Return *current* if the CLI flag was explicit, else parse env."""
-        source = ctx.get_parameter_source(param_name)
-        if source == click.core.ParameterSource.COMMANDLINE:
+        source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
+        if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue]
             return current
         env_val = os.getenv(env_var)
         if env_val is not None:

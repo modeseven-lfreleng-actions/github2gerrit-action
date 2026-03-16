@@ -49,8 +49,6 @@ import configparser
 import logging
 import os
 import re
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
 from typing import cast
@@ -459,6 +457,9 @@ def _is_local_cli_context() -> bool:
 def _read_gitreview_host(repository: str | None = None) -> str | None:
     """Read the Gerrit host from the .gitreview file.
 
+    Delegates to the shared :mod:`github2gerrit.gitreview` module which
+    consolidates all ``.gitreview`` parsing and fetching logic.
+
     Checks the local workspace first (available after actions/checkout),
     then falls back to fetching via raw.githubusercontent.com when a
     GITHUB_REPOSITORY is set.
@@ -470,72 +471,9 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
     Returns:
         The host string from .gitreview, or None if unavailable.
     """
-    _gitreview_host_re = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+)$")
+    from .gitreview import read_gitreview_host
 
-    # 1. Try local .gitreview (available after actions/checkout)
-    local_path = Path(".gitreview")
-    if local_path.exists():
-        try:
-            text = local_path.read_text(encoding="utf-8")
-            match = _gitreview_host_re.search(text)
-            if match:
-                host = match.group(1).strip()
-                if host:
-                    log.debug(
-                        "Read Gerrit host from local .gitreview: %s", host
-                    )
-                    return host
-        except Exception as exc:
-            log.debug("Failed to read local .gitreview: %s", exc)
-
-    # 2. Try fetching from GitHub via raw URL
-    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
-    if not repo_full or "/" not in repo_full:
-        return None
-
-    # Try PR head/base refs first, then common default branches
-    branches: list[str] = []
-    for env_var in ("GITHUB_HEAD_REF", "GITHUB_BASE_REF"):
-        ref = (os.getenv(env_var) or "").strip()
-        if ref:
-            branches.append(ref)
-    branches.extend(["master", "main"])
-
-    tried: set[str] = set()
-    for branch in branches:
-        if not branch or branch in tried:
-            continue
-        tried.add(branch)
-        safe_branch = urllib.parse.quote(branch, safe="/")
-        url = (
-            f"https://raw.githubusercontent.com/"
-            f"{repo_full}/refs/heads/{safe_branch}/.gitreview"
-        )
-        parsed = urllib.parse.urlparse(url)
-        if (
-            parsed.scheme != "https"
-            or parsed.netloc != "raw.githubusercontent.com"
-        ):
-            continue
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310
-                text = resp.read().decode("utf-8")
-            match = _gitreview_host_re.search(text)
-            if match:
-                host = match.group(1).strip()
-                if host:
-                    log.debug(
-                        "Read Gerrit host from remote .gitreview (%s): %s",
-                        branch,
-                        host,
-                    )
-                    return host
-        except Exception as exc:
-            log.debug(
-                "Failed to fetch .gitreview from %s branch: %s", branch, exc
-            )
-
-    return None
+    return read_gitreview_host(repository)
 
 
 def derive_gerrit_parameters(

@@ -26,22 +26,23 @@ from typing import ClassVar
 
 
 try:
-    from rich.console import Console
-    from rich.logging import RichHandler
+    from rich.console import Console  # pyright: ignore[reportAssignmentType]
+    from rich.logging import (
+        RichHandler,  # pyright: ignore[reportAssignmentType]
+    )
 
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
 
-    # Fallback classes for when Rich is not available
-    class Console:  # type: ignore
+    class Console:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         def print(self, *args: Any, **kwargs: Any) -> None:
             print(*args)
 
-    class RichHandler:  # type: ignore
+    class RichHandler:  # type: ignore[no-redef]
         pass
 
 

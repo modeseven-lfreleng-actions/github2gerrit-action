@@ -140,7 +140,7 @@ class TestReadGitreviewHostLocal:
 class TestReadGitreviewHostRemote:
     """Tests for fetching .gitreview from raw.githubusercontent.com."""
 
-    @patch("github2gerrit.config.urllib.request.urlopen")
+    @patch("github2gerrit.gitreview.urllib.request.urlopen")
     def test_fetches_from_master_branch(
         self,
         mock_urlopen: MagicMock,
@@ -163,7 +163,7 @@ class TestReadGitreviewHostRemote:
         result = _read_gitreview_host("opendaylight/aaa")
         assert result == "git.opendaylight.org"
 
-    @patch("github2gerrit.config.urllib.request.urlopen")
+    @patch("github2gerrit.gitreview.urllib.request.urlopen")
     def test_returns_none_when_remote_unavailable(
         self,
         mock_urlopen: MagicMock,
@@ -199,7 +199,7 @@ class TestReadGitreviewHostRemote:
         result = _read_gitreview_host("noslash")
         assert result is None
 
-    @patch("github2gerrit.config.urllib.request.urlopen")
+    @patch("github2gerrit.gitreview.urllib.request.urlopen")
     def test_prefers_github_head_ref_over_master(
         self,
         mock_urlopen: MagicMock,
@@ -227,7 +227,7 @@ class TestReadGitreviewHostRemote:
         first_call_url = mock_urlopen.call_args_list[0][0][0]
         assert "feature/my-branch" in first_call_url
 
-    @patch("github2gerrit.config.urllib.request.urlopen")
+    @patch("github2gerrit.gitreview.urllib.request.urlopen")
     def test_tries_base_ref_after_head_ref(
         self,
         mock_urlopen: MagicMock,
