@@ -55,6 +55,7 @@ def _create_test_inputs(*, issue_id: str = "CIMAN-33") -> Inputs:
         gerrit_project="portal-ng/bff",
         issue_id=issue_id,
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
         duplicates_filter="open",

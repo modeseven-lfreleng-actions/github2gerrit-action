@@ -68,6 +68,7 @@ class Inputs:
     gerrit_project: str
     issue_id: str
     issue_id_lookup_json: str
+    commit_rules_json: str
     allow_duplicates: bool
     ci_testing: bool
     duplicates_filter: str = "open"

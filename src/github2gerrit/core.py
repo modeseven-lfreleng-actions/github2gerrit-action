@@ -915,6 +915,7 @@ class Orchestrator:
         g2g_mode: str | None = None,
         g2g_topic: str | None = None,
         g2g_change_ids: list[str] | None = None,
+        gerrit_project: str = "",
     ) -> str:
         """
         Build complete commit message with all trailers in proper order.
@@ -922,11 +923,15 @@ class Orchestrator:
         This is the single source of truth for trailer management.
 
         Trailer order:
+        0. Custom trailer-location commit rules (from COMMIT_RULES_JSON)
         1. Issue-ID (if provided)
         2. Signed-off-by (preserved or added)
         3. Change-ID (if provided or preserved)
         4. GitHub-PR
         5. GitHub-Hash
+
+        Custom body-location commit rules are inserted into the body
+        text before the trailer block.
 
         Args:
             base_message: The base commit message (subject + body)
@@ -939,10 +944,16 @@ class Orchestrator:
             g2g_mode: Mode for metadata block (squash/multi-commit)
             g2g_topic: Topic for metadata block
             g2g_change_ids: Change-IDs for metadata block
+            gerrit_project: Gerrit project name for commit-rules
+                resolution (from .gitreview or GERRIT_PROJECT)
 
         Returns:
             Complete commit message with all trailers properly ordered
         """
+        from .commit_rules import apply_body_rules
+        from .commit_rules import apply_trailer_rules
+        from .commit_rules import parse_commit_rules_json
+        from .commit_rules import resolve_rules
         from .gitutils import _parse_trailers
 
         # Parse existing trailers if preserving
@@ -980,8 +991,31 @@ class Orchestrator:
         body_lines = lines[:trailer_start]
         base_body = "\n".join(body_lines).rstrip()
 
+        # Resolve commit rules from COMMIT_RULES_JSON
+        github_actor = os.getenv("GITHUB_ACTOR", "")
+        rules_config = parse_commit_rules_json(inputs.commit_rules_json)
+        resolved_rules = resolve_rules(
+            rules_config,
+            gerrit_project=gerrit_project,
+            github_actor=github_actor,
+        )
+
+        # Apply body-location rules (e.g. "Type: ci" for FD.io VPP)
+        if resolved_rules.has_rules:
+            base_body = apply_body_rules(base_body, resolved_rules)
+
         # Build trailers in proper order
         trailers_ordered: list[str] = []
+
+        # 0. Custom trailer-location commit rules
+        #    (inserted first, before Issue-ID / Signed-off-by / etc.)
+        if resolved_rules.has_rules:
+            apply_trailer_rules(
+                trailers_ordered,
+                resolved_rules,
+                existing_trailers=existing_trailers,
+                issue_id_override=inputs.issue_id,
+            )
 
         # 1. Issue-ID (if provided)
         if inputs.issue_id.strip():
@@ -3208,6 +3242,7 @@ class Orchestrator:
                 g2g_mode="multi-commit",
                 g2g_topic=topic,
                 g2g_change_ids=reuse_change_ids if reuse_change_ids else None,
+                gerrit_project=gerrit.project,
             )
 
             # Only amend if message changed
@@ -3586,6 +3621,7 @@ class Orchestrator:
             gh=gh,
             change_id=reuse_cid,
             preserve_existing=True,
+            gerrit_project=gerrit.project,
         )
 
         # Preserve primary author from the PR head commit

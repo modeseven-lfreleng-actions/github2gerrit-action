@@ -675,6 +675,16 @@ def main(
             "for automatic lookup."
         ),
     ),
+    commit_rules_json: str = typer.Option(
+        "",
+        "--commit-rules",
+        envvar="COMMIT_RULES_JSON",
+        help=(
+            "JSON object defining commit message rules with per-project "
+            "and per-actor overrides. Supports arbitrary key-value lines "
+            "placed in the commit body or trailer block."
+        ),
+    ),
     log_reconcile_json: bool = typer.Option(
         True,
         "--log-reconcile-json/--no-log-reconcile-json",
@@ -996,6 +1006,8 @@ def main(
 
     if resolved_issue_id:
         os.environ["ISSUE_ID"] = resolved_issue_id
+    if commit_rules_json:
+        os.environ["COMMIT_RULES_JSON"] = commit_rules_json
     os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
     os.environ["CI_TESTING"] = "true" if ci_testing else "false"
     os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"
@@ -1174,6 +1186,7 @@ def _build_inputs_from_env() -> Inputs:
         gerrit_project=env_str("GERRIT_PROJECT"),
         issue_id=env_str("ISSUE_ID", ""),
         issue_id_lookup_json=env_str("ISSUE_ID_LOOKUP_JSON", ""),
+        commit_rules_json=env_str("COMMIT_RULES_JSON", ""),
         allow_duplicates=env_bool("ALLOW_DUPLICATES", True),
         ci_testing=env_bool("CI_TESTING", False),
         duplicates_filter=env_str("DUPLICATE_TYPES", "open"),
@@ -1802,6 +1815,7 @@ def _load_effective_inputs() -> Inputs:
                     gerrit_project=data.gerrit_project,
                     issue_id=data.issue_id,
                     issue_id_lookup_json=data.issue_id_lookup_json,
+                    commit_rules_json=data.commit_rules_json,
                     allow_duplicates=data.allow_duplicates,
                     ci_testing=data.ci_testing,
                     duplicates_filter=data.duplicates_filter,

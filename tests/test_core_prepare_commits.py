@@ -34,6 +34,7 @@ def _minimal_inputs() -> Inputs:
         gerrit_project="example/project",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
