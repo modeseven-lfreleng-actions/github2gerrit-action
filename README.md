@@ -1591,7 +1591,9 @@ requiring manual configuration per PR or user.
   - `src/github2gerrit/gitutils.py` (subprocess and git helpers)
 - Linting and type checking
   - Ruff and MyPy use settings in `pyproject.toml`.
-  - Run from pre‑commit hooks and CI.
+  - Run from [prek](https://github.com/j178/prek) hooks and CI.
+  - prek is a faster, Rust-based drop-in replacement for pre-commit
+    that reads the existing `.pre-commit-config.yaml` unchanged.
 - Tests
   - Pytest with coverage targets around 80%.
   - Add unit and integration tests for each feature.
@@ -1601,6 +1603,10 @@ requiring manual configuration per PR or user.
 - Install `uv` and run:
   - `uv pip install --system .`
   - `uv run github2gerrit --help`
+- Install prek hooks:
+  - `uv tool install prek && prek install -f`
+- Run all checks (including tests) manually:
+  - `prek run --all-files`
 - Run tests:
   - `uv run pytest -q`
 - Lint and type check:
