@@ -26,12 +26,25 @@ permissions: {}
 
 concurrency:
   # yamllint disable-line rule:line-length
-  group: "rd-${{ github.event_name }}-${{ github.event.number }}-${{ github.ref }}"
+  group: ${{ github.event.pull_request.number && format('rd-{0}-pr-{1}', github.event_name, github.event.pull_request.number) || format('rd-push-{0}', github.ref) }}
   cancel-in-progress: true
 
 jobs:
   update_release_draft:
     name: 'Update Release Draft'
+    # Run on pull_request_target for forks, or pull_request for same-repo PRs
+    # This prevents duplicate runs for same-repo PRs
+    # yamllint disable rule:line-length
+    if: >
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork) ||
+      (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork) ||
+      github.event_name == 'push'
+    # yamllint enable rule:line-length
+    # SECURITY: pull_request_target with write permissions is safe here because:
+    # 1. This workflow does NOT checkout any code from the PR
+    # 2. The workflow code itself runs from the base branch (not the fork)
+    # 3. release-drafter only makes GitHub API calls (no code execution)
+    # 4. pull_request_target is needed ONLY for autolabeling fork PRs
     permissions:
       # write permission is required to create releases
       contents: write
@@ -39,9 +52,9 @@ jobs:
       pull-requests: write
     runs-on: 'ubuntu-latest'
     timeout-minutes: 3
-    # yamllint disable rule:line-length
     steps:
       # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
         with:
           egress-policy: 'audit'
@@ -51,13 +64,16 @@ jobs:
         # yamllint disable rule:line-length
         run: |
           # Show concurrency group
+          GROUP="${{ github.event.pull_request.number && format('rd-{0}-pr-{1}', github.event_name, github.event.pull_request.number) || format('rd-push-{0}', github.ref) }}"
           {
             echo '## Release Drafter'
-            echo "Concurrency group: rd-${{ github.event_name }}-${{ github.event.number }}-${{ github.ref }}"
+            echo "Concurrency group: ${GROUP}"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Concurrency group: rd-${{ github.event_name }}-${{ github.event.number }}-${{ github.ref }}"
+          echo "Concurrency group: ${GROUP}"
+        # yamllint enable rule:line-length
 
       - name: 'Update draft release'
+        # yamllint disable-line rule:line-length
         uses: release-drafter/release-drafter@3a7fb5c85b80b1dda66e1ccb94009adbbd32fce3 # v7.0.0
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
