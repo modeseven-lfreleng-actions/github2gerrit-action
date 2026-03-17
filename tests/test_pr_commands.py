@@ -433,6 +433,7 @@ class TestShouldCreateMissing:
             "gerrit_project": "test-project",
             "issue_id": "",
             "issue_id_lookup_json": "",
+            "commit_rules_json": "",
             "allow_duplicates": True,
             "ci_testing": False,
             "create_missing": create_missing,
@@ -750,6 +751,7 @@ class TestInputsCreateMissing:
             gerrit_project="proj",
             issue_id="",
             issue_id_lookup_json="",
+            commit_rules_json="",
             allow_duplicates=True,
             ci_testing=False,
         )
@@ -777,6 +779,7 @@ class TestInputsCreateMissing:
             gerrit_project="proj",
             issue_id="",
             issue_id_lookup_json="",
+            commit_rules_json="",
             allow_duplicates=True,
             ci_testing=False,
             create_missing=True,

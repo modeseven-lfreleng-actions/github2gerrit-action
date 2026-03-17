@@ -36,29 +36,23 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from github2gerrit.core import GerritInfo
 from github2gerrit.gerrit_query import GerritChange
 from github2gerrit.gerrit_query import query_changes_by_topic
+from github2gerrit.gitreview import GerritInfo
 from github2gerrit.mapping_comment import parse_mapping_comments
 from github2gerrit.mapping_comment import validate_mapping_consistency
 from github2gerrit.reconcile_matcher import LocalCommit
 from github2gerrit.reconcile_matcher import ReconciliationMatcher
 
 
-log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Type hints (imported lazily to avoid circulars)
-# ---------------------------------------------------------------------------
-
-try:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from github2gerrit.models import GitHubContext
     from github2gerrit.models import Inputs
-except Exception:  # pragma: no cover
-    GitHubContext = object  # type: ignore[misc,assignment]
-    Inputs = object  # type: ignore[misc,assignment]
+
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

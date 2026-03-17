@@ -129,6 +129,14 @@ inputs:
       (format: [{"key": "username", "value": "ISSUE-ID"}])
     required: false
     default: "[]"
+  COMMIT_RULES_JSON:
+    description: >-
+      JSON object defining commit message rules with per-project and
+      per-actor overrides. Supports arbitrary label-value pairs placed
+      in the commit body or trailer block.
+      (see: docs/COMMIT_RULES.md)
+    required: false
+    default: ""
   AUTOMATION_ONLY:
     description: "Only accept pull requests from known automation tools"
     required: false
@@ -294,6 +302,7 @@ runs:
         ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
         ISSUE_ID: ${{ inputs.ISSUE_ID }}
         ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
+        COMMIT_RULES_JSON: ${{ inputs.COMMIT_RULES_JSON }}
         CI_TESTING: ${{ inputs.CI_TESTING }}
         CLOSE_MERGED_PRS: ${{ inputs.CLOSE_MERGED_PRS }}
         FORCE: ${{ inputs.FORCE }}

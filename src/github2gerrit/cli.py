@@ -22,6 +22,7 @@ from typing import cast
 from urllib.parse import urlparse
 
 import click
+import click.core
 import typer
 
 from . import models
@@ -674,6 +675,16 @@ def main(
             "for automatic lookup."
         ),
     ),
+    commit_rules_json: str = typer.Option(
+        "",
+        "--commit-rules",
+        envvar="COMMIT_RULES_JSON",
+        help=(
+            "JSON object defining commit message rules with per-project "
+            "and per-actor overrides. Supports arbitrary key-value lines "
+            "placed in the commit body or trailer block."
+        ),
+    ),
     log_reconcile_json: bool = typer.Option(
         True,
         "--log-reconcile-json/--no-log-reconcile-json",
@@ -845,8 +856,8 @@ def main(
         param_name: str, env_var: str, current: bool
     ) -> bool:
         """Return *current* if the CLI flag was explicit, else parse env."""
-        source = ctx.get_parameter_source(param_name)
-        if source == click.core.ParameterSource.COMMANDLINE:
+        source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
+        if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue]
             return current
         env_val = os.getenv(env_var)
         if env_val is not None:
@@ -995,6 +1006,9 @@ def main(
 
     if resolved_issue_id:
         os.environ["ISSUE_ID"] = resolved_issue_id
+    # Always set COMMIT_RULES_JSON so passing an empty string via CLI
+    # clears any pre-existing env var rather than leaving stale rules.
+    os.environ["COMMIT_RULES_JSON"] = commit_rules_json or ""
     os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
     os.environ["CI_TESTING"] = "true" if ci_testing else "false"
     os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"
@@ -1173,6 +1187,7 @@ def _build_inputs_from_env() -> Inputs:
         gerrit_project=env_str("GERRIT_PROJECT"),
         issue_id=env_str("ISSUE_ID", ""),
         issue_id_lookup_json=env_str("ISSUE_ID_LOOKUP_JSON", ""),
+        commit_rules_json=env_str("COMMIT_RULES_JSON", ""),
         allow_duplicates=env_bool("ALLOW_DUPLICATES", True),
         ci_testing=env_bool("CI_TESTING", False),
         duplicates_filter=env_str("DUPLICATE_TYPES", "open"),
@@ -1620,8 +1635,9 @@ def _process_single(
                         progress_tracker=progress_tracker,
                     )
                     safe_console_print(
-                        "   To create a new change, trigger the 'opened' "
-                        "workflow action.",
+                        "   To create a new change, set CREATE_MISSING=true "
+                        "or add a '@github2gerrit create missing change' "
+                        "comment on the PR.",
                         style="yellow",
                         progress_tracker=progress_tracker,
                     )
@@ -1800,6 +1816,7 @@ def _load_effective_inputs() -> Inputs:
                     gerrit_project=data.gerrit_project,
                     issue_id=data.issue_id,
                     issue_id_lookup_json=data.issue_id_lookup_json,
+                    commit_rules_json=data.commit_rules_json,
                     allow_duplicates=data.allow_duplicates,
                     ci_testing=data.ci_testing,
                     duplicates_filter=data.duplicates_filter,

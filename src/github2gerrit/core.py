@@ -54,6 +54,9 @@ from .github_api import get_pull
 from .github_api import get_recent_change_ids_from_comments
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
+from .gitreview import GerritInfo
+from .gitreview import fetch_gitreview
+from .gitreview import make_gitreview_info
 from .gitutils import CommandError
 from .gitutils import GitError
 from .gitutils import _parse_trailers
@@ -182,11 +185,11 @@ def _is_valid_change_id(value: str) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class GerritInfo:
-    host: str
-    port: int
-    project: str
+# GerritInfo is imported from .gitreview (aliased from GitReviewInfo).
+# It retains the same frozen-dataclass interface (host, port, project) plus
+# an additional optional ``base_path`` field (default ``None``).
+# The top-level import is sufficient for ``from github2gerrit.core import
+# GerritInfo`` to keep working — no explicit re-export needed.
 
 
 @dataclass(frozen=True)
@@ -912,6 +915,7 @@ class Orchestrator:
         g2g_mode: str | None = None,
         g2g_topic: str | None = None,
         g2g_change_ids: list[str] | None = None,
+        gerrit_project: str = "",
     ) -> str:
         """
         Build complete commit message with all trailers in proper order.
@@ -919,11 +923,15 @@ class Orchestrator:
         This is the single source of truth for trailer management.
 
         Trailer order:
+        0. Custom trailer-location commit rules (from COMMIT_RULES_JSON)
         1. Issue-ID (if provided)
         2. Signed-off-by (preserved or added)
         3. Change-ID (if provided or preserved)
         4. GitHub-PR
         5. GitHub-Hash
+
+        Custom body-location commit rules are inserted into the body
+        text before the trailer block.
 
         Args:
             base_message: The base commit message (subject + body)
@@ -936,10 +944,16 @@ class Orchestrator:
             g2g_mode: Mode for metadata block (squash/multi-commit)
             g2g_topic: Topic for metadata block
             g2g_change_ids: Change-IDs for metadata block
+            gerrit_project: Gerrit project name for commit-rules
+                resolution (from .gitreview or GERRIT_PROJECT)
 
         Returns:
             Complete commit message with all trailers properly ordered
         """
+        from .commit_rules import apply_body_rules
+        from .commit_rules import apply_trailer_rules
+        from .commit_rules import parse_commit_rules_json
+        from .commit_rules import resolve_rules
         from .gitutils import _parse_trailers
 
         # Parse existing trailers if preserving
@@ -951,34 +965,62 @@ class Orchestrator:
         lines = base_message.splitlines()
         body_lines = []
 
-        # Find where trailers start (working backwards)
+        # Find where trailers start using generic "Key: value" detection
+        # aligned with _parse_trailers() in gitutils.py: a trailer block
+        # must be preceded by a blank line to avoid matching conventional
+        # commit subjects like "fix: something" as trailers.
         trailer_start = len(lines)
+        in_trailer_block = True
+
         for i in range(len(lines) - 1, -1, -1):
             line = lines[i].strip()
-            if not line:
-                continue
-            # Common trailer patterns
-            if any(
-                line.startswith(prefix)
-                for prefix in [
-                    "Issue-ID:",
-                    "Signed-off-by:",
-                    "Change-Id:",
-                    "GitHub-PR:",
-                    "GitHub-Hash:",
-                    "Co-authored-by:",
-                ]
-            ):
-                trailer_start = i
-            else:
+
+            if not line and in_trailer_block:
+                # Found blank line before trailer block — accept it
+                trailer_start = i + 1
                 break
+            elif not line:
+                in_trailer_block = False
+            elif in_trailer_block and ":" in line:
+                key, val = line.split(":", 1)
+                k = key.strip()
+                v = val.strip()
+                if k and v and not k.startswith((" ", "\t")):
+                    continue
+                else:
+                    in_trailer_block = False
+            elif in_trailer_block:
+                in_trailer_block = False
 
         # Body is everything before trailers
         body_lines = lines[:trailer_start]
         base_body = "\n".join(body_lines).rstrip()
 
+        # Resolve commit rules from COMMIT_RULES_JSON
+        github_actor = os.getenv("GITHUB_ACTOR", "")
+        rules_config = parse_commit_rules_json(inputs.commit_rules_json)
+        resolved_rules = resolve_rules(
+            rules_config,
+            gerrit_project=gerrit_project,
+            github_actor=github_actor,
+        )
+
+        # Apply body-location rules (e.g. "Type: ci" for FD.io VPP)
+        if resolved_rules.has_rules:
+            base_body = apply_body_rules(base_body, resolved_rules)
+
         # Build trailers in proper order
         trailers_ordered: list[str] = []
+
+        # 0. Custom trailer-location commit rules
+        #    (inserted first, before Issue-ID / Signed-off-by / etc.)
+        if resolved_rules.has_rules:
+            apply_trailer_rules(
+                trailers_ordered,
+                resolved_rules,
+                existing_trailers=existing_trailers,
+                issue_id_override=inputs.issue_id,
+            )
 
         # 1. Issue-ID (if provided)
         if inputs.issue_id.strip():
@@ -1027,6 +1069,28 @@ class Orchestrator:
             # Check if not already present
             if gh_trailer not in trailers_ordered:
                 trailers_ordered.append(gh_trailer)
+
+        # 6. Preserve any unmanaged existing trailers (e.g. Bug:,
+        #    Ticket:, Co-authored-by:) that are not explicitly rebuilt
+        #    above, so custom trailers are not silently dropped.
+        if preserve_existing and existing_trailers:
+            managed_keys = {
+                "Issue-ID",
+                "Signed-off-by",
+                "Change-Id",
+                "GitHub-PR",
+                "GitHub-Hash",
+            }
+            # Also treat commit-rule trailer keys as managed
+            if resolved_rules.has_rules:
+                managed_keys.update(r.key for r in resolved_rules.trailer_rules)
+            for key, values in existing_trailers.items():
+                if key in managed_keys:
+                    continue
+                for val in values:
+                    trailer_line = f"{key}: {val}"
+                    if trailer_line not in trailers_ordered:
+                        trailers_ordered.append(trailer_line)
 
         # Add GitHub2Gerrit metadata block before trailers if requested
         if include_g2g_metadata and g2g_mode and g2g_topic:
@@ -1296,7 +1360,7 @@ class Orchestrator:
             topic = f"GH-{gh.repository_owner}-{repo_name}-{gh.pr_number}"
 
             msg = (
-                f"UPDATE operation requires existing Gerrit change, but "
+                f"UPDATE operation requires existing Gerrit change, but "  # noqa: S608
                 f"none found. "
                 f"PR #{gh.pr_number} should have an existing change with "
                 f"topic '{topic}'. "
@@ -1304,8 +1368,9 @@ class Orchestrator:
                 f"1. The PR was not previously processed by GitHub2Gerrit\n"
                 f"2. The Gerrit change was abandoned or deleted\n"
                 f"3. The topic was manually changed in Gerrit\n"
-                f"Consider using 'opened' event type or check Gerrit for "
-                f"the change."
+                f"To create a new change anyway, set CREATE_MISSING=true "
+                f"or add a '@github2gerrit create missing change' comment "
+                f"on the PR."
             )
             raise OrchestratorError(msg)
 
@@ -1343,19 +1408,19 @@ class Orchestrator:
                 expected_github_hash = trailer.split(":", 1)[1].strip()
                 break
 
-            # Check if this is an update operation
-            operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
-            is_update_op = operation_mode == "update"
+        # Check if this is an update operation
+        operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+        is_update_op = operation_mode == "update"
 
-            change_ids = perform_reconciliation(
-                inputs=inputs,
-                gh=gh,
-                gerrit=gerrit,
-                local_commits=local_commits,
-                expected_pr_url=expected_pr_url,
-                expected_github_hash=expected_github_hash or None,
-                is_update_operation=is_update_op,
-            )
+        change_ids = perform_reconciliation(
+            inputs=inputs,
+            gh=gh,
+            gerrit=gerrit,
+            local_commits=local_commits,
+            expected_pr_url=expected_pr_url,
+            expected_github_hash=expected_github_hash or None,
+            is_update_operation=is_update_op,
+        )
         # Store lightweight plan snapshot (only fields needed for verify)
         try:
             self._reconciliation_plan = {
@@ -1850,20 +1915,6 @@ class Orchestrator:
             raise OrchestratorError(_MSG_MISSING_PR_CONTEXT)
         log.debug("PR context OK: #%s", gh.pr_number)
 
-    def _parse_gitreview_text(self, text: str) -> GerritInfo | None:
-        host = _match_first_group(r"(?m)^host=(.+)$", text)
-        port_s = _match_first_group(r"(?m)^port=(\d+)$", text)
-        proj = _match_first_group(r"(?m)^project=(.+)$", text)
-        if host and proj:
-            project = proj.removesuffix(".git")
-            port = int(port_s) if port_s else 29418
-            return GerritInfo(
-                host=host.strip(),
-                port=port,
-                project=project.strip(),
-            )
-        return None
-
     def _read_gitreview(
         self,
         path: Path,
@@ -1871,122 +1922,103 @@ class Orchestrator:
     ) -> GerritInfo | None:
         """Read .gitreview and return GerritInfo if present.
 
+        Delegates to the shared :mod:`github2gerrit.gitreview` module
+        which consolidates parsing, local reads, GitHub API fetches,
+        and raw.githubusercontent.com fallbacks in a single place.
+
         Expected keys:
           host=<hostname>
           port=<port>
           project=<repo/path>.git
         """
-        if not path.exists():
-            log.info(".gitreview not found locally; attempting remote fetch")
-            # If invoked via direct URL or in environments with a token,
-            # attempt to read .gitreview from the repository using the API.
-            try:
-                client = build_client()
-                repo_obj: Any = get_repo_from_env(client)
-                # Prefer a specific ref when available; otherwise default branch
-                ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
-                content = (
-                    repo_obj.get_contents(".gitreview", ref=ref)
-                    if ref
-                    else repo_obj.get_contents(".gitreview")
-                )
-                text_remote = (
-                    getattr(content, "decoded_content", b"") or b""
-                ).decode("utf-8")
-                info_remote = self._parse_gitreview_text(text_remote)
-                if info_remote:
-                    log.debug("Parsed remote .gitreview: %s", info_remote)
-                    return info_remote
-                log.info("Remote .gitreview missing required keys; ignoring")
-            except Exception as exc:
-                log.debug("Remote .gitreview not available: %s", exc)
-            # Attempt raw.githubusercontent.com as a fallback
-            try:
-                repo_full = (
-                    (
-                        gh.repository
-                        if gh
-                        else os.getenv("GITHUB_REPOSITORY", "")
-                    )
-                    or ""
-                ).strip()
-                branches: list[str] = []
-                # Prefer PR head/base refs via GitHub API when running
-                # from a direct URL when a token is available
-                try:
-                    # When a target URL was provided via CLI, G2G_TARGET_URL
-                    # contains the actual URL string (truthy check)
-                    if (
-                        gh
-                        and gh.pr_number
-                        and os.getenv("G2G_TARGET_URL")
-                        and (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"))
-                    ):
-                        client = build_client()
-                        repo_obj = get_repo_from_env(client)
-                        pr_obj = get_pull(repo_obj, int(gh.pr_number))
-                        api_head = str(
-                            getattr(
-                                getattr(pr_obj, "head", object()), "ref", ""
-                            )
-                            or ""
-                        )
-                        api_base = str(
-                            getattr(
-                                getattr(pr_obj, "base", object()), "ref", ""
-                            )
-                            or ""
-                        )
-                        if api_head:
-                            branches.append(api_head)
-                        if api_base:
-                            branches.append(api_base)
-                except Exception as exc_api:
-                    log.debug(
-                        "Could not resolve PR refs via API for .gitreview: %s",
-                        exc_api,
-                    )
-                if gh and gh.head_ref:
-                    branches.append(gh.head_ref)
-                if gh and gh.base_ref:
-                    branches.append(gh.base_ref)
-                branches.extend(["master", "main"])
-                tried: set[str] = set()
-                for br in branches:
-                    if not br or br in tried:
-                        continue
-                    tried.add(br)
-                    url = f"https://raw.githubusercontent.com/{repo_full}/refs/heads/{br}/.gitreview"
-                    parsed = urllib.parse.urlparse(url)
-                    if (
-                        parsed.scheme != "https"
-                        or parsed.netloc != "raw.githubusercontent.com"
-                    ):
-                        continue
-                    log.info("Fetching .gitreview via raw URL: %s", url)
-                    with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310
-                        text_remote = resp.read().decode("utf-8")
-                    info_remote = self._parse_gitreview_text(text_remote)
-                    if info_remote:
-                        log.debug("Parsed remote .gitreview: %s", info_remote)
-                        return info_remote
-            except Exception as exc2:
-                log.debug("Raw .gitreview fetch failed: %s", exc2)
-            log.info("Remote .gitreview not available via API or HTTP")
-            log.info("Falling back to inputs/env")
-            return None
+        from .gitreview import parse_gitreview
 
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception as exc:
-            msg = f"failed to read .gitreview: {exc}"
-            raise OrchestratorError(msg) from exc
-        info_local = self._parse_gitreview_text(text)
-        if not info_local:
+        # --- Strategy 1: local file ---
+        if path.exists():
+            # Read file with explicit error handling so IO failures
+            # produce a distinct message from malformed content.
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                msg = f"failed to read .gitreview at {path}: {exc}"
+                raise OrchestratorError(msg) from exc
+
+            info_local = parse_gitreview(text)
+            if info_local:
+                if not info_local.project:
+                    msg = "invalid .gitreview: missing host/project"
+                    raise OrchestratorError(msg)
+                log.debug("Parsed .gitreview: %s", info_local)
+                return info_local
+            # File exists and is readable but is malformed
             msg = "invalid .gitreview: missing host/project"
             raise OrchestratorError(msg)
-        log.debug("Parsed .gitreview: %s", info_local)
-        return info_local
+
+        log.info(".gitreview not found locally; attempting remote fetch")
+
+        # --- Strategy 2: GitHub API (PyGithub) ---
+        repo_obj: Any | None = None
+        try:
+            client = build_client()
+            repo_obj = get_repo_from_env(client)
+        except Exception as exc:
+            log.debug("Could not build GitHub client for API fetch: %s", exc)
+
+        api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
+
+        # Collect branch names for the raw URL fallback
+        branches: list[str] = []
+        # Prefer PR head/base refs via GitHub API when running from a
+        # direct URL and a token is available
+        try:
+            if (
+                gh
+                and gh.pr_number
+                and os.getenv("G2G_TARGET_URL")
+                and (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"))
+                and repo_obj is not None
+            ):
+                pr_obj = get_pull(repo_obj, int(gh.pr_number))
+                api_head = str(
+                    getattr(getattr(pr_obj, "head", object()), "ref", "") or ""
+                )
+                api_base = str(
+                    getattr(getattr(pr_obj, "base", object()), "ref", "") or ""
+                )
+                if api_head:
+                    branches.append(api_head)
+                if api_base:
+                    branches.append(api_base)
+        except Exception as exc_api:
+            log.debug(
+                "Could not resolve PR refs via API for .gitreview: %s",
+                exc_api,
+            )
+        if gh and gh.head_ref:
+            branches.append(gh.head_ref)
+        if gh and gh.base_ref:
+            branches.append(gh.base_ref)
+
+        repo_full = (
+            (gh.repository if gh else os.getenv("GITHUB_REPOSITORY", "")) or ""
+        ).strip()
+
+        info = fetch_gitreview(
+            skip_local=True,
+            repo_obj=repo_obj,
+            api_ref=api_ref,
+            repo_full=repo_full,
+            branches=branches,
+        )
+        if info:
+            if not info.project:
+                log.warning("Remote .gitreview missing project field; ignoring")
+            else:
+                return info
+
+        log.info("Remote .gitreview not available via API or HTTP")
+        log.info("Falling back to inputs/env")
+        return None
 
     def _derive_repo_names(
         self,
@@ -2067,7 +2099,7 @@ class Orchestrator:
             else:
                 raise OrchestratorError(_MSG_MISSING_GERRIT_PROJECT)
 
-        info = GerritInfo(host=host, port=port, project=project)
+        info = make_gitreview_info(host=host, port=port, project=project)
         log.debug("Resolved Gerrit info: %s", info)
         return info
 
@@ -3237,6 +3269,7 @@ class Orchestrator:
                 g2g_mode="multi-commit",
                 g2g_topic=topic,
                 g2g_change_ids=reuse_change_ids if reuse_change_ids else None,
+                gerrit_project=gerrit.project,
             )
 
             # Only amend if message changed
@@ -3615,6 +3648,7 @@ class Orchestrator:
             gh=gh,
             change_id=reuse_cid,
             preserve_existing=True,
+            gerrit_project=gerrit.project,
         )
 
         # Preserve primary author from the PR head commit
@@ -3884,17 +3918,18 @@ class Orchestrator:
         # Use our specific SSH configuration
         env = self._ssh_env()
 
+        args = [
+            "git",
+            "review",
+            "--yes",
+            "-v",
+            "-t",
+            topic,
+        ]
+        log.debug("Building git review command with topic: %s", topic)
+        collected_change_ids: list[str] = []
+
         try:
-            args = [
-                "git",
-                "review",
-                "--yes",
-                "-v",
-                "-t",
-                topic,
-            ]
-            log.debug("Building git review command with topic: %s", topic)
-            collected_change_ids: list[str] = []
             if prepared:
                 collected_change_ids.extend(prepared.all_change_ids())
             # Add any Change-Ids captured from apply_pr path (squash amend)
@@ -4943,7 +4978,7 @@ class Orchestrator:
                             blocked_ips.append(ip_str)
 
                     # Additional IPv6 specific checks
-                    elif isinstance(ip_obj, ipaddress.IPv6Address) and (
+                    elif isinstance(ip_obj, ipaddress.IPv6Address) and (  # pyright: ignore[reportUnnecessaryIsInstance]
                         ip_obj in ipaddress.IPv6Network("::1/128")  # Loopback
                         or ip_obj
                         in ipaddress.IPv6Network("fe80::/10")  # Link-local
@@ -5444,9 +5479,10 @@ class Orchestrator:
             if not csha:
                 log.debug("Empty commit SHA, skipping")
                 continue
+            # Build SSH command based on available authentication method
+            ssh_cmd: list[str] = []
             try:
                 log.debug("Executing SSH command for commit %s", csha)
-                # Build SSH command based on available authentication method
                 if self._ssh_key_path and self._ssh_known_hosts_path:
                     # File-based SSH authentication
                     ssh_cmd = [
@@ -5597,7 +5633,7 @@ class Orchestrator:
                     log.debug("SSH stdout: %s", exc.stdout)
                 log.debug(
                     "SSH command that failed: %s",
-                    " ".join(ssh_cmd) if "ssh_cmd" in locals() else "unknown",
+                    " ".join(ssh_cmd) if ssh_cmd else "unknown",
                 )
                 log.debug(
                     "Back-reference comment failed but change was successfully "

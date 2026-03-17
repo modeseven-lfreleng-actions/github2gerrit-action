@@ -85,6 +85,7 @@ def minimal_inputs() -> Inputs:
         gerrit_project="",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -182,6 +183,7 @@ def test_ssh_setup_skips_when_credentials_missing(tmp_path: Path) -> None:
         gerrit_project="example/project",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -340,6 +342,7 @@ def test_ssh_auto_discovery_integration(
         gerrit_project="",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -408,6 +411,7 @@ def test_ssh_auto_discovery_fallback_when_discovery_fails(
         gerrit_project="",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )
@@ -471,6 +475,7 @@ def test_ssh_setup_augments_provided_known_hosts_with_autodiscovery(
         gerrit_project="",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )

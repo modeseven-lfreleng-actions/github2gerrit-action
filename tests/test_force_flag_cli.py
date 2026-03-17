@@ -44,6 +44,7 @@ def mock_inputs():
         gerrit_project="test/project",
         issue_id="",
         issue_id_lookup_json="",
+        commit_rules_json="",
         allow_duplicates=False,
         ci_testing=False,
     )

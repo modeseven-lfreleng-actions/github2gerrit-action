@@ -173,7 +173,9 @@ def pytest_sessionstart(session: Any) -> None:
 
 
 @pytest.fixture(autouse=True)
-def disable_github_ci_mode(monkeypatch, request):
+def disable_github_ci_mode(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
     """
     Automatically disable GitHub CI mode detection for all tests.
 
@@ -201,7 +203,7 @@ def disable_github_ci_mode(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
-def isolate_git_environment(monkeypatch):
+def isolate_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Isolate git environment for each test to prevent cross-test contamination.
 
