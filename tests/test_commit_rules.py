@@ -659,6 +659,24 @@ class TestApplyBodyRules:
         # Should not produce excessive blank lines
         assert "\n\n\n\n" not in result
 
+    def test_substring_match_does_not_skip_insertion(self) -> None:
+        """Dedup uses line-based check, not substring match."""
+        body = "Subject line\n\nWe require Type: ci for this project."
+        rules = ResolvedCommitRules(
+            body_rules=[
+                CommitRule(
+                    key="Type",
+                    value="ci",
+                    location="body",
+                    separator="blank_line",
+                )
+            ]
+        )
+        result = apply_body_rules(body, rules)
+        # The rule line should be inserted as a standalone line
+        # even though "Type: ci" appears as a substring
+        assert "Type: ci" in result.splitlines()
+
 
 # ---------------------------------------------------------------------------
 # apply_trailer_rules
@@ -718,6 +736,18 @@ class TestApplyTrailerRules:
             trailers, rules, existing_trailers=existing
         )
         assert "Issue-ID: X-1" not in result
+
+    def test_allow_same_key_different_value(self) -> None:
+        """Dedup checks key+value, not just key."""
+        trailers: list[str] = []
+        rules = ResolvedCommitRules(
+            trailer_rules=[CommitRule(key="Issue-ID", value="NEW-1")]
+        )
+        existing = {"Issue-ID": ["OLD-1"]}
+        result = apply_trailer_rules(
+            trailers, rules, existing_trailers=existing
+        )
+        assert "Issue-ID: NEW-1" in result
 
     def test_skip_already_in_ordered_list(self) -> None:
         trailers = ["Issue-ID: X-1"]

@@ -1006,8 +1006,9 @@ def main(
 
     if resolved_issue_id:
         os.environ["ISSUE_ID"] = resolved_issue_id
-    if commit_rules_json:
-        os.environ["COMMIT_RULES_JSON"] = commit_rules_json
+    # Always set COMMIT_RULES_JSON so passing an empty string via CLI
+    # clears any pre-existing env var rather than leaving stale rules.
+    os.environ["COMMIT_RULES_JSON"] = commit_rules_json or ""
     os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
     os.environ["CI_TESTING"] = "true" if ci_testing else "false"
     os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"

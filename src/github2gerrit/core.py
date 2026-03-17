@@ -965,27 +965,32 @@ class Orchestrator:
         lines = base_message.splitlines()
         body_lines = []
 
-        # Find where trailers start (working backwards)
+        # Find where trailers start using generic "Key: value" detection
+        # aligned with _parse_trailers() in gitutils.py: a trailer block
+        # must be preceded by a blank line to avoid matching conventional
+        # commit subjects like "fix: something" as trailers.
         trailer_start = len(lines)
+        in_trailer_block = True
+
         for i in range(len(lines) - 1, -1, -1):
             line = lines[i].strip()
-            if not line:
-                continue
-            # Common trailer patterns
-            if any(
-                line.startswith(prefix)
-                for prefix in [
-                    "Issue-ID:",
-                    "Signed-off-by:",
-                    "Change-Id:",
-                    "GitHub-PR:",
-                    "GitHub-Hash:",
-                    "Co-authored-by:",
-                ]
-            ):
-                trailer_start = i
-            else:
+
+            if not line and in_trailer_block:
+                # Found blank line before trailer block — accept it
+                trailer_start = i + 1
                 break
+            elif not line:
+                in_trailer_block = False
+            elif in_trailer_block and ":" in line:
+                key, val = line.split(":", 1)
+                k = key.strip()
+                v = val.strip()
+                if k and v and not k.startswith((" ", "\t")):
+                    continue
+                else:
+                    in_trailer_block = False
+            elif in_trailer_block:
+                in_trailer_block = False
 
         # Body is everything before trailers
         body_lines = lines[:trailer_start]
@@ -1064,6 +1069,28 @@ class Orchestrator:
             # Check if not already present
             if gh_trailer not in trailers_ordered:
                 trailers_ordered.append(gh_trailer)
+
+        # 6. Preserve any unmanaged existing trailers (e.g. Bug:,
+        #    Ticket:, Co-authored-by:) that are not explicitly rebuilt
+        #    above, so custom trailers are not silently dropped.
+        if preserve_existing and existing_trailers:
+            managed_keys = {
+                "Issue-ID",
+                "Signed-off-by",
+                "Change-Id",
+                "GitHub-PR",
+                "GitHub-Hash",
+            }
+            # Also treat commit-rule trailer keys as managed
+            if resolved_rules.has_rules:
+                managed_keys.update(r.key for r in resolved_rules.trailer_rules)
+            for key, values in existing_trailers.items():
+                if key in managed_keys:
+                    continue
+                for val in values:
+                    trailer_line = f"{key}: {val}"
+                    if trailer_line not in trailers_ordered:
+                        trailers_ordered.append(trailer_line)
 
         # Add GitHub2Gerrit metadata block before trailers if requested
         if include_g2g_metadata and g2g_mode and g2g_topic:
@@ -1912,7 +1939,7 @@ class Orchestrator:
             # produce a distinct message from malformed content.
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 msg = f"failed to read .gitreview at {path}: {exc}"
                 raise OrchestratorError(msg) from exc
 

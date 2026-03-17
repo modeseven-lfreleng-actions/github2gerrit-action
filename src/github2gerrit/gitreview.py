@@ -56,11 +56,12 @@ DEFAULT_GERRIT_PORT: int = 29418
 #   • are multiline (``(?m)``)
 #   • are case-insensitive on the key name (``(?i)``)
 #   • tolerate optional horizontal whitespace around ``=``
+#   • strip trailing whitespace / ``\r`` so Windows line endings are handled
 # ───────────────────────────────────────────────────────────────────────
 
-_HOST_RE = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+)$")
-_PORT_RE = re.compile(r"(?mi)^port[ \t]*=[ \t]*(\d+)$")
-_PROJECT_RE = re.compile(r"(?mi)^project[ \t]*=[ \t]*(.+)$")
+_HOST_RE = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+?)[ \t\r]*$")
+_PORT_RE = re.compile(r"(?mi)^port[ \t]*=[ \t]*(\d+)[ \t\r]*$")
+_PROJECT_RE = re.compile(r"(?mi)^project[ \t]*=[ \t]*(.+?)[ \t\r]*$")
 
 # ───────────────────────────────────────────────────────────────────────
 # Data model

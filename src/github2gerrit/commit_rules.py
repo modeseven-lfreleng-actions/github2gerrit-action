@@ -49,7 +49,7 @@ Locations:
 
 Separators (only meaningful for ``location: body``):
 
-* ``blank_line`` (default) — surrounded by blank lines.
+* ``blank_line`` (default) — preceded by a blank line.
 * ``none`` — appended directly without extra blank lines.
 """
 
@@ -262,7 +262,6 @@ def parse_commit_rules_json(json_str: str) -> CommitRulesConfig | None:
             "(parse error: %s)",
             exc,
         )
-        print("⚠️  Warning: COMMIT_RULES_JSON was not valid JSON")
         return None
 
     if not isinstance(data, dict):
@@ -270,7 +269,6 @@ def parse_commit_rules_json(json_str: str) -> CommitRulesConfig | None:
             "⚠️  Warning: COMMIT_RULES_JSON must be a JSON object, got %s",
             type(data).__name__,
         )
-        print("⚠️  Warning: COMMIT_RULES_JSON was not valid (expected object)")
         return None
 
     config = CommitRulesConfig()
@@ -412,8 +410,8 @@ def apply_body_rules(
     for rule in rules.body_rules:
         line = rule.format_line()
 
-        # Skip if already present in body
-        if line in result:
+        # Skip if already present as a standalone line in body
+        if line in result.splitlines():
             log.debug("Body rule '%s' already present — skipping", rule.key)
             continue
 
@@ -431,8 +429,7 @@ def apply_body_rules(
                 result += "\n"
             result += line
 
-        log.debug("✅ Inserted body rule: %s", line)
-        print(f"✅ Added {rule.key}: {rule.value} to commit body")
+        log.info("✅ Added body rule: %s: %s", rule.key, rule.value)
 
     return result
 
@@ -488,9 +485,14 @@ def apply_trailer_rules(
             )
             continue
 
-        # Skip if already present in existing trailers
-        if rule.key in existing_trailers:
-            log.debug("Trailer rule '%s' already present — skipping", rule.key)
+        # Skip if this exact key+value already present in existing trailers
+        existing_values = existing_trailers.get(rule.key, [])
+        if rule.value in existing_values:
+            log.debug(
+                "Trailer rule '%s: %s' already present — skipping",
+                rule.key,
+                rule.value,
+            )
             continue
 
         line = rule.format_line()
@@ -504,8 +506,7 @@ def apply_trailer_rules(
             continue
 
         to_insert.append(line)
-        log.debug("✅ Queued trailer rule: %s", line)
-        print(f"✅ Added {rule.key}: {rule.value} to commit trailers")
+        log.info("✅ Added trailer rule: %s: %s", rule.key, rule.value)
 
     # Prepend in order (insert at the beginning, before Issue-ID /
     # Signed-off-by / Change-Id that the caller adds afterwards).

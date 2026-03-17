@@ -27,9 +27,6 @@ from typing import ClassVar
 
 try:
     from rich.console import Console  # pyright: ignore[reportAssignmentType]
-    from rich.logging import (
-        RichHandler,  # pyright: ignore[reportAssignmentType]
-    )
 
     RICH_AVAILABLE = True
 except ImportError:
@@ -41,9 +38,6 @@ except ImportError:
 
         def print(self, *args: Any, **kwargs: Any) -> None:
             print(*args)
-
-    class RichHandler:  # type: ignore[no-redef]
-        pass
 
 
 class RichAwareLogger:
