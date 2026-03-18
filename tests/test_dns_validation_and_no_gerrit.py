@@ -96,10 +96,13 @@ class TestValidateGerritServer:
                 orch.validate_gerrit_server("bogus.invalid.example")
             assert exc_info.value.__cause__ is gaierror
 
-    def test_dns_failure_logs_warning_not_exception(
-        self, tmp_path: Path
-    ) -> None:
-        """DNS failure logs at WARNING level (not exception)."""
+    def test_dns_failure_logs_debug_not_exception(self, tmp_path: Path) -> None:
+        """DNS failure logs at DEBUG level (not exception).
+
+        The top-level CLI caller owns user-facing logging, so
+        validate_gerrit_server uses log.debug for the DNS failure
+        message to avoid duplicate warnings.
+        """
         orch = self._make_orchestrator(tmp_path)
         with (
             patch(
@@ -110,7 +113,17 @@ class TestValidateGerritServer:
         ):
             with pytest.raises(OrchestratorError):
                 orch.validate_gerrit_server("bogus.invalid.example")
-            mock_log.warning.assert_called_once()
+            mock_log.debug.assert_called()
+            # Verify exc_info=True is passed so the original
+            # exception is visible when DEBUG logging is enabled.
+            failure_calls = [
+                c
+                for c in mock_log.debug.call_args_list
+                if "could not be resolved" in str(c)
+            ]
+            assert failure_calls, "expected a 'could not be resolved' debug log"
+            assert failure_calls[0].kwargs.get("exc_info") is True
+            mock_log.warning.assert_not_called()
             mock_log.exception.assert_not_called()
 
 

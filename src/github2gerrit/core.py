@@ -1661,8 +1661,8 @@ class Orchestrator:
     def validate_gerrit_server(self, gerrit_host: str | None) -> None:
         """Validate that the Gerrit server hostname can be resolved via DNS.
 
-        This provides a fast-fail mechanism to catch invalid or unreachable
-        Gerrit servers early, before any work is done.
+        This provides a fast-fail mechanism to catch invalid or
+        unresolvable Gerrit server hostnames early, before any work is done.
 
         Args:
             gerrit_host: The Gerrit server hostname to validate.
@@ -1680,12 +1680,13 @@ class Orchestrator:
             socket.getaddrinfo(host, None)
             log.debug("DNS resolution for Gerrit host '%s' succeeded", host)
         except socket.gaierror as exc:
-            log.warning(
+            log.debug(
                 "Gerrit server '%s' could not be resolved via DNS. "
                 "This typically means either the server hostname is "
                 "incorrect or there is no Gerrit server associated "
                 "with this repository.",
                 host,
+                exc_info=True,
             )
             msg = f"DNS resolution failed for '{host}'"
             raise OrchestratorError(msg) from exc

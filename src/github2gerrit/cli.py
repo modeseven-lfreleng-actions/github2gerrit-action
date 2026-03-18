@@ -2707,7 +2707,7 @@ def _process() -> None:
     # Show summary after progress tracker is stopped
     if show_progress and RICH_AVAILABLE:
         summary = progress_tracker.get_summary() if progress_tracker else {}
-        print()
+        safe_console_print("")
         safe_console_print(
             "✅ Operation completed!"
             if pipeline_success
