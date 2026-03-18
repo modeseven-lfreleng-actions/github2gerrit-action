@@ -69,6 +69,10 @@ inputs:
     description: "Enable CI testing mode; overrides .gitreview, creates orphan commits"
     required: false
     default: "false"
+  G2G_NO_GERRIT:
+    description: "Run full pipeline without contacting Gerrit (forces DRY_RUN, suppresses cleanup)"
+    required: false
+    default: "false"
   FORCE:
     description: "Force PR closure regardless of Gerrit change status (abandoned, etc)"
     required: false
@@ -168,6 +172,14 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: "Checkout repository"
+      # yamllint disable-line rule:line-length
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      with:
+        fetch-depth: ${{ inputs.FETCH_DEPTH }}
+        # Ensure we are on the PR's head SHA when triggered by PR events
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
     - name: "Setup Python"
       # yamllint disable-line rule:line-length
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -179,14 +191,6 @@ runs:
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       with:
         enable-cache: false
-
-    - name: "Checkout repository"
-      # yamllint disable-line rule:line-length
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        fetch-depth: ${{ inputs.FETCH_DEPTH }}
-        # Ensure we are on the PR's head SHA when triggered by PR events
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
     - name: "Setup github2gerrit"
       shell: bash
@@ -338,6 +342,7 @@ runs:
         SYNC_ALL_OPEN_PRS: ${{ env.SYNC_ALL_OPEN_PRS }}
         PR_NUMBER: ${{ env.PR_NUMBER }}
         G2G_TEST_MODE: "false"
+        G2G_NO_GERRIT: ${{ inputs.G2G_NO_GERRIT }}
       run: |
         # Run github2gerrit Python CLI
         set -euo pipefail

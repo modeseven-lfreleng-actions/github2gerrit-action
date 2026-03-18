@@ -31,6 +31,9 @@ def _base_env() -> dict[str, str]:
         # Token not needed since we mock build_client for bulk mode
         "GITHUB_TOKEN": "dummy",
         "DRY_RUN": "true",
+        # Skip early DNS validation — tests mock the Gerrit layer,
+        # the derived placeholder hostname is not resolvable
+        "G2G_DRYRUN_DISABLE_NETWORK": "true",
         # Disable automation-only mode for tests
         "AUTOMATION_ONLY": "false",
     }
