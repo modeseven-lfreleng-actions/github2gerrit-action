@@ -114,7 +114,9 @@ def test_derive_repo_names_from_context_fallback(tmp_path: Path) -> None:
     assert names.project_github == "my-repo-name"
 
 
-def test_resolve_gerrit_info_prefers_gitreview(tmp_path: Path) -> None:
+def test_resolve_gerrit_info_prefers_gitreview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = init_repo(tmp_path / "repo4", default_branch="main")
     write_gitreview(
         repo,
@@ -127,6 +129,8 @@ def test_resolve_gerrit_info_prefers_gitreview(tmp_path: Path) -> None:
     assert gitreview is not None
     gh = _gh_ctx(repository="org/service-repo", owner="org")
     names = orch._derive_repo_names(gitreview, gh)
+    # Skip DNS validation — fake hostname is not resolvable
+    monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
     info = orch._resolve_gerrit_info(gitreview, _minimal_inputs(), names)
     # Should return the gitreview values directly
     assert info.host == "gerrit.example.net"
@@ -135,7 +139,7 @@ def test_resolve_gerrit_info_prefers_gitreview(tmp_path: Path) -> None:
 
 
 def test_resolve_gerrit_info_dry_run_uses_derived_project_when_missing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = init_repo(tmp_path / "repo5", default_branch="main")
     orch = Orchestrator(workspace=repo.path)
@@ -166,6 +170,8 @@ def test_resolve_gerrit_info_dry_run_uses_derived_project_when_missing(
         allow_duplicates=inputs.allow_duplicates,
         ci_testing=inputs.ci_testing,
     )
+    # Skip DNS validation — fake hostname is not resolvable
+    monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
     info = orch._resolve_gerrit_info(None, inputs, names)
     assert info.host == "gerrit.example.org"
     assert info.port == 29418

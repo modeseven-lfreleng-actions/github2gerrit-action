@@ -2134,11 +2134,6 @@ def _process() -> None:
     # also suppressed because they would hit a non-existent server.
     no_gerrit = env_bool("G2G_NO_GERRIT", False)
 
-    # G2G_TEST_MODE is an internal unit-test flag that short-circuits after
-    # config validation (no network at all).  It must also suppress the
-    # early DNS probe to avoid failures against placeholder hostnames.
-    g2g_test_mode = env_bool("G2G_TEST_MODE", False)
-
     if no_gerrit:
         log.info(
             "🧪 G2G_NO_GERRIT enabled: forcing DRY_RUN=true and "
@@ -2153,63 +2148,17 @@ def _process() -> None:
     # reflects the actual runtime values (e.g. DRY_RUN forced true).
     _display_effective_config(data, gh)
 
-    # --- Early Gerrit server DNS validation (fast-fail) ---
-    # Validate the Gerrit server BEFORE any PR processing or workspace setup.
-    # This prevents wasted work when the server is unreachable or bogus.
-    # Runs for both normal and DRY_RUN modes — DRY_RUN still queries Gerrit
-    # for read-only checks (preflight probes, cleanup scans) so the server
-    # must actually resolve.
-    #
-    # Skipped when:
-    # - G2G_NO_GERRIT: no real Gerrit server exists for this repository
-    # - G2G_TEST_MODE: internal unit-test short-circuit; never reaches Gerrit
-    # - G2G_DRYRUN_DISABLE_NETWORK: explicitly opted out of all network probes
-    #   (consistent with its effect inside _dry_run_preflight)
-    dryrun_disable_network = env_bool("G2G_DRYRUN_DISABLE_NETWORK", False)
-
-    if not no_gerrit and not g2g_test_mode and not dryrun_disable_network:
-        gerrit_host = data.gerrit_server or ""
-        # Only validate when a hostname is configured.  An empty
-        # GERRIT_SERVER is expected when the value will be derived
-        # later from .gitreview by the orchestrator; failing fast
-        # here would cause false negatives.  Whitespace-only values
-        # (truthy but blank after strip) ARE validated and caught.
-        if gerrit_host:
-            try:
-                _validator = Orchestrator(workspace=Path("."))
-                _validator.validate_gerrit_server(gerrit_host)
-                log.debug(
-                    "✅ Gerrit server '%s' DNS validation passed",
-                    gerrit_host.strip(),
-                )
-            except OrchestratorError as exc:
-                # Use stripped hostname for clean user-facing messages
-                stripped_host = gerrit_host.strip()
-                log.warning(
-                    "❌ Gerrit server validation failed for '%s'",
-                    stripped_host or "(empty)",
-                )
-                # Differentiate between missing/blank GERRIT_SERVER
-                # and actual DNS resolution failure for actionable output
-                if not stripped_host:
-                    error_message = (
-                        "❌ GERRIT_SERVER is empty or blank; "
-                        "cannot proceed without a valid Gerrit server"
-                    )
-                else:
-                    error_message = (
-                        f"❌ Gerrit server '{stripped_host}' could not "
-                        f"be resolved via DNS; cannot proceed without "
-                        f"a valid Gerrit server"
-                    )
-                # Do NOT call safe_console_print here --
-                # exit_with_error already displays the message via
-                # display_and_exit() to avoid duplicate user output.
-                exit_with_error(
-                    ExitCode.CONFIGURATION_ERROR,
-                    message=error_message,
-                    exception=exc,
-                )
+    # Log configured Gerrit server if present.  DNS validation is
+    # handled by Orchestrator._resolve_gerrit_info() which covers
+    # both explicit GERRIT_SERVER and .gitreview-derived hosts in
+    # a single, consolidated code path.
+    gerrit_host = data.gerrit_server or ""
+    if gerrit_host:
+        log.debug(
+            "Gerrit server '%s' configured; DNS validation "
+            "deferred to Orchestrator",
+            gerrit_host.strip(),
+        )
 
     # Detect PR operation mode for routing
     operation_mode = gh.get_operation_mode()
@@ -2228,13 +2177,25 @@ def _process() -> None:
             log.debug("✏️  PR edit event - will sync metadata to Gerrit change")
         elif operation_mode == models.PROperationMode.CLOSE:
             pr_num = gh.pr_number or "unknown"
-            log.debug(
-                "🚪 Pull request #%s closed; performing Gerrit cleanup",
-                pr_num,
-            )
-            safe_console_print(
-                f"🚪 Pull request #{pr_num} closed; performing Gerrit cleanup"
-            )
+            if no_gerrit:
+                log.debug(
+                    "🚪 Pull request #%s closed; Gerrit cleanup skipped "
+                    "(G2G_NO_GERRIT)",
+                    pr_num,
+                )
+                safe_console_print(
+                    f"🚪 Pull request #{pr_num} closed; "
+                    "Gerrit cleanup skipped (G2G_NO_GERRIT)"
+                )
+            else:
+                log.debug(
+                    "🚪 Pull request #%s closed; performing Gerrit cleanup",
+                    pr_num,
+                )
+                safe_console_print(
+                    f"🚪 Pull request #{pr_num} closed; "
+                    "performing Gerrit cleanup"
+                )
 
             # Debug log prerequisites for abandoning Gerrit change
             log.debug(
@@ -2351,10 +2312,14 @@ def _process() -> None:
         log.debug(merge_message)
         safe_console_print(merge_message)
 
-        force = env_bool("FORCE", False)
-        _process_close_gerrit_change(
-            data, gh, gerrit_event_change_url, force=force
-        )
+        # Skip in G2G_NO_GERRIT: Gerrit REST calls are not possible
+        if no_gerrit:
+            log.info("G2G_NO_GERRIT: skipping Gerrit change processing")
+        else:
+            force = env_bool("FORCE", False)
+            _process_close_gerrit_change(
+                data, gh, gerrit_event_change_url, force=force
+            )
 
         # Continue with cleanup tasks even if no PR was found/closed
         # (Gerrit change might not have originated from GitHub)
@@ -2363,9 +2328,15 @@ def _process() -> None:
     gerrit_change_url = os.getenv("G2G_GERRIT_CHANGE_URL") or ""
     if gerrit_change_url and not gerrit_event_change_url:
         log.info("🔄 Gerrit change URL provided: %s", gerrit_change_url)
-        log.info("Finding and closing source GitHub pull request")
-        force = env_bool("FORCE", False)
-        _process_close_gerrit_change(data, gh, gerrit_change_url, force=force)
+        # Skip in G2G_NO_GERRIT: Gerrit REST calls are not possible
+        if no_gerrit:
+            log.info("G2G_NO_GERRIT: skipping Gerrit change processing")
+        else:
+            log.info("Finding and closing source GitHub pull request")
+            force = env_bool("FORCE", False)
+            _process_close_gerrit_change(
+                data, gh, gerrit_change_url, force=force
+            )
 
         # Continue with cleanup tasks
 

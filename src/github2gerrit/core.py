@@ -116,12 +116,16 @@ log = logging.getLogger("github2gerrit.core")
 _MSG_ISSUE_ID_MULTILINE = "Issue ID must be single line"
 _MSG_MISSING_PR_CONTEXT = "missing PR context"
 _MSG_BAD_REPOSITORY_CONTEXT = "bad repository context"
-_MSG_MISSING_GERRIT_SERVER = "missing GERRIT_SERVER"
+_MSG_MISSING_GERRIT_SERVER = (
+    "Missing Gerrit host. Provide it via the GERRIT_SERVER "
+    "input/environment variable, .gitreview file, or action configuration."
+)
 _MSG_MISSING_GERRIT_PROJECT = "missing GERRIT_PROJECT"
 _MSG_PYGERRIT2_REQUIRED_REST = "pygerrit2 is required to query Gerrit REST API"
 _MSG_PYGERRIT2_REQUIRED_AUTH = "pygerrit2 is required for HTTP authentication"
 _MSG_PYGERRIT2_MISSING = "pygerrit2 missing"
 _MSG_PYGERRIT2_AUTH_MISSING = "pygerrit2 auth missing"
+_MSG_DNS_RESOLUTION_FAILED = "DNS resolution failed for '%s'"
 
 
 # Removed _insert_issue_id_into_commit_message - dead code
@@ -1679,7 +1683,7 @@ class Orchestrator:
         try:
             socket.getaddrinfo(host, None)
             log.debug("DNS resolution for Gerrit host '%s' succeeded", host)
-        except socket.gaierror as exc:
+        except (OSError, UnicodeError) as exc:
             log.debug(
                 "Gerrit server '%s' could not be resolved via DNS. "
                 "This typically means either the server hostname is "
@@ -1688,8 +1692,7 @@ class Orchestrator:
                 host,
                 exc_info=True,
             )
-            msg = f"DNS resolution failed for '{host}'"
-            raise OrchestratorError(msg) from exc
+            raise OrchestratorError(_MSG_DNS_RESOLUTION_FAILED % host) from exc
 
     def execute(
         self,
@@ -2091,7 +2094,15 @@ class Orchestrator:
         inputs: Inputs,
         repo: RepoNames,
     ) -> GerritInfo:
-        """Resolve Gerrit connection info from .gitreview or inputs."""
+        """Resolve Gerrit connection info from .gitreview or inputs.
+
+        After resolution, the Gerrit host is validated via DNS to
+        catch bogus hostnames early — regardless of whether the host
+        came from ``.gitreview`` or explicit ``GERRIT_SERVER`` input.
+
+        DNS validation is skipped when ``G2G_DRYRUN_DISABLE_NETWORK``
+        is set, consistent with the preflight and CLI-level guards.
+        """
         log.debug(
             "_resolve_gerrit_info: inputs.ci_testing=%s", inputs.ci_testing
         )
@@ -2104,6 +2115,7 @@ class Orchestrator:
 
         if gitreview:
             log.debug("Using .gitreview settings: %s", gitreview)
+            self._validate_resolved_gerrit_host(gitreview.host)
             return gitreview
 
         host = inputs.gerrit_server.strip()
@@ -2134,7 +2146,23 @@ class Orchestrator:
 
         info = make_gitreview_info(host=host, port=port, project=project)
         log.debug("Resolved Gerrit info: %s", info)
+        self._validate_resolved_gerrit_host(info.host)
         return info
+
+    def _validate_resolved_gerrit_host(self, host: str | None) -> None:
+        """Validate a resolved Gerrit host via DNS unless network is disabled.
+
+        Delegates to :meth:`validate_gerrit_server` for the actual DNS
+        check.  Skipped when ``G2G_DRYRUN_DISABLE_NETWORK`` is set so
+        that offline / test scenarios are not penalised.
+        """
+        if env_bool("G2G_DRYRUN_DISABLE_NETWORK", False):
+            log.debug(
+                "Skipping DNS validation for '%s' (G2G_DRYRUN_DISABLE_NETWORK)",
+                host,
+            )
+            return
+        self.validate_gerrit_server(host)
 
     def _setup_ssh(self, inputs: Inputs, gerrit: GerritInfo) -> None:
         """Set up temporary SSH configuration for Gerrit access.
@@ -5805,15 +5833,8 @@ class Orchestrator:
                 )
             return
 
-        # DNS resolution for Gerrit host
-        try:
-            socket.getaddrinfo(gerrit.host, None)
-            log.debug(
-                "DNS resolution for Gerrit host '%s' succeeded", gerrit.host
-            )
-        except Exception as exc:
-            msg = "DNS resolution failed"
-            raise OrchestratorError(msg) from exc
+        # DNS resolution for Gerrit host (reuses validate_gerrit_server)
+        self.validate_gerrit_server(gerrit.host)
 
         # SSH (TCP) reachability on Gerrit port
         try:
