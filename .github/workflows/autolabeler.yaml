@@ -55,23 +55,5 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      - name: 'Show concurrency group'
-        shell: bash
-        # yamllint disable rule:line-length
-        run: |
-          # Show concurrency group
-          GROUP="${{ format('al-{0}-pr-{1}', github.event_name, github.event.pull_request.number) }}"
-          {
-            echo '## Autolabeler'
-            echo "Concurrency group: ${GROUP}"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Concurrency group: ${GROUP}"
-        # yamllint enable rule:line-length
-
-      - name: 'Autolabel PR'
-        # yamllint disable-line rule:line-length
-        uses: release-drafter/release-drafter@44a942e465867c7465b76aa808ddca6e0acae5da # v7.1.0
-        with:
-          disable-releaser: true
-        env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      # yamllint disable-line rule:line-length
+      - uses: release-drafter/release-drafter/autolabeler@44a942e465867c7465b76aa808ddca6e0acae5da # v7.1.0
