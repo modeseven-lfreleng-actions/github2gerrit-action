@@ -144,7 +144,14 @@ jobs:
         env:
           # Use invalid token to force GitHub API failure
           GITHUB_TOKEN: "invalid_token_12345"
+          # NOTE: GITHUB_EVENT_NAME cannot be reliably overridden at
+          # step level when the runner sets it (e.g. push-triggered
+          # workflows). Instead we disable the push-event cleanup path
+          # via CLOSE_MERGED_PRS and clear GITHUB_EVENT_PATH so the
+          # tool enters the single-PR processing path where invalid
+          # token errors are properly surfaced with exit code 4.
           GITHUB_EVENT_NAME: 'workflow_dispatch'
+          GITHUB_EVENT_PATH: ''
           GITHUB_REPOSITORY: "${{ github.repository }}"
           GITHUB_REPOSITORY_OWNER: "${{ github.repository_owner }}"
           GITHUB_SERVER_URL: "${{ github.server_url }}"
@@ -153,6 +160,8 @@ jobs:
           GERRIT_KNOWN_HOSTS: "${{ vars.GERRIT_KNOWN_HOSTS }}"
           GERRIT_SSH_PRIVKEY_G2G: "${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}"
           DRY_RUN: 'true'
+          CLOSE_MERGED_PRS: 'false'
+          SYNC_ALL_OPEN_PRS: 'false'
         run: |
           echo "Testing GitHub API error handling with invalid token..."
           echo "Target PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
