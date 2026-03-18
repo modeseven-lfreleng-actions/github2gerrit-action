@@ -13,7 +13,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: "rd-push-${{ github.ref }}"
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -31,21 +31,5 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      - name: 'Show concurrency group'
-        shell: bash
-        run: |
-          # Show concurrency group
-          GROUP="rd-push-${{ github.ref }}"
-          {
-            echo '## Release Drafter'
-            echo "Concurrency group: ${GROUP}"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Concurrency group: ${GROUP}"
-
-      - name: 'Update draft release'
-        # yamllint disable-line rule:line-length
-        uses: release-drafter/release-drafter@44a942e465867c7465b76aa808ddca6e0acae5da # v7.1.0
-        with:
-          disable-autolabeler: true
-        env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      # yamllint disable-line rule:line-length
+      - uses: release-drafter/release-drafter@44a942e465867c7465b76aa808ddca6e0acae5da # v7.1.0
