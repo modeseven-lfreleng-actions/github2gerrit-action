@@ -6,6 +6,7 @@
 import socket
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -52,7 +53,9 @@ class TestSSRFProtection:
             orchestrator._validate_hostname_against_ssrf(subdomain)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_private_ipv4(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_private_ipv4(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that private IPv4 addresses are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -69,7 +72,9 @@ class TestSSRFProtection:
         assert "192.168.1.1" in str(exc_info.value)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_loopback_ipv4(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_loopback_ipv4(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that loopback IPv4 addresses are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -86,7 +91,9 @@ class TestSSRFProtection:
         assert "127.0.0.1" in str(exc_info.value)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_private_ipv6(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_private_ipv6(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that private IPv6 addresses are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -105,7 +112,9 @@ class TestSSRFProtection:
         assert "fc00::1" in str(exc_info.value)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_link_local_ipv6(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_link_local_ipv6(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that link-local IPv6 addresses are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -124,7 +133,9 @@ class TestSSRFProtection:
         assert "fe80::1" in str(exc_info.value)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_carrier_grade_nat(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_carrier_grade_nat(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that carrier-grade NAT addresses are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -142,7 +153,8 @@ class TestSSRFProtection:
 
     @patch("socket.getaddrinfo")
     def test_validate_hostname_blocks_mixed_ips_when_any_blocked(
-        self, mock_getaddrinfo
+        self,
+        mock_getaddrinfo: MagicMock,
     ):
         """Test that hostname is blocked if ANY resolved IP is blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -175,7 +187,9 @@ class TestSSRFProtection:
         assert "192.168.1.1" in error_msg  # Should show blocked IP
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_allows_public_ips(self, mock_getaddrinfo):
+    def test_validate_hostname_allows_public_ips(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that public IP addresses are allowed."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -191,7 +205,8 @@ class TestSSRFProtection:
 
     @patch("socket.getaddrinfo")
     def test_validate_hostname_blocks_documentation_ranges(
-        self, mock_getaddrinfo
+        self,
+        mock_getaddrinfo: MagicMock,
     ):
         """Test that documentation IP ranges are blocked."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -222,7 +237,8 @@ class TestSSRFProtection:
 
     @patch("socket.getaddrinfo")
     def test_validate_hostname_handles_dns_resolution_failure(
-        self, mock_getaddrinfo
+        self,
+        mock_getaddrinfo: MagicMock,
     ):
         """Test that DNS resolution failures are handled gracefully."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -239,7 +255,9 @@ class TestSSRFProtection:
         assert "Cannot resolve hostname" in str(exc_info.value)
 
     @patch("socket.getaddrinfo")
-    def test_validate_hostname_blocks_malformed_ips(self, mock_getaddrinfo):
+    def test_validate_hostname_blocks_malformed_ips(
+        self, mock_getaddrinfo: MagicMock
+    ):
         """Test that malformed IP addresses are blocked for safety."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             orchestrator = Orchestrator(workspace=Path(tmp_dir))
@@ -268,7 +286,8 @@ class TestSSRFProtection:
 
     @patch("socket.getaddrinfo")
     def test_validate_and_get_api_base_url_github_enterprise(
-        self, mock_getaddrinfo
+        self,
+        mock_getaddrinfo: MagicMock,
     ):
         """Test that GitHub Enterprise URLs are validated and handled correctly."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -293,7 +312,8 @@ class TestSSRFProtection:
 
     @patch("socket.getaddrinfo")
     def test_validate_and_get_api_base_url_github_enterprise_success(
-        self, mock_getaddrinfo
+        self,
+        mock_getaddrinfo: MagicMock,
     ):
         """Test successful GitHub Enterprise URL validation."""
         with tempfile.TemporaryDirectory() as tmp_dir:
