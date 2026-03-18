@@ -43,7 +43,7 @@ def _minimal_inputs() -> Inputs:
         dry_run=False,
         normalise_commit=True,
         gerrit_server="gerrit.example.org",
-        gerrit_server_port="29418",
+        gerrit_server_port=29418,
         gerrit_project="example/project",
         issue_id="",
         issue_id_lookup_json="",
