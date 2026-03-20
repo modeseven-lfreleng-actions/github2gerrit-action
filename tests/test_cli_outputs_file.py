@@ -111,6 +111,9 @@ def _base_env_with_event(tmp_path: Path) -> dict[str, str]:
         "GITHUB_HEAD_REF": "feature",
         # Ensure real execution path (not short-circuited)
         "G2G_TEST_MODE": "false",
+        # Skip early DNS validation — tests mock the Gerrit layer,
+        # the derived placeholder hostname is not resolvable
+        "G2G_DRYRUN_DISABLE_NETWORK": "true",
         # Disable automation-only mode for tests
         "AUTOMATION_ONLY": "false",
     }
@@ -216,6 +219,8 @@ def test_multi_pr_url_mode_writes_aggregated_outputs(
         "GITHUB_TOKEN": "dummy",
         "DRY_RUN": "true",
         "G2G_TEST_MODE": "false",
+        # Skip early DNS validation — tests mock the Gerrit layer
+        "G2G_DRYRUN_DISABLE_NETWORK": "true",
         "GITHUB_OUTPUT": str(outputs_file),
     }
 

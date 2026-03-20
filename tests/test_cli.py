@@ -180,6 +180,9 @@ def test_no_pr_context_exits_2(tmp_path: Path) -> None:
     env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
     # Disable test mode to ensure non-zero exit on missing PR context
     env.pop("G2G_TEST_MODE", None)
+    # Skip early DNS validation — this test targets PR context validation,
+    # not network reachability of the derived placeholder hostname
+    env["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
     # Force non-bulk path to avoid GitHub API token requirement
     env["SYNC_ALL_OPEN_PRS"] = "false"
     # Set PR_NUMBER to empty to trigger validation error
@@ -238,6 +241,9 @@ def test_validation_fails_when_no_organization_and_missing_gerrit_params(
     env.pop("GITHUB_EVENT_NAME", None)
     # Disable test mode to ensure validation errors are properly caught
     env.pop("G2G_TEST_MODE", None)
+    # Skip early DNS validation — this test targets input validation,
+    # not network reachability of placeholder hostnames
+    env["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
     # Use empty config file to avoid interference from real config
     empty_config = tmp_path / "config.txt"
     empty_config.write_text("", encoding="utf-8")
@@ -294,6 +300,9 @@ def test_validation_local_cli_requires_derivation_disabled(
     env["G2G_ENABLE_DERIVATION"] = "false"  # Explicitly disable derivation
     # Disable test mode to see validation behavior
     env.pop("G2G_TEST_MODE", None)
+    # Skip early DNS validation — this test targets derivation validation,
+    # not network reachability of placeholder hostnames
+    env["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
     # Use empty config file to avoid interference from real config
     empty_config = tmp_path / "config.txt"
     empty_config.write_text("", encoding="utf-8")

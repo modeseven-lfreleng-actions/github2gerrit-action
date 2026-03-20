@@ -2126,7 +2126,39 @@ def _process() -> None:
         raise converted_error from exc
 
     gh = _read_github_context()
+
+    # --- G2G_NO_GERRIT: leverage DRY_RUN infrastructure ---
+    # G2G_NO_GERRIT reuses the existing DRY_RUN + G2G_DRYRUN_DISABLE_NETWORK
+    # code paths so that all tool logic runs but Gerrit network operations
+    # are no-ops.  Cleanup tasks (abandoned-PR / Gerrit-change sweeps) are
+    # also suppressed because they would hit a non-existent server.
+    no_gerrit = env_bool("G2G_NO_GERRIT", False)
+
+    if no_gerrit:
+        log.info(
+            "🧪 G2G_NO_GERRIT enabled: forcing DRY_RUN=true and "
+            "G2G_DRYRUN_DISABLE_NETWORK=true"
+        )
+        os.environ["DRY_RUN"] = "true"
+        os.environ["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
+        # Rebuild inputs so the rest of the pipeline sees dry_run=True
+        data = _load_effective_inputs()
+
+    # Display config AFTER G2G_NO_GERRIT evaluation so the table
+    # reflects the actual runtime values (e.g. DRY_RUN forced true).
     _display_effective_config(data, gh)
+
+    # Log configured Gerrit server if present.  DNS validation is
+    # handled by Orchestrator._resolve_gerrit_info() which covers
+    # both explicit GERRIT_SERVER and .gitreview-derived hosts in
+    # a single, consolidated code path.
+    gerrit_host = data.gerrit_server or ""
+    if gerrit_host:
+        log.debug(
+            "Gerrit server '%s' configured; DNS validation "
+            "deferred to Orchestrator",
+            gerrit_host.strip(),
+        )
 
     # Detect PR operation mode for routing
     operation_mode = gh.get_operation_mode()
@@ -2145,13 +2177,25 @@ def _process() -> None:
             log.debug("✏️  PR edit event - will sync metadata to Gerrit change")
         elif operation_mode == models.PROperationMode.CLOSE:
             pr_num = gh.pr_number or "unknown"
-            log.debug(
-                "🚪 Pull request #%s closed; performing Gerrit cleanup",
-                pr_num,
-            )
-            safe_console_print(
-                f"🚪 Pull request #{pr_num} closed; performing Gerrit cleanup"
-            )
+            if no_gerrit:
+                log.debug(
+                    "🚪 Pull request #%s closed; Gerrit cleanup skipped "
+                    "(G2G_NO_GERRIT)",
+                    pr_num,
+                )
+                safe_console_print(
+                    f"🚪 Pull request #{pr_num} closed; "
+                    "Gerrit cleanup skipped (G2G_NO_GERRIT)"
+                )
+            else:
+                log.debug(
+                    "🚪 Pull request #%s closed; performing Gerrit cleanup",
+                    pr_num,
+                )
+                safe_console_print(
+                    f"🚪 Pull request #{pr_num} closed; "
+                    "performing Gerrit cleanup"
+                )
 
             # Debug log prerequisites for abandoning Gerrit change
             log.debug(
@@ -2164,8 +2208,10 @@ def _process() -> None:
             )
 
             # First, abandon the specific Gerrit change for this closed PR
+            # Skip in G2G_NO_GERRIT: no Gerrit server to query
             if (
-                gh.pr_number
+                not no_gerrit
+                and gh.pr_number
                 and data.gerrit_server
                 and data.gerrit_project
                 and gh.repository
@@ -2209,7 +2255,8 @@ def _process() -> None:
                     )
 
             # Run abandoned PR cleanup if enabled
-            if FORCE_ABANDONED_CLEANUP:
+            # Skip in G2G_NO_GERRIT: no Gerrit server to query
+            if FORCE_ABANDONED_CLEANUP and not no_gerrit:
                 try:
                     log.debug("Running abandoned PR cleanup...")
                     if gh.repository and "/" in gh.repository:
@@ -2225,7 +2272,8 @@ def _process() -> None:
                     log.warning("Abandoned PR cleanup failed: %s", exc)
 
             # Run Gerrit cleanup if enabled
-            if FORCE_GERRIT_CLEANUP:
+            # Skip in G2G_NO_GERRIT: no Gerrit server to query
+            if FORCE_GERRIT_CLEANUP and not no_gerrit:
                 try:
                     log.debug("Running Gerrit cleanup for closed GitHub PRs...")
                     if data.gerrit_server and data.gerrit_project:
@@ -2264,10 +2312,14 @@ def _process() -> None:
         log.debug(merge_message)
         safe_console_print(merge_message)
 
-        force = env_bool("FORCE", False)
-        _process_close_gerrit_change(
-            data, gh, gerrit_event_change_url, force=force
-        )
+        # Skip in G2G_NO_GERRIT: Gerrit REST calls are not possible
+        if no_gerrit:
+            log.info("G2G_NO_GERRIT: skipping Gerrit change processing")
+        else:
+            force = env_bool("FORCE", False)
+            _process_close_gerrit_change(
+                data, gh, gerrit_event_change_url, force=force
+            )
 
         # Continue with cleanup tasks even if no PR was found/closed
         # (Gerrit change might not have originated from GitHub)
@@ -2276,16 +2328,23 @@ def _process() -> None:
     gerrit_change_url = os.getenv("G2G_GERRIT_CHANGE_URL") or ""
     if gerrit_change_url and not gerrit_event_change_url:
         log.info("🔄 Gerrit change URL provided: %s", gerrit_change_url)
-        log.info("Finding and closing source GitHub pull request")
-        force = env_bool("FORCE", False)
-        _process_close_gerrit_change(data, gh, gerrit_change_url, force=force)
+        # Skip in G2G_NO_GERRIT: Gerrit REST calls are not possible
+        if no_gerrit:
+            log.info("G2G_NO_GERRIT: skipping Gerrit change processing")
+        else:
+            log.info("Finding and closing source GitHub pull request")
+            force = env_bool("FORCE", False)
+            _process_close_gerrit_change(
+                data, gh, gerrit_change_url, force=force
+            )
 
         # Continue with cleanup tasks
 
     # Run cleanup tasks for Gerrit events and legacy G2G_GERRIT_CHANGE_URL
     if gerrit_event_change_url or gerrit_change_url:
         # Run abandoned PR cleanup if enabled
-        if FORCE_ABANDONED_CLEANUP:
+        # Skip in G2G_NO_GERRIT: no Gerrit server to query
+        if FORCE_ABANDONED_CLEANUP and not no_gerrit:
             try:
                 log.debug("Running abandoned PR cleanup...")
                 if gh.repository and "/" in gh.repository:
@@ -2301,7 +2360,8 @@ def _process() -> None:
                 log.warning("Abandoned PR cleanup failed: %s", exc)
 
         # Run Gerrit cleanup if enabled
-        if FORCE_GERRIT_CLEANUP:
+        # Skip in G2G_NO_GERRIT: no Gerrit server to query
+        if FORCE_GERRIT_CLEANUP and not no_gerrit:
             try:
                 log.debug("Running Gerrit cleanup for closed GitHub PRs...")
                 if data.gerrit_server and data.gerrit_project:
@@ -2322,7 +2382,8 @@ def _process() -> None:
         _process_close_merged_prs(data, gh)
 
         # Run abandoned PR cleanup if enabled
-        if FORCE_ABANDONED_CLEANUP:
+        # Skip in G2G_NO_GERRIT: no Gerrit server to query
+        if FORCE_ABANDONED_CLEANUP and not no_gerrit:
             try:
                 log.debug("Running abandoned PR cleanup...")
                 if gh.repository and "/" in gh.repository:
@@ -2338,7 +2399,8 @@ def _process() -> None:
                 log.warning("Abandoned PR cleanup failed: %s", exc)
 
         # Run Gerrit cleanup if enabled
-        if FORCE_GERRIT_CLEANUP:
+        # Skip in G2G_NO_GERRIT: no Gerrit server to query
+        if FORCE_GERRIT_CLEANUP and not no_gerrit:
             try:
                 log.info("Running Gerrit cleanup for closed GitHub PRs...")
                 if data.gerrit_server and data.gerrit_project:
@@ -2383,7 +2445,8 @@ def _process() -> None:
             log.debug("Processing completed ✅")
 
             # Run abandoned PR cleanup if enabled
-            if FORCE_ABANDONED_CLEANUP:
+            # Skip in G2G_NO_GERRIT: no Gerrit server to query
+            if FORCE_ABANDONED_CLEANUP and not no_gerrit:
                 try:
                     log.debug("Running abandoned PR cleanup...")
                     if gh.repository and "/" in gh.repository:
@@ -2399,7 +2462,8 @@ def _process() -> None:
                     log.warning("Abandoned PR cleanup failed: %s", exc)
 
             # Run Gerrit cleanup if enabled
-            if FORCE_GERRIT_CLEANUP:
+            # Skip in G2G_NO_GERRIT: no Gerrit server to query
+            if FORCE_GERRIT_CLEANUP and not no_gerrit:
                 try:
                     log.info("Running Gerrit cleanup for closed GitHub PRs...")
                     if data.gerrit_server and data.gerrit_project:
@@ -2567,7 +2631,8 @@ def _process() -> None:
     pipeline_success, result = _process_single(data, gh, progress_tracker)
 
     # Run abandoned PR cleanup if enabled and pipeline was successful
-    if pipeline_success and FORCE_ABANDONED_CLEANUP:
+    # Skip in G2G_NO_GERRIT: no Gerrit server to query
+    if pipeline_success and FORCE_ABANDONED_CLEANUP and not no_gerrit:
         try:
             log.debug("Running abandoned PR cleanup...")
             # Extract owner and repo from gh.repository (format: "owner/repo")
@@ -2585,7 +2650,8 @@ def _process() -> None:
             log.warning("Abandoned PR cleanup failed: %s", exc)
 
     # Run Gerrit cleanup if enabled and pipeline was successful
-    if pipeline_success and FORCE_GERRIT_CLEANUP:
+    # Skip in G2G_NO_GERRIT: no Gerrit server to query
+    if pipeline_success and FORCE_GERRIT_CLEANUP and not no_gerrit:
         try:
             log.debug("Running Gerrit cleanup for closed GitHub PRs...")
             if data.gerrit_server and data.gerrit_project:
@@ -2612,10 +2678,11 @@ def _process() -> None:
     # Show summary after progress tracker is stopped
     if show_progress and RICH_AVAILABLE:
         summary = progress_tracker.get_summary() if progress_tracker else {}
+        safe_console_print("")
         safe_console_print(
-            "\n✅ Operation completed!"
+            "✅ Operation completed!"
             if pipeline_success
-            else "\n❌ Operation failed!",
+            else "❌ Operation failed!",
             style="green" if pipeline_success else "red",
         )
         safe_console_print(
@@ -2864,6 +2931,9 @@ def _get_ssh_agent_status() -> str:
 
 def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     """Display effective configuration in a formatted table."""
+    # Use env_bool for consistent boolean parsing across the codebase
+    no_gerrit_enabled = env_bool("G2G_NO_GERRIT", False)
+
     # Detect mode and display prominently
     github_mode = _is_github_mode()
     mode_label = "GITHUB_MODE" if github_mode else "CLI_MODE"
@@ -2923,6 +2993,11 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
 
     # Mode first - always show
     config_info[mode_label] = mode_description
+
+    # Show G2G_NO_GERRIT regardless of operation mode so logs always
+    # indicate when the run is using test infrastructure.
+    if no_gerrit_enabled:
+        config_info["G2G_NO_GERRIT"] = "🧪"
 
     if is_closing_pr_mode:
         # In PR closing mode, only show minimal relevant config
