@@ -29,8 +29,7 @@ concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   repository-metadata:
@@ -145,6 +144,7 @@ jobs:
         uses: lfreleng-actions/python-audit-action@1776538e768c52c55c3c96495f6e25f0762ad28f  # v0.2.6
         with:
           python_version: "${{ matrix.python-version }}"
+          permit_fail: "${{ vars.NO_BLOCK_AUDIT_FAIL == 'true' }}"
 
   sbom:
     name: 'Generate SBOM'
@@ -233,7 +233,9 @@ jobs:
             fi
 
       - name: "Check Grype scan results"
-        if: steps.grype-sarif.outcome == 'failure'
+        if: >-
+          steps.grype-sarif.outcome == 'failure'
+          && vars.NO_BLOCK_AUDIT_FAIL != 'true'
         run: |
             # Check Grype scan results
             echo "::error::Grype found vulnerabilities" \
