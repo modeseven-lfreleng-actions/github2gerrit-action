@@ -157,6 +157,10 @@ inputs:
     description: "Create a Gerrit change when an UPDATE operation cannot find an existing one"
     required: false
     default: "false"
+  G2G_DISABLED:
+    description: "Set to 'true' to disable the action entirely (exits successfully with a message)"
+    required: false
+    default: ""
 
 outputs:
   gerrit_change_request_url:
@@ -172,7 +176,34 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: "Check if GitHub2Gerrit is disabled"
+      id: disabled-check
+      shell: bash
+      run: |
+        # Check if GitHub2Gerrit is disabled
+        set -euo pipefail
+        DISABLED_ENV="${G2G_DISABLED:-}"
+        DISABLED_INPUT="${{ inputs.G2G_DISABLED }}"
+        # Normalize: accept the same truthy set as env_bool()
+        # (1/true/yes/on, case-insensitive, trimmed)
+        _normalize() {
+          printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | xargs
+        }
+        _is_truthy() {
+          case "$(_normalize "$1")" in
+            1|true|yes|on) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        if _is_truthy "${DISABLED_ENV}" || _is_truthy "${DISABLED_INPUT}"; then
+          echo "🛑 GitHub2Gerrit is disabled by check of G2G_DISABLED variable or input"
+          echo "disabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "disabled=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: "Checkout repository"
+      if: steps.disabled-check.outputs.disabled != 'true'
       # yamllint disable-line rule:line-length
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
@@ -181,18 +212,21 @@ runs:
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
     - name: "Setup Python"
+      if: steps.disabled-check.outputs.disabled != 'true'
       # yamllint disable-line rule:line-length
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
       with:
         python-version-file: '${{ github.action_path }}/pyproject.toml'
 
     - name: "Setup uv"
+      if: steps.disabled-check.outputs.disabled != 'true'
       # yamllint disable-line rule:line-length
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
       with:
         enable-cache: false
 
     - name: "Setup github2gerrit"
+      if: steps.disabled-check.outputs.disabled != 'true'
       shell: bash
       env:
         # Provide version for hatch-vcs (via setuptools-scm)
@@ -214,7 +248,7 @@ runs:
 
     - name: "Validate PR_NUMBER usage"
       # yamllint disable-line rule:line-length
-      if: ${{ github.event_name != 'workflow_dispatch' && inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0' }}
+      if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name != 'workflow_dispatch' && inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0' }}
       shell: bash
       run: |
         # Validate PR_NUMBER usage
@@ -223,7 +257,7 @@ runs:
         exit 2
 
     - name: "Normalize PR_NUMBER"
-      if: ${{ github.event_name == 'workflow_dispatch' }}
+      if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name == 'workflow_dispatch' }}
       shell: bash
       run: |
         # Normalize PR_NUMBER
@@ -243,6 +277,7 @@ runs:
         fi
 
     - name: "Extract PR number, validate context"
+      if: steps.disabled-check.outputs.disabled != 'true'
       shell: bash
       run: |
         # Extract PR number, validate context
@@ -284,6 +319,7 @@ runs:
         fi
 
     - name: "Run github2gerrit Python CLI"
+      if: steps.disabled-check.outputs.disabled != 'true'
       id: run-cli
       shell: bash
       env:
@@ -357,6 +393,7 @@ runs:
         fi
 
     - name: "Capture outputs"
+      if: steps.disabled-check.outputs.disabled != 'true'
       id: capture-outputs
       shell: bash
       # yamllint disable rule:line-length

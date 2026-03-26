@@ -235,19 +235,7 @@ markers = [
 
 [tool.pyright]
 pythonVersion = "3.11"
-include = ["src", "tests"]
-exclude = [
-  "build/",
-  "dist/",
-  "docs/",
-  "scripts/",
-  "tests/fixtures/",
-  ".venv/",
-  ".mypy_cache/",
-  ".pytest_cache/",
-  ".ruff_cache/",
-  "coverage_html_report/",
-]
+include = ["src"]
 typeCheckingMode = "strict"
 reportMissingImports = "none"
 reportMissingTypeStubs = "none"

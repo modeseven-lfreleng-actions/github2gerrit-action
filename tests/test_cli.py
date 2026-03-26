@@ -156,6 +156,55 @@ def test_missing_required_inputs_exits_2(tmp_path: Path) -> None:
     assert "Missing required input" in error_output
 
 
+def test_disabled_variable_true_exits_0(tmp_path: Path) -> None:
+    """Setting G2G_DISABLED=true should exit 0 with a message."""
+    env = _base_env(tmp_path)
+    env["G2G_DISABLED"] = "true"
+
+    result = runner.invoke(app, [], env=env)
+    assert result.exit_code == 0
+    output = _get_combined_output(result)
+    assert (
+        "GitHub2Gerrit is disabled by check of G2G_DISABLED variable" in output
+    )
+
+
+def test_disabled_variable_false_does_not_exit_early(tmp_path: Path) -> None:
+    """Setting G2G_DISABLED=false should not trigger the disabled check."""
+    env = _base_env(tmp_path)
+    env["G2G_DISABLED"] = "false"
+
+    result = runner.invoke(app, [], env=env)
+    assert result.exit_code == 0
+    output = _get_combined_output(result)
+    assert "GitHub2Gerrit is disabled" not in output
+    assert "Validation complete" in output
+
+
+def test_disabled_variable_absent_does_not_exit_early(tmp_path: Path) -> None:
+    """When G2G_DISABLED is not set, the disabled check should not trigger."""
+    env = _base_env(tmp_path)
+    env.pop("G2G_DISABLED", None)
+
+    result = runner.invoke(app, [], env=env)
+    assert result.exit_code == 0
+    output = _get_combined_output(result)
+    assert "GitHub2Gerrit is disabled" not in output
+    assert "Validation complete" in output
+
+
+def test_disabled_variable_empty_does_not_exit_early(tmp_path: Path) -> None:
+    """An empty G2G_DISABLED should not trigger the disabled check."""
+    env = _base_env(tmp_path)
+    env["G2G_DISABLED"] = ""
+
+    result = runner.invoke(app, [], env=env)
+    assert result.exit_code == 0
+    output = _get_combined_output(result)
+    assert "GitHub2Gerrit is disabled" not in output
+    assert "Validation complete" in output
+
+
 def test_parses_pr_number_and_returns_zero(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
     # Ensure non-conflicting options and sane defaults
