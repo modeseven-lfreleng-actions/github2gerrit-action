@@ -845,6 +845,14 @@ def main(
             typer.echo("Version information not available")
         sys.exit(int(ExitCode.SUCCESS))
 
+    # Check if GitHub2Gerrit is disabled via environment variable
+    if env_bool("G2G_DISABLED"):
+        typer.echo(
+            "\U0001f6d1 GitHub2Gerrit is disabled by check of "
+            "G2G_DISABLED variable"
+        )
+        sys.exit(int(ExitCode.SUCCESS))
+
     # Override boolean parameters with properly parsed environment variables.
     # This ensures that string "false" from GitHub Actions is handled
     # correctly (Typer/Click treats any non-empty string as truthy).
