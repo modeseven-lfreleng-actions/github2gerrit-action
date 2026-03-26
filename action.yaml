@@ -182,9 +182,21 @@ runs:
       run: |
         # Check if GitHub2Gerrit is disabled
         set -euo pipefail
-        DISABLED="${G2G_DISABLED:-${{ inputs.G2G_DISABLED }}}"
-        if [[ "${DISABLED}" == "true" ]]; then
-          echo "🛑 GitHub2Gerrit is disabled by check of G2G_DISABLED variable"
+        DISABLED_ENV="${G2G_DISABLED:-}"
+        DISABLED_INPUT="${{ inputs.G2G_DISABLED }}"
+        # Normalize: accept the same truthy set as env_bool()
+        # (1/true/yes/on, case-insensitive, trimmed)
+        _normalize() {
+          printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | xargs
+        }
+        _is_truthy() {
+          case "$(_normalize "$1")" in
+            1|true|yes|on) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        if _is_truthy "${DISABLED_ENV}" || _is_truthy "${DISABLED_INPUT}"; then
+          echo "🛑 GitHub2Gerrit is disabled by check of G2G_DISABLED variable or input"
           echo "disabled=true" >> "$GITHUB_OUTPUT"
         else
           echo "disabled=false" >> "$GITHUB_OUTPUT"
