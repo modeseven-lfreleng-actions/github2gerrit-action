@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 ci:
-  skip: [pytest]
+  skip: [pytest, gha-workflow-linter]
   autofix_commit_msg: |
     Chore: pre-commit autofixes
 
@@ -76,13 +76,6 @@ repos:
           - types-PyYAML
           - types-requests
 
-  # Doesn't seem to run reliably inside pre-commit.ci
-  # - repo: https://github.com/RobertCraigie/pyright-python
-  #   rev: d393df1703a808473b84bd14a2702f4793014031  # frozen: v1.1.404
-  #   hooks:
-  #     - id: pyright
-  #       files: ^(src|scripts|tests)/.+\.py$
-
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
     hooks:
@@ -119,6 +112,18 @@ repos:
     rev: 2ccb47ff45ad361a21071a7eedda4c37e6ae8c5a  # frozen: v2.4.2
     hooks:
       - id: codespell
+
+  # Requires a mirror, primary repo lacks .pre-commit-hooks.yaml
+  - repo: https://github.com/DetachHead/basedpyright-prek-mirror
+    rev: d58fe7fc44458fa7e41e2d38c04598a3c87833f2  # frozen: 1.38.3
+    hooks:
+      - id: basedpyright
+        files: ^src/.+\.py$
+
+  - repo: https://github.com/lfreleng-actions/gha-workflow-linter
+    rev: a7caf8f3a1a05688d1cee46615ff94def617e5a3  # frozen: v1.0.2
+    hooks:
+      - id: gha-workflow-linter
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: 8db279a37c552206d2df62269ff6f9d31125815a  # frozen: 0.37.0
