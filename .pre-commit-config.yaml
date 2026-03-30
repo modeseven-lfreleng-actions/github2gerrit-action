@@ -59,7 +59,7 @@ repos:
         types: [yaml]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: e05c5c0818279e5ac248ac9e954431ba58865e61  # frozen: v0.15.7
+    rev: aca6d4c8045a504e2812ea4bedff1d0a09e437bc  # frozen: v0.15.8
     hooks:
       - id: ruff
         files: ^(src|scripts|tests)/.+\.py$
@@ -115,7 +115,7 @@ repos:
 
   # Requires a mirror, primary repo lacks .pre-commit-hooks.yaml
   - repo: https://github.com/DetachHead/basedpyright-prek-mirror
-    rev: d58fe7fc44458fa7e41e2d38c04598a3c87833f2  # frozen: 1.38.3
+    rev: 999197ca536894136b46f77eec4e4617c0724320  # frozen: 1.38.4
     hooks:
       - id: basedpyright
         files: ^src/.+\.py$
@@ -126,7 +126,7 @@ repos:
       - id: gha-workflow-linter
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
-    rev: 8db279a37c552206d2df62269ff6f9d31125815a  # frozen: 0.37.0
+    rev: ed81924a8b1cecdaa570b072528fa80c9c4d6ccd  # frozen: 0.37.1
     hooks:
       - id: check-github-actions
       - id: check-github-workflows
