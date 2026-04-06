@@ -154,6 +154,80 @@ def _clean_ellipses_from_message(message: str) -> str:
     return "\n".join(cleaned_lines)
 
 
+# Pattern to match conventional commit prefixes like "feat:", "fix(scope):",
+# "Build(deps)!:" etc.  Used by _clean_squash_title_line to prevent the
+# truncation algorithm from splitting on the prefix separator.
+_CC_PREFIX_RE = re.compile(
+    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)"
+    r"(\(.+?\))?\s*!?\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_squash_title_line(title_line: str) -> str:
+    """Clean and truncate a squashed commit title line.
+
+    Handles markdown removal, separator splitting, and length
+    truncation while preserving conventional commit prefixes
+    and underscores in package/path names.
+
+    Args:
+        title_line: Raw title line from git log output.
+
+    Returns:
+        Cleaned title line, safe for use as a commit subject.
+    """
+    # Remove markdown links
+    title_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title_line)
+    # Remove trailing ellipsis/truncation
+    title_line = re.sub(r"\s*[.]{3,}.*$", "", title_line)
+    # Split on common separators to avoid leaking body content
+    for separator in [". Bumps ", " Bumps ", ". - ", " - "]:
+        if separator in title_line:
+            title_line = title_line.split(separator)[0].strip()
+            break
+    # Remove markdown bold/code formatting but preserve underscores
+    # (which appear in package names and filesystem paths).
+    title_line = re.sub(r"[*`]", "", title_line).strip()
+
+    if len(title_line) > 100:
+        # Detect conventional commit prefix length so that the
+        # ": " break-point does not split on the prefix separator
+        # (e.g. "Build(deps): " should not be treated as a sentence
+        # break).
+        cc_match = _CC_PREFIX_RE.match(title_line)
+        cc_prefix_len = cc_match.end() if cc_match else 0
+
+        break_points = [". ", "! ", "? ", " - ", ": "]
+        truncated = False
+        for bp in break_points:
+            # For the ": " break-point, start searching after the
+            # conventional commit prefix to avoid splitting there.
+            search_start = cc_prefix_len if bp == ": " else 0
+            candidate = title_line[search_start:100]
+            if bp in candidate:
+                bp_idx = title_line.index(bp, search_start)
+                title_line = title_line[: bp_idx + len(bp.strip())]
+                truncated = True
+                break
+
+        if not truncated and cc_prefix_len == 0:
+            # Non-CC title with no break-point found: fall back
+            # to word-boundary truncation at 100 characters.
+            words = title_line[:100].split()
+            title_line = (
+                " ".join(words[:-1])
+                if len(words) > 1
+                else title_line[:100].rstrip()
+            )
+        # For CC titles with no break-point: pass through the
+        # full title.  The length is inherent to the structured
+        # subject (e.g. long dependency paths), not body-content
+        # leakage.
+
+    return title_line
+
+
 # ---------------------
 # Utility functions
 # ---------------------
@@ -3564,32 +3638,7 @@ class Orchestrator:
             return message_lines, signed_off, change_ids
 
         def _clean_title_line(title_line: str) -> str:
-            # Remove markdown links
-            title_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title_line)
-            # Remove trailing ellipsis/truncation
-            title_line = re.sub(r"\s*[.]{3,}.*$", "", title_line)
-            # Split on common separators to avoid leaking body content
-            for separator in [". Bumps ", " Bumps ", ". - ", " - "]:
-                if separator in title_line:
-                    title_line = title_line.split(separator)[0].strip()
-                    break
-            # Remove simple markdown/formatting artifacts
-            title_line = re.sub(r"[*_`]", "", title_line).strip()
-            if len(title_line) > 100:
-                break_points = [". ", "! ", "? ", " - ", ": "]
-                for bp in break_points:
-                    if bp in title_line[:100]:
-                        title_line = title_line[
-                            : title_line.index(bp) + len(bp.strip())
-                        ]
-                        break
-                else:
-                    words = title_line[:100].split()
-                    title_line = (
-                        " ".join(words[:-1])
-                        if len(words) > 1
-                        else title_line[:100].rstrip()
-                    )
+            title_line = _clean_squash_title_line(title_line)
 
             # Apply conventional commit normalization if enabled
             if inputs.normalise_commit and gh.pr_number:
