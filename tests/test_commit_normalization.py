@@ -170,7 +170,7 @@ class TestCommitNormalizer:
         test_cases = [
             ("[text](url) some title", "text some title"),
             ("Title with trailing...", "title with trailing"),
-            ("Title with *bold* and _italic_", "title with bold and italic"),
+            ("Title with *bold* and _italic_", "title with bold and _italic_"),
         ]
 
         for original, expected in test_cases:

@@ -154,17 +154,7 @@ def _clean_ellipses_from_message(message: str) -> str:
     return "\n".join(cleaned_lines)
 
 
-# Pattern to match conventional commit prefixes like "feat:", "fix(scope):",
-# "Build(deps)!:" etc.  Used by _clean_squash_title_line to prevent the
-# truncation algorithm from splitting on the prefix separator.
-_CC_PREFIX_RE = re.compile(
-    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)"
-    r"(\(.+?\))?\s*!?\s*:\s*",
-    re.IGNORECASE,
-)
-
-
-def _clean_squash_title_line(title_line: str) -> str:
+def _clean_squash_title_line(title_line: str | None) -> str:
     """Clean and truncate a squashed commit title line.
 
     Handles markdown removal, separator splitting, and length
@@ -177,6 +167,11 @@ def _clean_squash_title_line(title_line: str) -> str:
     Returns:
         Cleaned title line, safe for use as a commit subject.
     """
+    from .similarity import CC_PREFIX_RE
+
+    if not title_line:
+        return ""
+
     # Remove markdown links
     title_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title_line)
     # Remove trailing ellipsis/truncation
@@ -195,7 +190,7 @@ def _clean_squash_title_line(title_line: str) -> str:
         # ": " break-point does not split on the prefix separator
         # (e.g. "Build(deps): " should not be treated as a sentence
         # break).
-        cc_match = _CC_PREFIX_RE.match(title_line)
+        cc_match = CC_PREFIX_RE.match(title_line)
         cc_prefix_len = cc_match.end() if cc_match else 0
 
         break_points = [". ", "! ", "? ", " - ", ": "]
@@ -207,7 +202,15 @@ def _clean_squash_title_line(title_line: str) -> str:
             candidate = title_line[search_start:100]
             if bp in candidate:
                 bp_idx = title_line.index(bp, search_start)
-                title_line = title_line[: bp_idx + len(bp.strip())]
+                # Punctuation break-points (". ", ": ") — include
+                # the punctuation mark.  Separator break-points
+                # (" - ") — truncate before the separator.
+                if bp[0].isspace():
+                    title_line = title_line[:bp_idx].rstrip()
+                else:
+                    title_line = title_line[
+                        : bp_idx + len(bp.rstrip())
+                    ].rstrip()
                 truncated = True
                 break
 
@@ -752,6 +755,9 @@ class Orchestrator:
         2. GitHub-Hash trailer matching
         3. GitHub-PR trailer URL matching
         4. Mapping comment parsing from PR comments
+        5. Dependency package match — find an open change that
+           bumps the same dependency (for Dependabot / Renovate
+           supersession).
 
         Args:
             gh: GitHub context containing PR information
@@ -867,6 +873,10 @@ class Orchestrator:
             except Exception as exc:
                 log.debug("GitHub-Hash trailer query failed: %s", exc)
 
+        # Cache the PR title for reuse across strategies 4 and 5
+        # so we don't duplicate GitHub API requests.
+        cached_pr_title: str = ""
+
         # Strategy 4: Parse mapping comments from PR
         try:
             from .mapping_comment import parse_mapping_comments
@@ -874,6 +884,7 @@ class Orchestrator:
             client_gh = build_client()
             repo = get_repo_from_env(client_gh)
             pr_obj = get_pull(repo, int(gh.pr_number))
+            cached_pr_title = getattr(pr_obj, "title", "") or ""
 
             issue = pr_obj.as_issue()
             comments = list(issue.get_comments())
@@ -903,6 +914,110 @@ class Orchestrator:
 
         except Exception as exc:
             log.debug("Mapping comment parsing failed: %s", exc)
+
+        # Strategy 5: Dependency package match (supersession)
+        # When a new Dependabot/Renovate PR bumps the same dependency
+        # as an existing open Gerrit change, reuse that Change-Id so
+        # the push creates a new patchset instead of a duplicate change.
+        try:
+            from .gerrit_query import GerritChange
+            from .gerrit_query import query_open_changes_by_project
+            from .gerrit_rest import build_client_for_host
+            from .similarity import extract_dependency_package_from_subject
+            from .trailers import GITHUB_PR_TRAILER
+            from .trailers import parse_trailers
+
+            # Reuse PR title cached by Strategy 4 to avoid a
+            # duplicate GitHub API request.
+            pr_title = cached_pr_title
+            if not pr_title:
+                log.debug(
+                    "Strategy 5: PR title cache miss, fetching from GitHub API",
+                )
+                try:
+                    gh_client = build_client()
+                    gh_repo = get_repo_from_env(gh_client)
+                    pr_obj = get_pull(gh_repo, int(gh.pr_number))
+                    pr_title = getattr(pr_obj, "title", "") or ""
+                except Exception:
+                    pr_title = ""
+
+            current_pkg = extract_dependency_package_from_subject(pr_title)
+            if current_pkg:
+                log.debug(
+                    "Strategy 5: searching for open changes that "
+                    "bump dependency '%s'",
+                    current_pkg,
+                )
+                dep_client = build_client_for_host(gerrit.host)
+                open_changes = query_open_changes_by_project(
+                    dep_client,
+                    gerrit.project,
+                    branch=gh.base_ref,
+                    max_results=200,
+                )
+
+                # Collect all matching changes, then select the
+                # oldest one (lowest change number) to avoid
+                # "downgrading" a newer change by uploading an
+                # older patchset to it.
+                candidates: list[tuple[int, GerritChange]] = []
+                for change in open_changes:
+                    candidate_pkg = extract_dependency_package_from_subject(
+                        change.subject
+                    )
+                    if candidate_pkg and candidate_pkg == current_pkg:
+                        # Verify this is a GitHub2Gerrit change
+                        commit_msg = change.commit_message or ""
+                        trailers = parse_trailers(commit_msg)
+                        if GITHUB_PR_TRAILER not in trailers:
+                            log.debug(
+                                "Strategy 5: skipping change %s "
+                                "(no GitHub2Gerrit metadata)",
+                                change.number,
+                            )
+                            continue
+                        try:
+                            change_num = int(change.number)
+                        except (TypeError, ValueError):
+                            log.debug(
+                                "Strategy 5: skipping change with "
+                                "invalid number %r for subject %r",
+                                change.number,
+                                change.subject,
+                            )
+                            continue
+                        candidates.append((change_num, change))
+
+                if candidates:
+                    # Prefer the oldest open change so the newest
+                    # PR always updates the original change and
+                    # the post-push sweep abandons the rest.
+                    candidates.sort(key=lambda t: t[0])
+                    _, oldest = candidates[0]
+                    change_ids = [oldest.change_id]
+                    log.info(
+                        "Found superseding target by dependency "
+                        "package '%s': change %s (%s) "
+                        "(oldest of %d candidate(s))",
+                        current_pkg,
+                        oldest.number,
+                        oldest.subject,
+                        len(candidates),
+                    )
+                    return change_ids
+
+                log.debug(
+                    "No open changes found for dependency '%s'",
+                    current_pkg,
+                )
+            else:
+                log.debug(
+                    "Strategy 5 skipped: could not extract dependency "
+                    "package from PR title"
+                )
+        except Exception as exc:
+            log.debug("Dependency package strategy failed: %s", exc)
 
         log.warning(
             "⚠️  No existing Gerrit changes found for PR #%s",
@@ -2009,6 +2124,49 @@ class Orchestrator:
 
         # Validate that no unexpected files were committed
         self._validate_committed_files(gh, result)
+
+        # Post-push supersession sweep (Option A fallback).
+        # After a successful push, check whether other open Gerrit
+        # changes in the same project bump the same dependency
+        # package.  If Strategy 5 already reused the old Change-Id
+        # (update-in-place), no duplicates should exist.  If that
+        # path was skipped (e.g. non-dependency PR, or the query
+        # failed), this sweep catches and abandons stale changes.
+        if not inputs.dry_run and gerrit and prep.change_ids:
+            try:
+                from .gerrit_pr_closer import (
+                    abandon_superseded_dependency_changes,
+                )
+
+                # Derive the subject from the pushed commit,
+                # regardless of whether change URL lookup
+                # succeeded.
+                push_subject = ""
+                try:
+                    push_subject = run_cmd(
+                        [
+                            "git",
+                            "show",
+                            "-s",
+                            "--pretty=format:%s",
+                            "HEAD",
+                        ],
+                        cwd=self.workspace,
+                    ).stdout.strip()
+                except Exception:
+                    push_subject = ""
+
+                if push_subject:
+                    abandon_superseded_dependency_changes(
+                        gerrit_server=gerrit.host,
+                        gerrit_project=gerrit.project,
+                        current_subject=push_subject,
+                        exclude_change_ids=prep.change_ids,
+                        dry_run=False,
+                        target_branch=self._resolve_target_branch(),
+                    )
+            except Exception as exc:
+                log.debug("Post-push supersession sweep skipped: %s", exc)
 
         self._close_pull_request_if_required(gh)
 

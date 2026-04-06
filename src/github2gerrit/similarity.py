@@ -33,6 +33,7 @@ from difflib import SequenceMatcher
 
 # Public API surface
 __all__ = [
+    "CC_PREFIX_RE",
     "ScoreResult",
     "ScoringConfig",
     "aggregate_scores",
@@ -47,6 +48,14 @@ __all__ = [
     "score_subjects",
     "sequence_ratio",
 ]
+
+# Compiled conventional-commit prefix regex, shared across modules.
+# Matches types like "feat:", "Fix(scope):", "Build(deps)!:" etc.
+CC_PREFIX_RE = re.compile(
+    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)"
+    r"(?:\([^)]*\))?\s*!?\s*:\s*",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +206,7 @@ def extract_dependency_package_from_subject(subject: str) -> str:
     Examples to consider (to be implemented):
     - "Bump requests from 2.31.0 to 2.32.0" -> "requests"
     - "chore: update org/tool from v1.2.3 to v1.2.4" -> "org/tool"
+    - "Build(deps): Bump org/tool from 1.0 to 2.0" -> "org/tool"
 
     Args:
         subject: The (possibly unnormalized) subject line.
@@ -205,15 +215,20 @@ def extract_dependency_package_from_subject(subject: str) -> str:
         Package identifier, or empty string if none could be extracted.
     """
     s = (subject or "").lower()
+    # Strip any conventional-commit prefix before matching
+    cc_match = CC_PREFIX_RE.match(s)
+    if cc_match:
+        s = s[cc_match.end() :]
+
     patterns = [
         # Full version with "from" clause
-        r"(?:chore.*?:\s*)?bump\s+([^\s]+)\s+from\s+",
-        r"(?:chore.*?:\s*)?update\s+([^\s]+)\s+from\s+",
-        r"(?:chore.*?:\s*)?upgrade\s+([^\s]+)\s+from\s+",
+        r"bump\s+([^\s]+)\s+from\s+",
+        r"update\s+([^\s]+)\s+from\s+",
+        r"upgrade\s+([^\s]+)\s+from\s+",
         # Truncated version without "from" clause (for Gerrit subjects)
-        r"(?:chore.*?:\s*)?bump\s+([^\s]+)\s*$",
-        r"(?:chore.*?:\s*)?update\s+([^\s]+)\s*$",
-        r"(?:chore.*?:\s*)?upgrade\s+([^\s]+)\s*$",
+        r"bump\s+([^\s]+)\s*$",
+        r"update\s+([^\s]+)\s*$",
+        r"upgrade\s+([^\s]+)\s*$",
     ]
     for pat in patterns:
         m = re.search(pat, s)
