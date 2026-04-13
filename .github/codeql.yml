@@ -1,0 +1,12 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+name: "CodeQL Advanced Configuration File"
+
+# Exclude test files from CodeQL analysis; CodeQL
+# only runs AFTER submission of pull requests and
+# tests cause false positives in security audits.
+
+paths-ignore:
+  - tests
