@@ -61,18 +61,21 @@ def _build_gerrit_change_url(
 ) -> str | None:
     """Build a Gerrit change URL from a change number string.
 
-    Returns the URL string, or ``None`` when *change_number* cannot
-    be parsed as an integer.
+    Returns the URL string, or ``None`` when URL generation fails.
     """
     try:
         from .gerrit_urls import create_gerrit_url_builder
 
         url_builder = create_gerrit_url_builder(gerrit_server)
         return url_builder.change_url(gerrit_project, int(change_number))
-    except (ValueError, TypeError):
+    except Exception:
         log.debug(
-            "Could not parse change number %r as int; skipping URL generation",
+            "Could not build Gerrit change URL for server=%r, project=%r, "
+            "change_number=%r; skipping URL generation",
+            gerrit_server,
+            gerrit_project,
             change_number,
+            exc_info=True,
         )
         return None
 

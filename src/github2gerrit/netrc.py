@@ -802,7 +802,7 @@ def resolve_gerrit_credentials(
         if fallback_user and env_pass:
             log.debug(
                 "Using credentials from mixed environment variables"
-                " (%s + fallback password)",
+                " (%s + primary password)",
                 fallback_env_username_var,
             )
             return GerritCredentials(

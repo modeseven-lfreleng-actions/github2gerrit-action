@@ -194,14 +194,24 @@ def _clean_squash_title_line(title_line: str | None) -> str:
         cc_prefix_len = cc_match.end() if cc_match else 0
 
         break_points = [". ", "! ", "? ", " - ", ": "]
+        max_bp_len = max(len(bp) for bp in break_points)
         truncated = False
         for bp in break_points:
             # For the ": " break-point, start searching after the
             # conventional commit prefix to avoid splitting there.
             search_start = cc_prefix_len if bp == ": " else 0
-            candidate = title_line[search_start:100]
-            if bp in candidate:
-                bp_idx = title_line.index(bp, search_start)
+            # Extend the slice by (max_bp_len - 1) so that a
+            # break-point starting just before position 100 is
+            # still detected even if it spans across the boundary.
+            candidate_end = min(len(title_line), 100 + max_bp_len - 1)
+            candidate = title_line[search_start:candidate_end]
+            bp_offset = candidate.find(bp)
+            if bp_offset != -1:
+                bp_idx = search_start + bp_offset
+                # Only use this break-point if it starts within
+                # the 100-char limit.
+                if bp_idx >= 100:
+                    continue
                 # Punctuation break-points (". ", ": ") — include
                 # the punctuation mark.  Separator break-points
                 # (" - ") — truncate before the separator.

@@ -2254,7 +2254,7 @@ def _process() -> None:
                                 gerrit_change_url,
                                 gh.pr_number,
                             )
-                        except (ValueError, TypeError):
+                        except Exception:
                             log.debug(
                                 "Successfully abandoned Gerrit "
                                 "change %s for pull request #%s",

@@ -169,6 +169,10 @@ class TestQueryOpenChangesByProject:
 # -------------------------------------------------------------------
 
 
+@patch(
+    "github2gerrit.gerrit_urls._discover_base_path_for_host",
+    new=lambda *_a, **_kw: "",
+)
 class TestAbandonSupersededDependencyChanges:
     """Tests for the post-push abandon sweep."""
 
@@ -673,6 +677,10 @@ class TestStrategy5Integration:
 # -------------------------------------------------------------------
 
 
+@patch(
+    "github2gerrit.gerrit_urls._discover_base_path_for_host",
+    new=lambda *_a, **_kw: "",
+)
 class TestRealWorldScenarios:
     """Scenarios taken directly from the issue report."""
 

@@ -18,6 +18,20 @@ from .gerrit_rest import GerritRestClient
 log = logging.getLogger(__name__)
 
 
+def _gerrit_quote(value: str) -> str:
+    """Escape a value for safe use inside Gerrit query double-quotes.
+
+    Gerrit query syntax uses double-quoted strings for values
+    containing special characters.  Backslashes and double-quotes
+    inside the value must be escaped to prevent query injection or
+    malformed queries (e.g. branch names containing ``"``).
+
+    Returns:
+        The escaped string (without surrounding quotes).
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 @dataclass
 class GerritChange:
     """Represents a Gerrit change from query results."""
@@ -83,7 +97,7 @@ def query_changes_by_topic(
 
     # Build query string
     status_query = " OR ".join(f"status:{status}" for status in statuses)
-    query = f'topic:"{topic}" AND ({status_query})'
+    query = f'topic:"{_gerrit_quote(topic)}" AND ({status_query})'
 
     log.debug("Querying Gerrit for changes: %s", query)
 
@@ -131,9 +145,9 @@ def query_open_changes_by_project(
     Returns:
         List of open ``GerritChange`` objects.
     """
-    query = f'project:"{project}" status:open owner:self'
+    query = f'project:"{_gerrit_quote(project)}" status:open owner:self'
     if branch:
-        query += f' branch:"{branch}"'
+        query += f' branch:"{_gerrit_quote(branch)}"'
     log.debug("Querying Gerrit for open changes: %s", query)
 
     try:
