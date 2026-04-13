@@ -769,9 +769,8 @@ def resolve_gerrit_credentials(
 
     if env_user and env_pass:
         log.debug(
-            "Using credentials from environment variables %s/%s",
+            "Using credentials from environment variable %s",
             env_username_var,
-            env_password_var,
         )
         return GerritCredentials(
             username=env_user,
@@ -787,9 +786,8 @@ def resolve_gerrit_credentials(
 
         if fallback_user and fallback_pass:
             log.debug(
-                "Using credentials from fallback environment variables %s/%s",
+                "Using credentials from fallback environment variable %s",
                 fallback_env_username_var,
-                fallback_env_password_var,
             )
             return GerritCredentials(
                 username=fallback_user,
@@ -803,9 +801,9 @@ def resolve_gerrit_credentials(
         fallback_user = os.getenv(fallback_env_username_var, "").strip()
         if fallback_user and env_pass:
             log.debug(
-                "Using credentials from mixed environment variables %s/%s",
+                "Using credentials from mixed environment variables"
+                " (%s + fallback password)",
                 fallback_env_username_var,
-                env_password_var,
             )
             return GerritCredentials(
                 username=fallback_user,

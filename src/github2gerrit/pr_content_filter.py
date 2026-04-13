@@ -112,7 +112,7 @@ class DependabotRule(FilterRule):
             "Bumps " in title and " from " in title and " to " in title,
             "Dependabot will resolve any conflicts" in body,
             "<details>" in body and "<summary>" in body,
-            "camo.githubusercontent.com" in body,
+            "https://camo.githubusercontent.com/" in body,
         ]
 
         # Require multiple indicators for confidence
