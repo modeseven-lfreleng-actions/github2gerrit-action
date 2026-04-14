@@ -10,11 +10,26 @@ based on topics, with support for pagination and safe parsing.
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 from .gerrit_rest import GerritRestClient
 
 
 log = logging.getLogger(__name__)
+
+
+def _gerrit_quote(value: str) -> str:
+    """Escape a value for safe use inside Gerrit query double-quotes.
+
+    Gerrit query syntax uses double-quoted strings for values
+    containing special characters.  Backslashes and double-quotes
+    inside the value must be escaped to prevent query injection or
+    malformed queries (e.g. branch names containing ``"``).
+
+    Returns:
+        The escaped string (without surrounding quotes).
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass
@@ -82,7 +97,7 @@ def query_changes_by_topic(
 
     # Build query string
     status_query = " OR ".join(f"status:{status}" for status in statuses)
-    query = f"topic:{topic} AND ({status_query})"
+    query = f'topic:"{_gerrit_quote(topic)}" AND ({status_query})'
 
     log.debug("Querying Gerrit for changes: %s", query)
 
@@ -99,6 +114,56 @@ def query_changes_by_topic(
     except Exception as exc:
         log.warning(
             "Failed to query Gerrit changes for topic '%s': %s", topic, exc
+        )
+        return []
+    else:
+        return changes
+
+
+def query_open_changes_by_project(
+    client: GerritRestClient,
+    project: str,
+    *,
+    branch: str | None = None,
+    max_results: int = 100,
+) -> list[GerritChange]:
+    """Query open changes owned by the current user in a Gerrit project.
+
+    Used by the supersession sweep to discover open changes that
+    may be superseded by a newer dependency update.  Only returns
+    changes owned by the authenticated user (``owner:self``) to
+    avoid acting on unrelated human-authored changes.
+
+    Args:
+        client: Gerrit REST client.
+        project: Gerrit project name (e.g. ``myorg/myrepo``).
+        branch: Optional Gerrit branch name to scope the query.
+            When provided, only changes targeting this branch are
+            returned.
+        max_results: Maximum number of results to return.
+
+    Returns:
+        List of open ``GerritChange`` objects.
+    """
+    query = f'project:"{_gerrit_quote(project)}" status:open owner:self'
+    if branch:
+        query += f' branch:"{_gerrit_quote(branch)}"'
+    log.debug("Querying Gerrit for open changes: %s", query)
+
+    try:
+        changes = _execute_query_with_pagination(
+            client, query, max_results=max_results
+        )
+        log.debug(
+            "Found %d open changes in project '%s'",
+            len(changes),
+            project,
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to query open Gerrit changes for project '%s': %s",
+            project,
+            exc,
         )
         return []
     else:
@@ -135,7 +200,7 @@ def _execute_query_with_pagination(
             # Build query URL with parameters
             # Gerrit REST API: /changes/?q=query&n=limit&S=skip&o=options
             query_params = [
-                f"q={query}",
+                f"q={quote(query, safe='')}",
                 f"n={current_limit}",
                 f"S={start}",
                 "o=CURRENT_REVISION",

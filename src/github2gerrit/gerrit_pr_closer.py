@@ -54,6 +54,32 @@ FORCE_ABANDONED_CLEANUP = _env_bool("CLEANUP_ABANDONED", True)
 FORCE_GERRIT_CLEANUP = _env_bool("CLEANUP_GERRIT", True)
 
 
+def _build_gerrit_change_url(
+    gerrit_server: str,
+    gerrit_project: str,
+    change_number: str,
+) -> str | None:
+    """Build a Gerrit change URL from a change number string.
+
+    Returns the URL string, or ``None`` when URL generation fails.
+    """
+    try:
+        from .gerrit_urls import create_gerrit_url_builder
+
+        url_builder = create_gerrit_url_builder(gerrit_server)
+        return url_builder.change_url(gerrit_project, int(change_number))
+    except Exception:
+        log.debug(
+            "Could not build Gerrit change URL for server=%r, project=%r, "
+            "change_number=%r; skipping URL generation",
+            gerrit_server,
+            gerrit_project,
+            change_number,
+            exc_info=True,
+        )
+        return None
+
+
 def extract_change_number_from_url(
     gerrit_change_url: str,
 ) -> tuple[str, str] | None:
@@ -1078,7 +1104,7 @@ def abandon_gerrit_change_for_closed_pr(
         (or would be in dry-run), None otherwise
     """
     log.debug(
-        "🔍 Looking for Gerrit change associated with PR #%d",
+        "Looking for Gerrit change associated with PR #%d",
         pr_number,
     )
 
@@ -1232,24 +1258,35 @@ def abandon_gerrit_change_for_closed_pr(
 
             # Abandon the Gerrit change
             if not dry_run:
-                gerrit_change_url = (
-                    f"https://{gerrit_server}/c/"
-                    f"{gerrit_project}/+/{change_number}"
+                gerrit_change_url = _build_gerrit_change_url(
+                    gerrit_server, gerrit_project, change_number
                 )
                 _abandon_gerrit_change(
                     gerrit_client,
                     change_number,
                     abandon_message,
                 )
-                log.debug(
-                    "✅ Abandoned Gerrit change %s: %s",
-                    change_number,
-                    gerrit_change_url,
-                )
-                safe_console_print(
-                    f"✅ Abandoned Gerrit change {gerrit_change_url} "
-                    f"for pull request #{pr_number}"
-                )
+                if gerrit_change_url:
+                    log.debug(
+                        "Abandoned Gerrit change %s: %s",
+                        change_number,
+                        gerrit_change_url,
+                    )
+                    safe_console_print(
+                        f"✅ Abandoned Gerrit change "
+                        f"{gerrit_change_url} "
+                        f"for pull request #{pr_number}"
+                    )
+                else:
+                    log.debug(
+                        "Abandoned Gerrit change %s",
+                        change_number,
+                    )
+                    safe_console_print(
+                        f"✅ Abandoned Gerrit change "
+                        f"{change_number} "
+                        f"for pull request #{pr_number}"
+                    )
             else:
                 log.debug(
                     "DRY-RUN: Would abandon Gerrit change %s",
@@ -1274,9 +1311,8 @@ def abandon_gerrit_change_for_closed_pr(
             )
 
             if not dry_run:
-                gerrit_change_url = (
-                    f"https://{gerrit_server}/c/"
-                    f"{gerrit_project}/+/{change_number}"
+                gerrit_change_url = _build_gerrit_change_url(
+                    gerrit_server, gerrit_project, change_number
                 )
                 _abandon_gerrit_change(
                     gerrit_client,
@@ -1284,10 +1320,18 @@ def abandon_gerrit_change_for_closed_pr(
                     simple_message,
                 )
                 log.debug("Abandoned Gerrit change %s", change_number)
-                safe_console_print(
-                    f"✅ Abandoned Gerrit change {gerrit_change_url} "
-                    f"for pull request #{pr_number}"
-                )
+                if gerrit_change_url:
+                    safe_console_print(
+                        f"✅ Abandoned Gerrit change "
+                        f"{gerrit_change_url} "
+                        f"for pull request #{pr_number}"
+                    )
+                else:
+                    safe_console_print(
+                        f"✅ Abandoned Gerrit change "
+                        f"{change_number} "
+                        f"for pull request #{pr_number}"
+                    )
             else:
                 log.debug(
                     "DRY-RUN: Would abandon Gerrit change %s",
@@ -1454,20 +1498,25 @@ def cleanup_closed_github_prs(
 
                     # Abandon the Gerrit change
                     if not dry_run:
-                        gerrit_change_url = (
-                            f"https://{gerrit_server}/c/"
-                            f"{gerrit_project}/+/{change_number}"
+                        gerrit_change_url = _build_gerrit_change_url(
+                            gerrit_server, gerrit_project, change_number
                         )
                         _abandon_gerrit_change(
                             gerrit_client,
                             change_number,
                             abandon_message,
                         )
-                        log.info(
-                            "Abandoned Gerrit change %s: %s",
-                            change_number,
-                            gerrit_change_url,
-                        )
+                        if gerrit_change_url:
+                            log.info(
+                                "Abandoned Gerrit change %s: %s",
+                                change_number,
+                                gerrit_change_url,
+                            )
+                        else:
+                            log.info(
+                                "Abandoned Gerrit change %s",
+                                change_number,
+                            )
                     else:
                         log.info(
                             "DRY-RUN: Would abandon Gerrit change %s",
@@ -1652,3 +1701,157 @@ def _abandon_gerrit_change(
     except Exception:
         log.exception("Failed to abandon Gerrit change %s", change_number)
         raise
+
+
+def abandon_superseded_dependency_changes(
+    gerrit_server: str,
+    gerrit_project: str,
+    current_subject: str,
+    exclude_change_ids: list[str],
+    *,
+    dry_run: bool = False,
+    target_branch: str | None = None,
+) -> list[str]:
+    """Abandon open Gerrit changes superseded by a newer dependency update.
+
+    After pushing a new dependency-update change, this function
+    queries Gerrit for other open changes in the same project that
+    bump the **same** dependency package.  Matches are abandoned
+    with an explanatory message.
+
+    This serves as the "Option A fallback" when the primary
+    update-in-place strategy (Change-Id reuse) could not be
+    applied.
+
+    Args:
+        gerrit_server: Gerrit server hostname.
+        gerrit_project: Gerrit project name.
+        current_subject: Subject of the change that was just pushed.
+        exclude_change_ids: Change-IDs to exclude (the change we
+            just pushed, so we don't abandon ourselves).
+        dry_run: If True, log but do not actually abandon.
+        target_branch: Optional Gerrit branch name.  When provided,
+            only changes targeting this branch are considered.
+
+    Returns:
+        List of Gerrit change numbers that were abandoned
+        (or would be in dry-run mode).
+    """
+    from .gerrit_query import query_open_changes_by_project
+    from .gerrit_rest import build_client_for_host
+    from .gerrit_urls import create_gerrit_url_builder
+    from .similarity import extract_dependency_package_from_subject
+    from .trailers import GITHUB_PR_TRAILER
+    from .trailers import parse_trailers
+
+    current_pkg = extract_dependency_package_from_subject(current_subject)
+    if not current_pkg:
+        log.debug(
+            "Cannot extract dependency package from subject: %s",
+            current_subject,
+        )
+        return []
+
+    log.info(
+        "Checking for superseded dependency changes (package: %s)",
+        current_pkg,
+    )
+
+    abandoned: list[str] = []
+    try:
+        client = build_client_for_host(gerrit_server)
+        open_changes = query_open_changes_by_project(
+            client, gerrit_project, branch=target_branch, max_results=200
+        )
+
+        url_builder = create_gerrit_url_builder(gerrit_server)
+
+        for change in open_changes:
+            # Skip the change(s) we just pushed
+            if change.change_id in exclude_change_ids:
+                continue
+
+            # Only target changes created by GitHub2Gerrit
+            commit_msg = change.commit_message or ""
+            trailers = parse_trailers(commit_msg)
+            if GITHUB_PR_TRAILER not in trailers:
+                log.debug(
+                    "Skipping change %s: no GitHub2Gerrit "
+                    "metadata (missing %s trailer)",
+                    change.number,
+                    GITHUB_PR_TRAILER,
+                )
+                continue
+
+            candidate_pkg = extract_dependency_package_from_subject(
+                change.subject
+            )
+            if not candidate_pkg or candidate_pkg != current_pkg:
+                continue
+
+            # Parse change number for URL construction
+            try:
+                candidate_num = int(change.number)
+            except (TypeError, ValueError):
+                log.debug(
+                    "Skipping change with unparsable number: %r",
+                    change.number,
+                )
+                continue
+
+            change_url = url_builder.change_url(gerrit_project, candidate_num)
+            log.info(
+                "Found superseded change %s (%s)",
+                change.number,
+                change.subject,
+            )
+
+            if dry_run:
+                log.info(
+                    "DRY-RUN: Would abandon superseded change %s",
+                    change_url,
+                )
+                abandoned.append(str(change.number))
+                continue
+
+            superseding_info = f"New change subject: {current_subject}"
+            if exclude_change_ids:
+                superseding_info += "\nChange-Id(s): " + ", ".join(
+                    str(cid) for cid in exclude_change_ids
+                )
+            abandon_msg = (
+                f"Superseded by a newer update for {current_pkg}\n\n"
+                f"{superseding_info}\n\n"
+                "This change was automatically abandoned by "
+                "GitHub2Gerrit because a newer dependency update "
+                "for the same package was pushed."
+            )
+            try:
+                _abandon_gerrit_change(client, str(change.number), abandon_msg)
+                log.info(
+                    "Abandoned superseded change: %s",
+                    change_url,
+                )
+                abandoned.append(str(change.number))
+            except Exception as exc:
+                log.warning(
+                    "Failed to abandon superseded change %s: %s",
+                    change_url,
+                    exc,
+                )
+
+    except Exception as exc:
+        log.warning(
+            "Superseded dependency change sweep failed (non-fatal): %s",
+            exc,
+        )
+
+    if abandoned:
+        log.info(
+            "Supersession sweep complete: abandoned %d change(s)",
+            len(abandoned),
+        )
+    else:
+        log.debug("No superseded dependency changes found")
+
+    return abandoned

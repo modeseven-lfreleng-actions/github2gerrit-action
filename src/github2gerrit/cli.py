@@ -2226,7 +2226,7 @@ def _process() -> None:
             ):
                 try:
                     log.debug(
-                        "🔍 Checking for Gerrit change to abandon for PR #%s",
+                        "Checking for Gerrit change to abandon for PR #%s",
                         gh.pr_number,
                     )
                     change_number = abandon_gerrit_change_for_closed_pr(
@@ -2238,16 +2238,29 @@ def _process() -> None:
                         progress_tracker=None,
                     )
                     if change_number:
-                        gerrit_change_url = (
-                            f"https://{data.gerrit_server}/c/"
-                            f"{data.gerrit_project}/+/{change_number}"
-                        )
-                        log.debug(
-                            "✅ Successfully abandoned Gerrit change %s "
-                            "for pull request #%s",
-                            gerrit_change_url,
-                            gh.pr_number,
-                        )
+                        try:
+                            from .gerrit_urls import create_gerrit_url_builder
+
+                            _url_builder = create_gerrit_url_builder(
+                                data.gerrit_server
+                            )
+                            gerrit_change_url = _url_builder.change_url(
+                                data.gerrit_project,
+                                int(change_number),
+                            )
+                            log.debug(
+                                "Successfully abandoned Gerrit "
+                                "change %s for pull request #%s",
+                                gerrit_change_url,
+                                gh.pr_number,
+                            )
+                        except Exception:
+                            log.debug(
+                                "Successfully abandoned Gerrit "
+                                "change %s for pull request #%s",
+                                change_number,
+                                gh.pr_number,
+                            )
                         # Console output already done by
                         # abandon_gerrit_change_for_closed_pr
                     else:
@@ -2295,7 +2308,7 @@ def _process() -> None:
                     log.warning("Gerrit cleanup failed: %s", exc)
 
             log.debug(
-                "✅ Cleanup operations completed for closed PR #%s",
+                "Cleanup operations completed for closed PR #%s",
                 gh.pr_number or "unknown",
             )
             return

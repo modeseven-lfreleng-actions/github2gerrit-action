@@ -401,8 +401,9 @@ class CommitNormalizer:
         # Remove trailing ellipsis
         title = re.sub(r"\s*[.]{3,}.*$", "", title)
 
-        # Remove markdown formatting
-        title = re.sub(r"[*_`]", "", title)
+        # Remove markdown bold/code formatting but preserve underscores
+        # (which appear in package names and filesystem paths).
+        title = re.sub(r"[*`]", "", title)
 
         # For dependabot titles, extract the essential information
         for pattern in DEPENDABOT_PATTERNS:
