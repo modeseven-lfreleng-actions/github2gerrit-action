@@ -208,7 +208,7 @@ disallow_untyped_calls = false
 
 [tool.coverage.run]
 branch = true
-source = ["src/github2gerrit"]
+source = ["github2gerrit"]
 omit = [
   "tests/*",
   "src/github2gerrit/gerrit_rest.py",
