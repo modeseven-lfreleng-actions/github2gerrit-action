@@ -30,6 +30,13 @@ dependencies = [
   # CLI framework (Typer)
   "typer>=0.20.1",
 
+  # Imported directly by the CLI (click.Group subclass for custom usage
+  # formatting; click.core.ParameterSource to detect explicit CLI flags)
+  # rather than only transitively via typer. Declared as a direct
+  # dependency so our import contract doesn't depend on typer's internal
+  # dependency choices.
+  "click>=8.1.7",
+
   # Rich formatting for CLI output
   "rich>=14.2.0",
 
