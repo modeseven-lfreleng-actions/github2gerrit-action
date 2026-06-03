@@ -917,7 +917,7 @@ name: github2gerrit
 
 on:
   pull_request_target:
-    types: [opened, reopened, edited, synchronize]
+    types: [opened, reopened, edited, synchronize, closed]
   workflow_dispatch:
 
 permissions:
@@ -1146,7 +1146,7 @@ name: github2gerrit (advanced)
 
 on:
   pull_request_target:
-    types: [opened, reopened, edited, synchronize]
+    types: [opened, reopened, edited, synchronize, closed]
   workflow_dispatch:
 
 permissions:
