@@ -163,6 +163,19 @@ class GerritRestClient:
         """Return True if client has authentication credentials."""
         return self._auth is not None
 
+    @property
+    def host(self) -> str:
+        """Return the Gerrit hostname derived from the base URL.
+
+        Returns an empty string when the host cannot be determined.
+        """
+        from urllib.parse import urlparse
+
+        try:
+            return urlparse(self._base_url).hostname or ""
+        except Exception:
+            return ""
+
     def get(self, path: str) -> Any:
         """HTTP GET, returning parsed JSON."""
         return self._request_json_with_retry("GET", path)

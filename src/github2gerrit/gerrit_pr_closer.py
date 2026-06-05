@@ -11,6 +11,7 @@ merged and close the corresponding GitHub pull request that originated it.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 from typing import Literal
@@ -1679,11 +1680,57 @@ def _build_gerrit_abandon_message(pr_obj: Any, pr_url: str) -> str:
         )
 
 
+def _abandon_change_via_ssh_if_possible(
+    client: Any, change_number: str, message: str
+) -> bool:
+    """Attempt to abandon a change over SSH using ambient credentials.
+
+    Reads the Gerrit SSH connection details from the environment
+    (populated by the action) and the host from the REST *client*.
+
+    Returns ``True`` only if the change was abandoned via SSH; ``False``
+    when SSH is not configured or the SSH abandon did not succeed (in
+    which case the caller should fall back to REST).
+    """
+    ssh_privkey = os.getenv("GERRIT_SSH_PRIVKEY_G2G", "").strip()
+    ssh_user = os.getenv("GERRIT_SSH_USER_G2G", "").strip()
+    if not ssh_privkey or not ssh_user:
+        return False
+
+    host = os.getenv("GERRIT_SERVER", "").strip()
+    if not host:
+        host = getattr(client, "host", "") or ""
+    if not host:
+        return False
+
+    try:
+        port = int(os.getenv("GERRIT_SERVER_PORT", "29418") or "29418")
+    except ValueError:
+        port = 29418
+
+    from .gerrit_ssh import abandon_change_via_ssh
+
+    return abandon_change_via_ssh(
+        host=host,
+        change_number=str(change_number),
+        message=message,
+        user=ssh_user,
+        ssh_privkey=ssh_privkey,
+        known_hosts=os.getenv("GERRIT_KNOWN_HOSTS", ""),
+        port=port,
+    )
+
+
 def _abandon_gerrit_change(
     client: Any, change_number: str, message: str
 ) -> None:
     """
-    Abandon a Gerrit change via REST API.
+    Abandon a Gerrit change.
+
+    Prefers SSH (``gerrit review --abandon``) because mutating REST calls
+    are rejected with HTTP 403 on Gerrit servers that do not allow
+    unauthenticated REST writes and where only SSH credentials are
+    configured.  Falls back to the REST API when SSH is unavailable.
 
     Args:
         client: Gerrit REST client
@@ -1691,9 +1738,18 @@ def _abandon_gerrit_change(
         message: Abandon message
 
     Raises:
-        Exception: If abandon operation fails
+        Exception: If the abandon operation fails
     """
+    if _abandon_change_via_ssh_if_possible(client, change_number, message):
+        log.debug(
+            "Successfully abandoned Gerrit change %s via SSH", change_number
+        )
+        return
+
     try:
+        log.debug(
+            "Falling back to REST abandon for Gerrit change %s", change_number
+        )
         abandon_path = f"/changes/{change_number}/abandon"
         abandon_data = {"message": message}
         client.post(abandon_path, data=abandon_data)
