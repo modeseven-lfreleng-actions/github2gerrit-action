@@ -268,6 +268,10 @@ reportUnsupportedDunderAll = "error"
 
 
 [tool.uv]
+# Supply-chain cooldown: do not resolve anything published in the last
+# 7 days (rolling window; uv records it as a relative span in uv.lock).
+# Requires uv >= 0.9.17 for the relative-duration ("7 days") form.
+exclude-newer = "7 days"
 # uv will manage installation based on this pyproject and lockfile.
 # No extra settings are required here; this stanza reserves the
 # namespace for future use if needed.
