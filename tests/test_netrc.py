@@ -117,9 +117,13 @@ class TestNetrcCredentials:
         )
         repr_str = repr(creds)
         assert "supersecret" not in repr_str
-        assert "****" in repr_str
-        assert "testuser" in repr_str
-        assert "gerrit.example.org" in repr_str
+        # Assert the exact repr: this verifies the password is masked while
+        # the machine/login remain visible, without a loose hostname
+        # substring check.
+        assert repr_str == (
+            "NetrcCredentials(machine='gerrit.example.org', "
+            "login='testuser', password='****')"
+        )
 
 
 class TestNetrcParserBasic:
@@ -197,10 +201,7 @@ class TestNetrcParserBasic:
         machine server2.org login u2 password p2
         """
         parser = NetrcParser(content)
-        machines = parser.machines
-        assert "server1.org" in machines
-        assert "server2.org" in machines
-        assert len(machines) == 2
+        assert sorted(parser.machines) == ["server1.org", "server2.org"]
 
     def test_has_default_property(self) -> None:
         """Test has_default property."""

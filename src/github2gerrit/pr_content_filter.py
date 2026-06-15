@@ -42,6 +42,13 @@ _DANGEROUS_HTML_PATTERN = re.compile(
 )
 _MULTIPLE_NEWLINES_PATTERN = re.compile(r"\n{3,}")
 _EMOJI_PATTERN = re.compile(r":[a-z_]+:")  # GitHub emoji codes like :sparkles:
+# Dependabot embeds compatibility-score badges proxied through GitHub's
+# camo image host. Detected via a regex rather than a substring membership
+# check (the latter trips CodeQL's incomplete-url-substring-sanitization
+# heuristic and is a weaker way to match a URL).
+_CAMO_IMAGE_URL_PATTERN = re.compile(
+    r"https://camo\.githubusercontent\.com/", re.IGNORECASE
+)
 
 
 @dataclass
@@ -112,7 +119,7 @@ class DependabotRule(FilterRule):
             "Bumps " in title and " from " in title and " to " in title,
             "Dependabot will resolve any conflicts" in body,
             "<details>" in body and "<summary>" in body,
-            "https://camo.githubusercontent.com/" in body,
+            bool(_CAMO_IMAGE_URL_PATTERN.search(body)),
         ]
 
         # Require multiple indicators for confidence

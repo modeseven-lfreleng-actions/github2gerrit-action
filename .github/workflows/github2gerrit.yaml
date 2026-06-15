@@ -165,12 +165,19 @@ concurrency:
   group: reusable-${{ github.workflow }}-${{ github.run_id }}
   cancel-in-progress: true
 
+# Default to no permissions; each job grants only what it needs.
+permissions: {}
+
 jobs:
   manual-dispatch:
     # Manual run: allow optional PR_NUMBER (0 => process all PRs)
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     steps:
       # yamllint disable rule:line-length
       # PR_NUMBER normalization is handled by the composite action

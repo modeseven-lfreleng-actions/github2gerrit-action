@@ -51,8 +51,8 @@ class TestSSHDiscovery:
         mock_reachable.return_value = True
         mock_run_cmd.return_value = Mock(
             stdout=(
-                "example.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...\n"
-                "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+                "[example.com]:29418 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...\n"
+                "[example.com]:29418 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
             ),
             stderr="",
             returncode=0,
@@ -62,7 +62,13 @@ class TestSSHDiscovery:
 
         assert "ssh-rsa" in result
         assert "ssh-ed25519" in result
-        assert "example.com" in result
+        # ssh-keyscan emits [host]:port known_hosts entries for non-default
+        # ports (Gerrit uses 29418); assert that exact representation rather
+        # than a loose substring match.
+        host_entries = {
+            line.split()[0] for line in result.splitlines() if line.strip()
+        }
+        assert host_entries == {"[example.com]:29418"}
         mock_reachable.assert_called_once_with("example.com", 29418, timeout=5)
         mock_run_cmd.assert_called_once()
 
