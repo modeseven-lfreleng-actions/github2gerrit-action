@@ -1754,6 +1754,19 @@ def _abandon_gerrit_change(
         abandon_data = {"message": message}
         client.post(abandon_path, data=abandon_data)
         log.debug("Successfully abandoned Gerrit change %s", change_number)
+    except GerritRestError as exc:
+        if exc.is_auth_error:
+            # Expected when no Gerrit REST credentials are available; the
+            # REST layer already surfaced this once. Avoid a duplicate
+            # error-level traceback for an authentication failure.
+            log.debug(
+                "REST abandon for Gerrit change %s failed (HTTP %s)",
+                change_number,
+                exc.status,
+            )
+        else:
+            log.exception("Failed to abandon Gerrit change %s", change_number)
+        raise
     except Exception:
         log.exception("Failed to abandon Gerrit change %s", change_number)
         raise

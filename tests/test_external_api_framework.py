@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import urllib.error
 from io import StringIO
 from pathlib import Path
@@ -120,6 +121,52 @@ def test_external_api_call_non_retryable_error() -> None:
     assert metrics.successful_calls == 0
     assert metrics.failed_calls == 1
     assert metrics.retry_attempts == 0  # No retries for non-transient errors
+
+
+def test_auth_failure_logging_scoped_to_gerrit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """401/403 log suppression must apply only to Gerrit REST.
+
+    Other API types (e.g. GitHub) can also expose a ``.status`` attribute,
+    so their auth/permission failures must retain error-level visibility;
+    only Gerrit REST auth failures are downgraded here (they are surfaced
+    once, as a concise warning, closer to the request).
+    """
+
+    class _StatusError(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__(f"HTTP {status}")
+            self.status = status
+
+    @external_api_call(
+        ApiType.GITHUB, "github_op", policy=RetryPolicy(max_attempts=1)
+    )
+    def github_forbidden() -> None:
+        raise _StatusError(403)
+
+    @external_api_call(
+        ApiType.GERRIT_REST, "gerrit_op", policy=RetryPolicy(max_attempts=1)
+    )
+    def gerrit_forbidden() -> None:
+        raise _StatusError(403)
+
+    reset_api_metrics(ApiType.GITHUB)
+    reset_api_metrics(ApiType.GERRIT_REST)
+
+    with caplog.at_level(logging.DEBUG, logger="github2gerrit.external_api"):
+        with pytest.raises(_StatusError):
+            github_forbidden()
+        with pytest.raises(_StatusError):
+            gerrit_forbidden()
+
+    error_records = [
+        rec for rec in caplog.records if rec.levelno == logging.ERROR
+    ]
+    # GitHub auth failure retains error-level visibility...
+    assert any("github_op" in rec.getMessage() for rec in error_records)
+    # ...while the Gerrit REST auth failure is not logged at error level here.
+    assert not any("gerrit_op" in rec.getMessage() for rec in error_records)
 
 
 def test_external_api_call_retry_exhaustion(

@@ -410,9 +410,13 @@ class Orchestrator:
 
             # Check if client has authentication
             if not client.is_authenticated:
+                from .gerrit_rest import warn_gerrit_credentials_unavailable
+
+                warn_gerrit_credentials_unavailable()
                 log.debug(
-                    "Cannot update Gerrit change metadata: "
-                    "No credentials found (check .netrc or environment)"
+                    "Cannot update Gerrit change metadata for %s: "
+                    "no Gerrit REST credentials available",
+                    change_id,
                 )
                 return False
 

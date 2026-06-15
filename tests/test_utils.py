@@ -6,6 +6,7 @@
 import logging
 import os
 import tempfile
+import threading
 
 from _pytest.logging import LogCaptureFixture
 from _pytest.monkeypatch import MonkeyPatch
@@ -15,7 +16,9 @@ from github2gerrit.utils import env_bool
 from github2gerrit.utils import env_str
 from github2gerrit.utils import is_verbose_mode
 from github2gerrit.utils import log_exception_conditionally
+from github2gerrit.utils import log_warning_once
 from github2gerrit.utils import parse_bool_env
+from github2gerrit.utils import reset_warning_once
 
 
 class TestEnvBool:
@@ -331,6 +334,84 @@ class TestLogExceptionConditionally:
         assert "Test message: arg1" in caplog.text
         # In non-verbose mode, the full traceback should not be present
         assert caplog.records[0].levelname == "ERROR"
+
+
+class TestLogWarningOnce:
+    """Test the log_warning_once warn-once helper."""
+
+    def test_warns_once_for_same_key(self, caplog: LogCaptureFixture) -> None:
+        """Repeated calls with the same key emit a single warning."""
+        reset_warning_once()
+        logger = logging.getLogger("test.warn_once")
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                log_warning_once(logger, "dup_key", "degraded: %s", "reason")
+
+        matching = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and "degraded: reason" in rec.getMessage()
+        ]
+        assert len(matching) == 1
+
+    def test_distinct_keys_each_warn(self, caplog: LogCaptureFixture) -> None:
+        """Different keys are tracked independently."""
+        reset_warning_once()
+        logger = logging.getLogger("test.warn_once")
+
+        with caplog.at_level(logging.WARNING):
+            log_warning_once(logger, "key_a", "first")
+            log_warning_once(logger, "key_b", "second")
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert "first" in messages
+        assert "second" in messages
+
+    def test_thread_safe_warns_once_under_concurrency(
+        self, caplog: LogCaptureFixture
+    ) -> None:
+        """Concurrent callers must still produce exactly one warning.
+
+        PRs are processed in parallel via a ThreadPoolExecutor, so the
+        check-and-record step must be atomic. Many threads racing on the
+        same key must not bypass the warn-once guarantee.
+        """
+        reset_warning_once()
+        logger = logging.getLogger("test.warn_once")
+
+        num_threads = 50
+        start = threading.Barrier(num_threads)
+        errors: list[Exception] = []
+
+        def _worker() -> None:
+            try:
+                # Bounded wait so a stalled worker fails fast (raising
+                # BrokenBarrierError) instead of deadlocking the test run.
+                start.wait(timeout=10)
+                log_warning_once(logger, "race_key", "raced warning")
+            except Exception as exc:
+                errors.append(exc)
+
+        with caplog.at_level(logging.WARNING):
+            threads = [
+                threading.Thread(target=_worker) for _ in range(num_threads)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+
+        # No worker should have stalled at the barrier or otherwise raised.
+        assert not errors
+        # Every thread must have terminated (no leaked/blocked threads).
+        assert all(not thread.is_alive() for thread in threads)
+
+        matching = [
+            rec for rec in caplog.records if "raced warning" in rec.getMessage()
+        ]
+        assert len(matching) == 1
 
 
 class TestAppendGithubOutput:

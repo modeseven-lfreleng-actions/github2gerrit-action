@@ -511,12 +511,24 @@ def _abandon_orphan_changes(
 
     from github2gerrit.gerrit_rest import GerritRestError
     from github2gerrit.gerrit_rest import build_client_for_host
+    from github2gerrit.gerrit_rest import warn_gerrit_credentials_unavailable
 
-    abandoned = []
+    abandoned: list[str] = []
     try:
         client = build_client_for_host(
             gerrit.host, timeout=10.0, max_attempts=3
         )
+
+        # Abandoning a change is a mutating REST call that requires
+        # authentication; without credentials every attempt would 403.
+        # Warn once and skip rather than emitting per-change errors.
+        if not client.is_authenticated:
+            warn_gerrit_credentials_unavailable()
+            log.debug(
+                "Skipping orphan-change abandon: "
+                "no Gerrit REST credentials available"
+            )
+            return abandoned
 
         for change_id in orphan_ids:
             try:
@@ -559,12 +571,24 @@ def _comment_orphan_changes(
 
     from github2gerrit.gerrit_rest import GerritRestError
     from github2gerrit.gerrit_rest import build_client_for_host
+    from github2gerrit.gerrit_rest import warn_gerrit_credentials_unavailable
 
-    commented = []
+    commented: list[str] = []
     try:
         client = build_client_for_host(
             gerrit.host, timeout=10.0, max_attempts=3
         )
+
+        # Posting a review comment is a mutating REST call that requires
+        # authentication; without credentials every attempt would 403.
+        # Warn once and skip rather than emitting per-change errors.
+        if not client.is_authenticated:
+            warn_gerrit_credentials_unavailable()
+            log.debug(
+                "Skipping orphan-change comment: "
+                "no Gerrit REST credentials available"
+            )
+            return commented
 
         for change_id in orphan_ids:
             try:

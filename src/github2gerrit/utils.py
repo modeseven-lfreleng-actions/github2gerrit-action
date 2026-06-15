@@ -10,6 +10,7 @@ and ensure consistent behavior.
 
 import logging
 import os
+import threading
 from typing import Any
 
 
@@ -90,6 +91,50 @@ def log_exception_conditionally(
         logger.exception(message, *args)
     else:
         logger.error(message, *args)
+
+
+_WARNED_ONCE_LOCK = threading.Lock()
+_WARNED_ONCE_KEYS: set[str] = set()
+
+
+def log_warning_once(
+    logger: logging.Logger, dedup_key: str, message: str, *args: Any
+) -> None:
+    """Emit a warning at most once per process for a given dedup key.
+
+    Useful for expected, recurring conditions (for example, an
+    authentication-gated operation that is skipped because no
+    credentials are available) where surfacing the situation once is
+    helpful but repeating it for every affected item would be noisy.
+
+    Thread-safe: PRs may be processed concurrently (see the
+    ``ThreadPoolExecutor`` in ``cli._process_bulk``), so the
+    check-and-record step is guarded by a lock to preserve the
+    warn-once guarantee. The warning itself is emitted outside the lock
+    to avoid holding it during logging I/O.
+
+    Args:
+        logger: Logger instance to use.
+        dedup_key: Stable key identifying the warning; subsequent calls
+            with the same key are suppressed.
+        message: Log message format string.
+        *args: Arguments for message formatting.
+    """
+    with _WARNED_ONCE_LOCK:
+        if dedup_key in _WARNED_ONCE_KEYS:
+            return
+        _WARNED_ONCE_KEYS.add(dedup_key)
+    logger.warning(message, *args)
+
+
+def reset_warning_once() -> None:
+    """Clear the warn-once dedup cache.
+
+    Primarily intended for tests that need to assert warn-once behavior
+    across independent cases within a single process.
+    """
+    with _WARNED_ONCE_LOCK:
+        _WARNED_ONCE_KEYS.clear()
 
 
 def append_github_output(outputs: dict[str, str]) -> None:

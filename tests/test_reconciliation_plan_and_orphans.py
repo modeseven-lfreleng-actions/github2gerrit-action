@@ -157,6 +157,8 @@ def test_topic_reuse_and_orphan_policy_comment(
 
     # Mock Gerrit REST client for comment operations
     class MockRestClient:
+        is_authenticated = True
+
         def post(self, path, data=None):
             # Simulate successful REST operation
             return {"message": "comment added"}
@@ -230,6 +232,8 @@ def test_orphan_policy_variants(policy, expected_field, caplog, monkeypatch):
 
     # Mock Gerrit REST client for all policies (abandon/comment operations)
     class MockRestClient:
+        is_authenticated = True
+
         def post(self, path, data=None):
             # Simulate successful REST operation
             return {"message": "operation completed"}
@@ -280,6 +284,8 @@ def test_comment_based_reuse_extension_digest(caplog, monkeypatch):
     # Mock Gerrit REST client (no orphan actions expected, but needed for
     # consistency)
     class MockRestClient:
+        is_authenticated = True
+
         def post(self, path, data=None):
             return {"message": "operation completed"}
 

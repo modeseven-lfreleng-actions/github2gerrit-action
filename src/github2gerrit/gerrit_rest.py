@@ -46,6 +46,7 @@ from .gerrit_urls import create_gerrit_url_builder
 from .netrc import GerritCredentials
 from .netrc import resolve_gerrit_credentials
 from .utils import log_exception_conditionally
+from .utils import log_warning_once
 
 
 log = logging.getLogger("github2gerrit.gerrit_rest")
@@ -80,12 +81,79 @@ _TRANSIENT_ERR_SUBSTRINGS: Final[tuple[str, ...]] = (
     "gateway timeout",
 )
 
+# HTTP status codes that indicate an authentication/authorization problem
+# rather than a transient fault or a bug. These are expected when no
+# Gerrit REST credentials are available (or they are insufficient for the
+# requested operation), and are surfaced as concise, default-visible
+# warnings rather than error-level tracebacks.
+_AUTH_ERROR_STATUSES: Final[tuple[int, ...]] = (401, 403)
+
+# Shared dedup key so the "no Gerrit REST credentials" situation is
+# surfaced at most once per run, regardless of how many auth-gated
+# operations are affected.
+_CREDENTIALS_UNAVAILABLE_KEY: Final[str] = "gerrit_rest_credentials_unavailable"
+
+
+def _is_auth_status(status: int | None) -> bool:
+    """Return True if the HTTP status indicates an auth/authorization error."""
+    return status in _AUTH_ERROR_STATUSES
+
+
+def _extract_http_status(exc: BaseException) -> int | None:
+    """Best-effort extraction of an HTTP status code from an exception.
+
+    Handles both the urllib path (``urllib.error.HTTPError.code``) and the
+    pygerrit2/requests path (``HTTPError.response.status_code``).
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    return None
+
+
+def warn_gerrit_credentials_unavailable() -> None:
+    """Warn once per run that authenticated Gerrit REST is unavailable.
+
+    Call this from auth-gated code paths before skipping an operation that
+    requires Gerrit REST credentials. The warning is emitted at most once
+    per process to avoid log spam while still making the degraded behavior
+    visible at the default log level.
+    """
+    log_warning_once(
+        log,
+        _CREDENTIALS_UNAVAILABLE_KEY,
+        "Gerrit REST credentials are not available; authenticated Gerrit "
+        "REST operations are disabled. Fallback behavior may apply and "
+        "could degrade performance. Provide GERRIT_HTTP_USER and "
+        "GERRIT_HTTP_PASSWORD (or a .netrc entry) to enable authenticated "
+        "Gerrit REST access.",
+    )
+
 
 # Removed individual retry logic functions - now using centralized framework
 
 
 class GerritRestError(RuntimeError):
-    """Raised for non-retryable REST errors or exhausted retries."""
+    """Raised for non-retryable REST errors or exhausted retries.
+
+    Args:
+        status: HTTP status code associated with the failure, when known.
+            Used by callers to distinguish authentication/authorization
+            problems (401/403) from transient or unexpected errors.
+    """
+
+    def __init__(self, *args: object, status: int | None = None) -> None:
+        super().__init__(*args)
+        self.status = status
+
+    @property
+    def is_auth_error(self) -> bool:
+        """Return True if this error stems from an auth failure (401/403)."""
+        return _is_auth_status(self.status)
 
 
 @dataclass(frozen=True)
@@ -264,13 +332,38 @@ class GerritRestClient:
         except urllib.error.HTTPError as http_exc:
             status = getattr(http_exc, "code", None)
             msg = f"Gerrit REST {method} {url} failed with HTTP {status}"
-            log_exception_conditionally(log, msg)
-            raise GerritRestError(msg) from http_exc
+            self._log_request_failure(msg, status)
+            raise GerritRestError(msg, status=status) from http_exc
 
         except Exception as exc:
+            status = _extract_http_status(exc)
             msg = f"Gerrit REST {method} {url} failed: {exc}"
+            self._log_request_failure(msg, status)
+            raise GerritRestError(msg, status=status) from exc
+
+    @staticmethod
+    def _log_request_failure(msg: str, status: int | None) -> None:
+        """Log a failed REST request at an appropriate level.
+
+        Authentication/authorization failures (401/403) are expected when
+        credentials are missing or insufficient; they are surfaced as a
+        single concise warning per run rather than an error-level traceback,
+        since they are neither transient faults nor bugs. All other failures
+        retain the existing conditional error/traceback behavior.
+        """
+        if _is_auth_status(status):
+            log_warning_once(
+                log,
+                f"gerrit_rest_auth_{status}",
+                "Gerrit REST authentication failed (HTTP %s): the configured "
+                "credentials are missing or insufficient for this operation. "
+                "Fallback behavior may apply and could degrade performance. "
+                "Details: %s",
+                status,
+                msg,
+            )
+        else:
             log_exception_conditionally(log, msg)
-            raise GerritRestError(msg) from exc
 
     def __repr__(self) -> str:  # pragma: no cover - convenience
         masked = ""
@@ -385,4 +478,5 @@ __all__ = [
     "GerritRestClient",
     "GerritRestError",
     "build_client_for_host",
+    "warn_gerrit_credentials_unavailable",
 ]
