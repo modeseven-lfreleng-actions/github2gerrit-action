@@ -11,9 +11,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import urlparse
 
 from .gerrit_rest import GerritRestClient
 from .gerrit_rest import warn_gerrit_credentials_unavailable
+from .trailers import GITHUB_PR_TRAILER
+from .trailers import parse_trailers
+from .utils import env_bool
+from .utils import log_warning_once
 
 
 log = logging.getLogger(__name__)
@@ -121,19 +126,71 @@ def query_changes_by_topic(
         return changes
 
 
+def _change_belongs_to_repository(
+    change: GerritChange, github_repository: str
+) -> bool:
+    """Return True if a change's GitHub-PR trailer targets the given repo.
+
+    The ``GitHub-PR`` trailer is a pull request URL of the form
+    ``https://github.com/{owner}/{repo}/pull/{n}``. Matching on it scopes
+    anonymous supersession queries to changes created by GitHub2Gerrit for
+    the current repository -- a precise replacement for ``owner:self`` that
+    does not require an authenticated session.
+
+    The trailer is parsed as a URL and matched on its **path** prefix
+    (``/{owner}/{repo}/pull/``) rather than a bare substring. The value must
+    be an absolute ``http(s)`` URL (scheme + host), so malformed or
+    relative values (e.g. ``/org/repo/pull/1``) and unrelated text that
+    merely contains the substring (for example inside a query string) do
+    not produce false positives. The host itself is not compared, so
+    GitHub Enterprise URLs still match.
+    """
+    target = github_repository.strip().strip("/").lower()
+    if not target:
+        return False
+    prefix = f"/{target}/pull/"
+    trailers = parse_trailers(change.commit_message or "")
+    for value in trailers.get(GITHUB_PR_TRAILER, []):
+        if not value:
+            continue
+        try:
+            parsed = urlparse(value.strip())
+        except ValueError:
+            continue
+        # Require an absolute http(s) URL; reject relative/malformed values.
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            continue
+        if parsed.path.lower().startswith(prefix):
+            return True
+    return False
+
+
 def query_open_changes_by_project(
     client: GerritRestClient,
     project: str,
     *,
     branch: str | None = None,
     max_results: int = 100,
+    github_repository: str | None = None,
 ) -> list[GerritChange]:
-    """Query open changes owned by the current user in a Gerrit project.
+    """Query open GitHub2Gerrit changes in a Gerrit project.
 
-    Used by the supersession sweep to discover open changes that
-    may be superseded by a newer dependency update.  Only returns
-    changes owned by the authenticated user (``owner:self``) to
-    avoid acting on unrelated human-authored changes.
+    Used by the supersession sweep to discover open changes that may be
+    superseded by a newer dependency update.
+
+    When the REST client is authenticated, the query is restricted to
+    changes owned by the authenticated user via the ``owner:self``
+    predicate (the original, most precise behaviour).
+
+    When the client is unauthenticated, ``owner:self`` cannot be used (the
+    server rejects it with HTTP 403). If the anonymous fallback is enabled
+    (``G2G_ANON_SUPERSEDE_FALLBACK``, default on) and ``github_repository``
+    is provided, the query instead lists all open changes in the
+    project/branch and keeps only those whose ``GitHub-PR`` trailer targets
+    ``github_repository``. This scopes results to GitHub2Gerrit changes for
+    the current repository without requiring credentials. If the fallback
+    is disabled or no repository is available, the sweep is skipped (with a
+    warning) as before.
 
     Args:
         client: Gerrit REST client.
@@ -142,37 +199,61 @@ def query_open_changes_by_project(
             When provided, only changes targeting this branch are
             returned.
         max_results: Maximum number of results to return.
+        github_repository: Current GitHub repository in ``owner/repo``
+            form. Required to enable the anonymous fallback.
 
     Returns:
         List of open ``GerritChange`` objects.
     """
-    query = f'project:"{_gerrit_quote(project)}" status:open owner:self'
+    base_query = f'project:"{_gerrit_quote(project)}" status:open'
     if branch:
-        query += f' branch:"{_gerrit_quote(branch)}"'
+        base_query += f' branch:"{_gerrit_quote(branch)}"'
 
-    # The ``owner:self`` predicate requires an authenticated Gerrit
-    # session; an anonymous request is rejected with HTTP 403. Skip the
-    # query (warning once per run) instead of issuing a request that is
-    # guaranteed to fail and would otherwise emit error-level noise.
-    if not client.is_authenticated:
+    repo_filter: str | None = None
+    if client.is_authenticated:
+        query = f"{base_query} owner:self"
+    else:
+        # owner:self requires an authenticated session. Fall back to an
+        # anonymous project/branch query scoped to the current repository
+        # via the GitHub-PR trailer, when permitted and possible.
+        normalized_repo = (github_repository or "").strip().strip("/")
+        fallback_enabled = env_bool("G2G_ANON_SUPERSEDE_FALLBACK", True)
+        if not fallback_enabled or not normalized_repo:
+            warn_gerrit_credentials_unavailable()
+            log.debug(
+                "Skipping owner:self query for project '%s': no Gerrit "
+                "REST credentials and anonymous fallback unavailable "
+                "(enabled=%s, repository=%s)",
+                project,
+                fallback_enabled,
+                normalized_repo,
+            )
+            return []
+        # owner:self is unavailable without authentication. Narrow the
+        # anonymous query server-side to GitHub2Gerrit changes (which all
+        # carry the GitHub-PR trailer in their commit message) so the
+        # result set stays small even on busy projects; the precise
+        # repository scoping is then applied client-side below.
+        query = f'{base_query} message:"{GITHUB_PR_TRAILER}"'
+        repo_filter = normalized_repo
+        # Surface the missing-credentials condition once at default level
+        # via the shared warn-once helper (its message already notes that
+        # fallback behavior may apply); keep the per-call detail at debug,
+        # since this can run multiple times per invocation (e.g. Strategy 5
+        # and the post-push sweep).
         warn_gerrit_credentials_unavailable()
         log.debug(
-            "Skipping owner:self query for project '%s': "
-            "no Gerrit REST credentials available",
+            "No Gerrit REST credentials; using anonymous supersession "
+            "fallback for project '%s' scoped to repository '%s'",
             project,
+            normalized_repo,
         )
-        return []
 
     log.debug("Querying Gerrit for open changes: %s", query)
 
     try:
         changes = _execute_query_with_pagination(
             client, query, max_results=max_results
-        )
-        log.debug(
-            "Found %d open changes in project '%s'",
-            len(changes),
-            project,
         )
     except Exception as exc:
         log.warning(
@@ -181,8 +262,44 @@ def query_open_changes_by_project(
             exc,
         )
         return []
-    else:
-        return changes
+
+    if repo_filter is not None:
+        # The cap may simply have been met exactly, but it can also mean
+        # the result set was truncated; surface the possibility once rather
+        # than silently missing changes (which could leave a duplicate
+        # un-reused/un-abandoned).
+        if len(changes) >= max_results:
+            log_warning_once(
+                log,
+                "gerrit_anon_supersede_truncated",
+                "Anonymous supersession query for project '%s' returned the "
+                "maximum of %d result(s); results may be truncated and some "
+                "GitHub2Gerrit changes may not have been examined. Provide "
+                "Gerrit REST credentials for a precise owner-scoped query.",
+                project,
+                max_results,
+            )
+        scoped = [
+            change
+            for change in changes
+            if _change_belongs_to_repository(change, repo_filter)
+        ]
+        log.debug(
+            "Anonymous fallback: %d of %d open change(s) in project "
+            "'%s' belong to repository '%s'",
+            len(scoped),
+            len(changes),
+            project,
+            repo_filter,
+        )
+        return scoped
+
+    log.debug(
+        "Found %d open changes in project '%s'",
+        len(changes),
+        project,
+    )
+    return changes
 
 
 def _execute_query_with_pagination(

@@ -1780,6 +1780,7 @@ def abandon_superseded_dependency_changes(
     *,
     dry_run: bool = False,
     target_branch: str | None = None,
+    github_repository: str | None = None,
 ) -> list[str]:
     """Abandon open Gerrit changes superseded by a newer dependency update.
 
@@ -1801,6 +1802,10 @@ def abandon_superseded_dependency_changes(
         dry_run: If True, log but do not actually abandon.
         target_branch: Optional Gerrit branch name.  When provided,
             only changes targeting this branch are considered.
+        github_repository: Current GitHub repository in ``owner/repo``
+            form. Enables the anonymous supersession fallback when no
+            Gerrit REST credentials are available (the discovery query is
+            then scoped to this repository via the ``GitHub-PR`` trailer).
 
     Returns:
         List of Gerrit change numbers that were abandoned
@@ -1830,7 +1835,11 @@ def abandon_superseded_dependency_changes(
     try:
         client = build_client_for_host(gerrit_server)
         open_changes = query_open_changes_by_project(
-            client, gerrit_project, branch=target_branch, max_results=200
+            client,
+            gerrit_project,
+            branch=target_branch,
+            max_results=200,
+            github_repository=github_repository,
         )
 
         url_builder = create_gerrit_url_builder(gerrit_server)

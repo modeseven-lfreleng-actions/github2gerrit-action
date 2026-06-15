@@ -1384,6 +1384,29 @@ variable.
 **Note**: Unknown configuration keys will generate warnings to help catch typos
 and missing functionality.
 
+### Supersession Sweep Without REST Credentials
+
+The dependency **supersession sweep** (which reuses or abandons older open
+Gerrit changes when GitHub2Gerrit pushes a newer update for the same
+dependency) needs to list GitHub2Gerrit's own open changes. With Gerrit REST
+credentials it does this precisely via the `owner:self` query operator.
+
+`owner:self` requires an authenticated session, so without Gerrit REST
+credentials the tool falls back to an **anonymous** query: it lists the
+project/branch's open GitHub2Gerrit changes (narrowed server-side via the
+`GitHub-PR` trailer, a public read-only operation) and then keeps only those
+whose trailer points at the current repository. This scopes the sweep to
+GitHub2Gerrit changes for this repository without needing a Gerrit HTTP
+password.
+
+- Use `G2G_ANON_SUPERSEDE_FALLBACK` (default `true`) to control the fallback.
+- Set it to `false` to disable the fallback; without credentials the tool then
+  skips the sweep and logs a warning, as before.
+- The fallback depends on the Gerrit server allowing anonymous change queries.
+  If the server rejects that query, the tool skips the sweep gracefully.
+- On large projects the query has a result cap; if it reaches that cap the
+  tool warns that the sweep may be incomplete.
+
 ### Credential Derivation
 
 When `GERRIT_SSH_USER_G2G` and `GERRIT_SSH_USER_G2G_EMAIL` are not explicitly provided,

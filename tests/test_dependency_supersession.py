@@ -22,6 +22,8 @@ from typing import Any
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import pytest
+
 from github2gerrit.core import Orchestrator
 from github2gerrit.gerrit_pr_closer import abandon_superseded_dependency_changes
 from github2gerrit.gerrit_query import GerritChange
@@ -61,6 +63,35 @@ def _gerrit_change(
         commit_message=commit_message,
         topic=topic,
     )
+
+
+def _raw_change(
+    number: int,
+    subject: str,
+    pr_url: str | None = None,
+) -> dict[str, Any]:
+    """Build a raw Gerrit REST change dict (as returned by /changes/).
+
+    When ``pr_url`` is provided, a ``GitHub-PR`` trailer is added to the
+    current revision's commit message so the anonymous repo-scoping filter
+    can be exercised.
+    """
+    message = subject
+    if pr_url:
+        message = f"{subject}\n\nGitHub-PR: {pr_url}\n"
+    return {
+        "change_id": f"I{number}",
+        "_number": number,
+        "subject": subject,
+        "status": "NEW",
+        "current_revision": "rev1",
+        "revisions": {
+            "rev1": {
+                "files": {},
+                "commit": {"message": message},
+            }
+        },
+    }
 
 
 # -------------------------------------------------------------------
@@ -164,11 +195,12 @@ class TestQueryOpenChangesByProject:
         assert result == []
 
     def test_skips_when_unauthenticated(self) -> None:
-        """owner:self requires auth; skip (no request) when unauthenticated.
+        """Unauthenticated with no repository: skip (no request issued).
 
         Without Gerrit REST credentials the ``owner:self`` query is
-        guaranteed to fail with HTTP 403, so the helper must short-circuit
-        and never issue the request, returning an empty list.
+        guaranteed to fail with HTTP 403. When no repository is available
+        to drive the anonymous fallback, the helper must short-circuit and
+        never issue the request, returning an empty list.
         """
         from github2gerrit.utils import reset_warning_once
 
@@ -179,6 +211,227 @@ class TestQueryOpenChangesByProject:
 
         result = query_open_changes_by_project(fake_client, "org/repo")
 
+        assert result == []
+        fake_client.get.assert_not_called()
+
+    def test_authenticated_uses_owner_self(self) -> None:
+        """Authenticated client must use the owner:self predicate."""
+        fake_client = MagicMock()
+        fake_client.is_authenticated = True
+        fake_client.get.return_value = []
+
+        query_open_changes_by_project(fake_client, "org/repo", branch="main")
+
+        path = fake_client.get.call_args[0][0]
+        # owner:self is URL-encoded as owner%3Aself in the query string
+        assert "owner%3Aself" in path
+
+    def test_anonymous_fallback_scopes_to_repository(self) -> None:
+        """Unauthenticated + repo: query anonymously, scope by trailer.
+
+        The query must NOT use owner:self, and only changes whose
+        GitHub-PR trailer targets the current repository are returned.
+        """
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        ours = _raw_change(
+            100,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "https://github.com/org/repo/pull/42",
+        )
+        other_repo = _raw_change(
+            101,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "https://github.com/other/project/pull/7",
+        )
+        human = _raw_change(102, "Fix: unrelated human change")
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = [ours, other_repo, human]
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+
+        path = fake_client.get.call_args[0][0]
+        assert "owner%3Aself" not in path
+        assert [change.number for change in result] == ["100"]
+
+    def test_anonymous_fallback_repo_match_is_case_insensitive(self) -> None:
+        """Repo trailer matching ignores case differences."""
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        ours = _raw_change(
+            200,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "https://github.com/Org/Repo/pull/9",
+        )
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = [ours]
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+        assert [change.number for change in result] == ["200"]
+
+    def test_anonymous_fallback_matches_ghes_host(self) -> None:
+        """The host is ignored, so GitHub Enterprise URLs still match."""
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        ours = _raw_change(
+            210,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "https://ghe.example.com/org/repo/pull/9",
+        )
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = [ours]
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+        assert [change.number for change in result] == ["210"]
+
+    def test_anonymous_fallback_rejects_substring_in_query(self) -> None:
+        """Non-absolute or substring-only repo references must not match.
+
+        The matcher requires an absolute http(s) URL and checks its path
+        prefix, so a different repo's URL that merely mentions the target
+        repo in its query string, a non-URL value, and a relative path
+        (e.g. ``/org/repo/pull/1``) are all correctly excluded.
+        """
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        other = _raw_change(
+            220,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "https://github.com/other/project/pull/7?ref=/org/repo/pull/1",
+        )
+        malformed = _raw_change(
+            221,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "not-a-url-/org/repo/pull/1",
+        )
+        relative = _raw_change(
+            222,
+            "chore: bump requests from 2.31.0 to 2.32.0",
+            "/org/repo/pull/1",
+        )
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = [other, malformed, relative]
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+        assert result == []
+
+    def test_anonymous_fallback_narrows_query_by_message(self) -> None:
+        """The anonymous query narrows server-side via message:GitHub-PR.
+
+        Without owner:self, the result set is reduced server-side to
+        GitHub2Gerrit changes (which carry the GitHub-PR trailer) so busy
+        projects do not truncate before the relevant changes are seen.
+        """
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = []
+
+        query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+
+        path = fake_client.get.call_args[0][0]
+        assert "owner%3Aself" not in path
+        # message:"GitHub-PR" is URL-encoded in the query string
+        assert "message%3A%22GitHub-PR%22" in path
+
+    def test_anonymous_fallback_warns_on_truncation(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Hitting the result cap emits a one-time truncation warning."""
+        import logging
+
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        c1 = _raw_change(
+            300,
+            "chore: bump x from 1 to 2",
+            "https://github.com/org/repo/pull/1",
+        )
+        c2 = _raw_change(
+            301,
+            "chore: bump y from 1 to 2",
+            "https://github.com/org/repo/pull/2",
+        )
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+        fake_client.get.return_value = [c1, c2]
+
+        with caplog.at_level(logging.WARNING):
+            result = query_open_changes_by_project(
+                fake_client,
+                "org/repo",
+                github_repository="org/repo",
+                max_results=2,
+            )
+
+        assert {change.number for change in result} == {"300", "301"}
+        assert any(
+            "results may be truncated" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_anonymous_fallback_disabled_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Disabling the fallback flag skips even when repo is known."""
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+        monkeypatch.setenv("G2G_ANON_SUPERSEDE_FALLBACK", "false")
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="org/repo"
+        )
+        assert result == []
+        fake_client.get.assert_not_called()
+
+    def test_anonymous_fallback_whitespace_repo_skips(self) -> None:
+        """A blank/whitespace-only repository must not trigger a query."""
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+
+        result = query_open_changes_by_project(
+            fake_client, "org/repo", github_repository="   "
+        )
         assert result == []
         fake_client.get.assert_not_called()
 
@@ -467,6 +720,7 @@ class TestAbandonSupersededDependencyChanges:
             current_subject="chore: bump requests from 2.31.0 to 2.32.0",
             exclude_change_ids=[],
             target_branch="main",
+            github_repository="org/repo-gh",
         )
 
         mock_query.assert_called_once_with(
@@ -474,6 +728,7 @@ class TestAbandonSupersededDependencyChanges:
             "org/repo",
             branch="main",
             max_results=200,
+            github_repository="org/repo-gh",
         )
 
 
