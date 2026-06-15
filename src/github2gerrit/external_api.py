@@ -380,12 +380,26 @@ def external_api_call(
                     reason = (
                         "final attempt" if is_final_attempt else "non-retryable"
                     )
-                    log_exception_conditionally(
-                        log,
+                    failure_msg = (
                         f"[{api_type.value}] {operation} failed ({reason}) "
                         f"after {attempt} attempt(s) in {duration:.2f}s: "
-                        f"{target}",
+                        f"{target}"
                     )
+                    # Authentication/authorization failures (Gerrit REST
+                    # 401/403) are surfaced once, closer to the request, as a
+                    # concise warning. Avoid emitting a duplicate error/
+                    # traceback for them here. Scope this strictly to Gerrit
+                    # REST: other API types (e.g. GitHub) may also expose a
+                    # ``.status`` attribute, and their auth/permission
+                    # failures must retain error-level visibility.
+                    is_gerrit_auth_failure = (
+                        api_type == ApiType.GERRIT_REST
+                        and getattr(exc, "status", None) in (401, 403)
+                    )
+                    if is_gerrit_auth_failure:
+                        log.debug(failure_msg)
+                    else:
+                        log_exception_conditionally(log, failure_msg)
                     _update_metrics(api_type, context, success=False, exc=exc)
                     raise
                 else:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import os
 import stat
 from collections.abc import Callable
@@ -289,3 +290,139 @@ def test_commit_msg_hook_integrity_success_and_executable(
     # Cleanup not strictly necessary, but keep tmp tidy
     with contextlib.suppress(OSError):
         os.remove(hook_path)
+
+
+def test_gerrit_rest_403_sets_auth_status_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 403 should produce an auth-tagged error and a single warning.
+
+    Authentication/authorization failures are expected when credentials
+    are missing or insufficient. They must be surfaced as a concise,
+    default-visible warning (not an error-level traceback), and the
+    resulting GerritRestError must carry the HTTP status so callers can
+    distinguish auth problems from transient faults.
+    """
+    from github2gerrit.utils import reset_warning_once
+
+    reset_warning_once()
+
+    # Force urllib path and stub sleep
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest._PygerritRestApi", None, raising=True
+    )
+    monkeypatch.setattr("time.sleep", lambda s: None, raising=False)
+
+    import urllib.error
+
+    def _fake_urlopen(req: Any, timeout: float | None = None) -> _DummyResp:
+        headers: Message[str, str] = Message()
+        raise urllib.error.HTTPError(
+            url="https://gerrit.example.org/changes/?q=owner:self",
+            code=403,
+            msg="Forbidden",
+            hdrs=headers,
+            fp=io.BytesIO(b""),
+        )
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.urllib.request.urlopen",
+        _fake_urlopen,
+        raising=True,
+    )
+
+    client = GerritRestClient(
+        base_url="https://gerrit.example.org/",
+        timeout=0.1,
+        max_attempts=3,
+    )
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(GerritRestError) as ei,
+    ):
+        client.get("/changes/?q=owner:self&n=1")
+
+    assert ei.value.status == 403
+    assert ei.value.is_auth_error is True
+
+    auth_warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+        and "authentication failed" in rec.getMessage().lower()
+    ]
+    assert len(auth_warnings) == 1
+
+
+def test_gerrit_rest_403_warning_is_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Repeated 403s within a run must warn at most once."""
+    from github2gerrit.utils import reset_warning_once
+
+    reset_warning_once()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest._PygerritRestApi", None, raising=True
+    )
+    monkeypatch.setattr("time.sleep", lambda s: None, raising=False)
+
+    import urllib.error
+
+    def _fake_urlopen(req: Any, timeout: float | None = None) -> _DummyResp:
+        headers: Message[str, str] = Message()
+        raise urllib.error.HTTPError(
+            url="https://gerrit.example.org/changes/?q=owner:self",
+            code=403,
+            msg="Forbidden",
+            hdrs=headers,
+            fp=io.BytesIO(b""),
+        )
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.urllib.request.urlopen",
+        _fake_urlopen,
+        raising=True,
+    )
+
+    client = GerritRestClient(
+        base_url="https://gerrit.example.org/",
+        timeout=0.1,
+        max_attempts=1,
+    )
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            with pytest.raises(GerritRestError):
+                client.get("/changes/?q=owner:self&n=1")
+
+    auth_warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+        and "authentication failed" in rec.getMessage().lower()
+    ]
+    assert len(auth_warnings) == 1
+
+
+def test_warn_gerrit_credentials_unavailable_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shared credentials-unavailable helper must warn once per run."""
+    from github2gerrit.gerrit_rest import warn_gerrit_credentials_unavailable
+    from github2gerrit.utils import reset_warning_once
+
+    reset_warning_once()
+
+    with caplog.at_level(logging.WARNING):
+        warn_gerrit_credentials_unavailable()
+        warn_gerrit_credentials_unavailable()
+        warn_gerrit_credentials_unavailable()
+
+    creds_warnings = [
+        rec
+        for rec in caplog.records
+        if "credentials are not available" in rec.getMessage().lower()
+    ]
+    assert len(creds_warnings) == 1

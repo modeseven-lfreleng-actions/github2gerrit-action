@@ -21,6 +21,9 @@ class MockGerritRestClient:
     def __init__(self):
         self.post_calls = []
         self.should_fail = {}
+        # Mirror the real GerritRestClient interface: these tests simulate
+        # an authenticated client that can perform mutating REST calls.
+        self.is_authenticated = True
 
     def post(self, path: str, data: dict | None = None):
         """Record POST calls and optionally simulate failures."""

@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .gerrit_rest import GerritRestClient
+from .gerrit_rest import warn_gerrit_credentials_unavailable
 
 
 log = logging.getLogger(__name__)
@@ -148,6 +149,20 @@ def query_open_changes_by_project(
     query = f'project:"{_gerrit_quote(project)}" status:open owner:self'
     if branch:
         query += f' branch:"{_gerrit_quote(branch)}"'
+
+    # The ``owner:self`` predicate requires an authenticated Gerrit
+    # session; an anonymous request is rejected with HTTP 403. Skip the
+    # query (warning once per run) instead of issuing a request that is
+    # guaranteed to fail and would otherwise emit error-level noise.
+    if not client.is_authenticated:
+        warn_gerrit_credentials_unavailable()
+        log.debug(
+            "Skipping owner:self query for project '%s': "
+            "no Gerrit REST credentials available",
+            project,
+        )
+        return []
+
     log.debug("Querying Gerrit for open changes: %s", query)
 
     try:

@@ -163,6 +163,25 @@ class TestQueryOpenChangesByProject:
         result = query_open_changes_by_project(fake_client, "org/repo")
         assert result == []
 
+    def test_skips_when_unauthenticated(self) -> None:
+        """owner:self requires auth; skip (no request) when unauthenticated.
+
+        Without Gerrit REST credentials the ``owner:self`` query is
+        guaranteed to fail with HTTP 403, so the helper must short-circuit
+        and never issue the request, returning an empty list.
+        """
+        from github2gerrit.utils import reset_warning_once
+
+        reset_warning_once()
+
+        fake_client = MagicMock()
+        fake_client.is_authenticated = False
+
+        result = query_open_changes_by_project(fake_client, "org/repo")
+
+        assert result == []
+        fake_client.get.assert_not_called()
+
 
 # -------------------------------------------------------------------
 # abandon_superseded_dependency_changes
