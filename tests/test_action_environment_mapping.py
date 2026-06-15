@@ -109,15 +109,16 @@ class TestActionEnvironmentMapping:
 
         env_mapping = cli_step.get("env", {})
 
-        # Test environment variables set by previous steps
-        computed_vars = [
-            "SYNC_ALL_OPEN_PRS",
-            "PR_NUMBER",
-        ]
+        # These are computed by the upstream "Extract PR number" step and
+        # passed through its step outputs (not GITHUB_ENV, which Zizmor
+        # flags as a code-execution vector).
+        computed_vars = {
+            "SYNC_ALL_OPEN_PRS": "${{ steps.extract.outputs.sync_all }}",
+            "PR_NUMBER": "${{ steps.extract.outputs.pr_number }}",
+        }
 
-        for var in computed_vars:
+        for var, expected_value in computed_vars.items():
             assert var in env_mapping
-            expected_value = f"${{{{ env.{var} }}}}"
             assert env_mapping[var] == expected_value
 
     def test_issue_id_conditional_mapping(self, action_config):

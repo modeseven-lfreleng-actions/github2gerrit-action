@@ -179,11 +179,13 @@ runs:
     - name: "Check if GitHub2Gerrit is disabled"
       id: disabled-check
       shell: bash
+      env:
+        INPUT_G2G_DISABLED: ${{ inputs.G2G_DISABLED }}
       run: |
         # Check if GitHub2Gerrit is disabled
         set -euo pipefail
         DISABLED_ENV="${G2G_DISABLED:-}"
-        DISABLED_INPUT="${{ inputs.G2G_DISABLED }}"
+        DISABLED_INPUT="${INPUT_G2G_DISABLED:-}"
         # Normalize: accept the same truthy set as env_bool()
         # (1/true/yes/on, case-insensitive, trimmed)
         _normalize() {
@@ -210,6 +212,10 @@ runs:
         fetch-depth: ${{ inputs.FETCH_DEPTH }}
         # Ensure we are on the PR's head SHA when triggered by PR events
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        # The action authenticates to Gerrit over SSH and to GitHub via an
+        # explicit GITHUB_TOKEN env var, so the checkout token does not need
+        # to be persisted into the local git config.
+        persist-credentials: false
 
     - name: "Setup Python"
       if: steps.disabled-check.outputs.disabled != 'true'
@@ -233,15 +239,16 @@ runs:
         # when git metadata is unavailable
         # GitHub Actions shallow checkout doesn't include .git history
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0+dev"
+        USE_LOCAL_ACTION: ${{ inputs.USE_LOCAL_ACTION }}
       run: |
         # Setup github2gerrit
         set -euo pipefail
         uv --version
         # Install locally for self-testing, use uvx for external repos
-        if [[ "${{ inputs.USE_LOCAL_ACTION }}" == "true" ]] || \
-           [[ "${{ github.repository }}" =~ lfreleng-actions/github2gerrit-action ]]; then
-          echo "Installing with: uv pip install --system ${{ github.action_path }}"
-          uv pip install --system ${{ github.action_path }}
+        if [[ "${USE_LOCAL_ACTION}" == "true" ]] || \
+           [[ "${GITHUB_REPOSITORY}" =~ lfreleng-actions/github2gerrit-action ]]; then
+          echo "Installing with: uv pip install --system ${GITHUB_ACTION_PATH}"
+          uv pip install --system "${GITHUB_ACTION_PATH}"
         else
           echo "uvx will install GitHub2Gerrit from PyPI"
         fi
@@ -258,11 +265,14 @@ runs:
 
     - name: "Normalize PR_NUMBER"
       if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name == 'workflow_dispatch' }}
+      id: normalize
       shell: bash
+      env:
+        INPUT_PR_NUMBER: ${{ inputs.PR_NUMBER }}
       run: |
         # Normalize PR_NUMBER
         set -euo pipefail
-        pr_in="${{ inputs.PR_NUMBER }}"
+        pr_in="${INPUT_PR_NUMBER:-}"
         if [[ -z "${pr_in}" || "${pr_in}" == "null" ]]; then
           pr_in="0"
         fi
@@ -271,51 +281,53 @@ runs:
           exit 2
         fi
         if [[ "${pr_in}" == "0" ]]; then
-          echo "SYNC_ALL_OPEN_PRS=true" >> "$GITHUB_ENV"
+          echo "sync_all=true" >> "$GITHUB_OUTPUT"
         else
-          echo "PR_NUMBER=${pr_in}" >> "$GITHUB_ENV"
+          echo "pr_number=${pr_in}" >> "$GITHUB_OUTPUT"
         fi
 
     - name: "Extract PR number, validate context"
       if: steps.disabled-check.outputs.disabled != 'true'
+      id: extract
       shell: bash
+      env:
+        EVENT_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || '' }}
+        DISPATCH_PR_NUMBER: ${{ steps.normalize.outputs.pr_number }}
+        DISPATCH_SYNC_ALL: ${{ steps.normalize.outputs.sync_all }}
       run: |
         # Extract PR number, validate context
         set -euo pipefail
 
         # Push events don't need PR_NUMBER (used for closing merged PRs)
         # The CLI handles push events specially via _process_close_merged_prs()
-        if [[ "${{ github.event_name }}" == "push" ]]; then
+        if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
           echo "Push event detected - will process merged commits for PR closure"
-          # Set PR_NUMBER to empty to indicate this is intentional for push events
-          echo "PR_NUMBER=" >> "$GITHUB_ENV"
+          # Emit an empty PR number to signal intentional push handling
+          echo "pr_number=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # Honor PR_NUMBER or SYNC_ALL_OPEN_PRS set by workflow_dispatch
-        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-          if [[ -n "${SYNC_ALL_OPEN_PRS:-}" ]]; then
+        # Honor PR_NUMBER or sync-all from workflow_dispatch normalization
+        if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ -n "${DISPATCH_SYNC_ALL:-}" ]]; then
             echo "Processing all open pull requests via workflow_dispatch."
+            echo "sync_all=true" >> "$GITHUB_OUTPUT"
           else
-            if [[ -z "${PR_NUMBER:-}" || "${PR_NUMBER}" == "null" ]]; then
+            if [[ -z "${DISPATCH_PR_NUMBER:-}" || "${DISPATCH_PR_NUMBER}" == "null" ]]; then
               echo "Error: provide PR_NUMBER or set 0 to process all PRs."
               exit 2
             fi
-            echo "PR_NUMBER=${PR_NUMBER}" >> "$GITHUB_ENV"
+            echo "pr_number=${DISPATCH_PR_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
         else
-          PR_NUMBER_EVT="${{ github.event.pull_request.number || github.event.issue.number || '' }}"
-          # Do not override PR_NUMBER if previously set
-          if [[ -z "${PR_NUMBER:-}" ]]; then
-            PR_NUMBER="${PR_NUMBER_EVT}"
-            echo "PR_NUMBER=${PR_NUMBER}" >> "$GITHUB_ENV"
-          fi
-          if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
+          pr_number="${EVENT_PR_NUMBER}"
+          if [[ -z "${pr_number}" || "${pr_number}" == "null" ]]; then
             echo "Error: PR_NUMBER is empty."
             echo "This action requires a valid pull request context."
-            echo "Current event: ${{ github.event_name }}"
+            echo "Current event: ${GITHUB_EVENT_NAME}"
             exit 2
           fi
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
         fi
 
     - name: "Run github2gerrit Python CLI"
@@ -375,16 +387,17 @@ runs:
         GITHUB_BASE_REF: ${{ github.base_ref }}
         GITHUB_HEAD_REF: ${{ github.head_ref }}
         GITHUB_ACTOR: ${{ github.actor }}
-        SYNC_ALL_OPEN_PRS: ${{ env.SYNC_ALL_OPEN_PRS }}
-        PR_NUMBER: ${{ env.PR_NUMBER }}
+        SYNC_ALL_OPEN_PRS: ${{ steps.extract.outputs.sync_all }}
+        PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
         G2G_TEST_MODE: "false"
         G2G_NO_GERRIT: ${{ inputs.G2G_NO_GERRIT }}
+        USE_LOCAL_ACTION: ${{ inputs.USE_LOCAL_ACTION }}
       run: |
         # Run github2gerrit Python CLI
         set -euo pipefail
         # Use different invocation methods based on repository or USE_LOCAL_ACTION flag
-        if [[ "${{ inputs.USE_LOCAL_ACTION }}" == "true" ]] || \
-           [[ "${{ github.repository }}" =~ lfreleng-actions/github2gerrit-action ]]; then
+        if [[ "${USE_LOCAL_ACTION}" == "true" ]] || \
+           [[ "${GITHUB_REPOSITORY}" =~ lfreleng-actions/github2gerrit-action ]]; then
           echo "Running:python -m github2gerrit.cli"
           python -m github2gerrit.cli
         else

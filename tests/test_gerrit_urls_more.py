@@ -150,8 +150,7 @@ def test_repr_contains_host_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GERRIT_HTTP_BASE_PATH", "r")
     b = GerritUrlBuilder("gerrit.example.org")
     rep = repr(b)
-    assert "gerrit.example.org" in rep
-    assert "base_path='r'" in rep
+    assert rep == "GerritUrlBuilder(host='gerrit.example.org', base_path='r')"
 
 
 def test_discover_base_path_returns_empty_on_200_ok(

@@ -219,11 +219,16 @@ class TestActionStepValidation:
 
         script = install_step["run"]
         assert "uv --version" in script
-        # Should contain both local installation and uvx logic
-        assert "github.repository" in script
+        # Inputs/context are passed via env (not inline ${{ }}) to avoid
+        # template injection; the script branches on env/built-in vars.
+        assert "GITHUB_REPOSITORY" in script
         assert "=~ lfreleng-actions/github2gerrit-action" in script
-        assert "uv pip install --system ${{ github.action_path }}" in script
+        assert 'uv pip install --system "${GITHUB_ACTION_PATH}"' in script
         assert "uvx will install GitHub2Gerrit from PyPI" in script
+        # USE_LOCAL_ACTION is provided through the step env block.
+        assert install_step.get("env", {}).get("USE_LOCAL_ACTION") == (
+            "${{ inputs.USE_LOCAL_ACTION }}"
+        )
 
     def test_cli_execution_step(self, action_config):
         """Test CLI execution step configuration."""
