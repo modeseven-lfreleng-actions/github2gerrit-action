@@ -969,6 +969,7 @@ class Orchestrator:
                     gerrit.project,
                     branch=gh.base_ref,
                     max_results=200,
+                    github_repository=gh.repository,
                 )
 
                 # Collect all matching changes, then select the
@@ -2178,6 +2179,7 @@ class Orchestrator:
                         exclude_change_ids=prep.change_ids,
                         dry_run=False,
                         target_branch=self._resolve_target_branch(),
+                        github_repository=gh.repository,
                     )
             except Exception as exc:
                 log.debug("Post-push supersession sweep skipped: %s", exc)
