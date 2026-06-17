@@ -321,7 +321,6 @@ class GerritRestClient:
             )
 
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                status = getattr(resp, "status", None)
                 content = resp.read()
                 # Gerrit prepends ")]}'" in JSON responses to prevent JSON
                 # hijacking; strip if present

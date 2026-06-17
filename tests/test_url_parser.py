@@ -11,7 +11,11 @@ from typing import TypeVar
 if TYPE_CHECKING:
     F = TypeVar("F", bound=Callable[..., object])
 
-    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]: ...
+    # Typed stub (raising body, never executed) so basedpyright treats
+    # @parametrize as a typed decorator and static analysers do not model
+    # it as a procedure returning None.
+    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
 else:
     from pytest import mark
 
