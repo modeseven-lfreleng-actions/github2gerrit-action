@@ -379,7 +379,6 @@ def save_host_keys_to_config(
             new_lines.append(f"[{organization}]")
             escaped_keys = host_keys.replace("\n", "\\n")
             new_lines.append(f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
-            gerrit_known_hosts_updated = True
 
         # If section existed but didn't have GERRIT_KNOWN_HOSTS, add it
         elif not gerrit_known_hosts_updated:

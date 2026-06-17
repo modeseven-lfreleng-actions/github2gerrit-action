@@ -385,12 +385,15 @@ else:
 
 
 class _FormatterProto(Protocol):
-    def write_usage(self, prog: str, args: str, prefix: str = ...) -> None: ...
+    def write_usage(self, prog: str, args: str, prefix: str = ...) -> None:
+        """Write the program usage line."""
 
 
 class _ContextProto(Protocol):
     @property
-    def command_path(self) -> str: ...
+    def command_path(self) -> str:
+        """Return the full command path."""
+        raise NotImplementedError
 
 
 class _SingleUsageGroup(BaseGroup):

@@ -615,7 +615,6 @@ def git_commit_new(
             _tf.flush()
             tmp_path = Path(_tf.name)
         message_file = tmp_path
-        message = None
 
     # Determine whether to add -s; only suppress if message already has a
     # sign-off for current committer

@@ -32,15 +32,6 @@ from .rich_display import safe_console_print
 from .trailers import extract_github_metadata
 
 
-# Optional Gerrit REST API support
-try:
-    from pygerrit2 import GerritRestAPI
-    from pygerrit2 import HTTPBasicAuth
-except ImportError:
-    GerritRestAPI = None
-    HTTPBasicAuth = None
-
-
 log = logging.getLogger(__name__)
 
 __all__ = [

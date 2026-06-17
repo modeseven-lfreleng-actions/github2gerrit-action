@@ -80,19 +80,10 @@ from .utils import is_verbose_mode
 
 
 try:
-    from pygerrit2 import GerritRestAPI
-    from pygerrit2 import HTTPBasicAuth
-except ImportError:
-    GerritRestAPI = None
-    HTTPBasicAuth = None
-
-try:
-    from .ssh_discovery import SSHDiscoveryError
     from .ssh_discovery import auto_discover_gerrit_host_keys
 except ImportError:
     # Fallback if ssh_discovery module is not available
     auto_discover_gerrit_host_keys = None  # type: ignore[assignment]
-    SSHDiscoveryError = Exception  # type: ignore[misc,assignment]
 
 try:
     from .ssh_agent_setup import SSHAgentManager
@@ -113,7 +104,6 @@ log = logging.getLogger("github2gerrit.core")
 
 
 # Error message constants to comply with TRY003
-_MSG_ISSUE_ID_MULTILINE = "Issue ID must be single line"
 _MSG_MISSING_PR_CONTEXT = "missing PR context"
 _MSG_BAD_REPOSITORY_CONTEXT = "bad repository context"
 _MSG_MISSING_GERRIT_SERVER = (
@@ -121,10 +111,6 @@ _MSG_MISSING_GERRIT_SERVER = (
     "input/environment variable, .gitreview file, or action configuration."
 )
 _MSG_MISSING_GERRIT_PROJECT = "missing GERRIT_PROJECT"
-_MSG_PYGERRIT2_REQUIRED_REST = "pygerrit2 is required to query Gerrit REST API"
-_MSG_PYGERRIT2_REQUIRED_AUTH = "pygerrit2 is required for HTTP authentication"
-_MSG_PYGERRIT2_MISSING = "pygerrit2 missing"
-_MSG_PYGERRIT2_AUTH_MISSING = "pygerrit2 auth missing"
 _MSG_DNS_RESOLUTION_FAILED = "DNS resolution failed for '%s'"
 
 
@@ -4429,7 +4415,6 @@ class Orchestrator:
             List of email addresses that were not found in Gerrit
         """
         combined_output = f"{exc.stdout}\n{exc.stderr}"
-        import re
 
         # Pattern to match: Account 'email@domain.com' not found
         pattern = r"Account\s+'([^']+)'\s+not\s+found"
@@ -4903,7 +4888,6 @@ class Orchestrator:
             # Extract specific rejection reason from output
             # Handle multiline rejection messages by looking in normalized
             # output
-            import re
 
             # Look for the rejection pattern in the normalized output
             rejection_match = re.search(
@@ -5299,7 +5283,6 @@ class Orchestrator:
         self, workspace: Path, gh: GitHubContext, inputs: Inputs
     ) -> None:
         """Fallback to GitHub API archive download (ported from CLI)."""
-        import json
         import zipfile
 
         repo_full = gh.repository.strip() if gh.repository else ""

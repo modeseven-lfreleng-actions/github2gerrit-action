@@ -280,8 +280,6 @@ def test_log_api_metrics_summary(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Test API metrics summary logging."""
-    import logging
-
     # Set up some metrics
     reset_api_metrics()
 

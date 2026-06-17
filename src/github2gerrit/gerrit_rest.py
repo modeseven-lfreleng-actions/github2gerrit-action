@@ -68,19 +68,6 @@ _MSG_PYGERRIT2_REQUIRED_AUTH: Final[str] = (
     "pygerrit2 is required for HTTP authentication"
 )
 
-_TRANSIENT_ERR_SUBSTRINGS: Final[tuple[str, ...]] = (
-    "timed out",
-    "temporarily unavailable",
-    "temporary failure",
-    "connection reset",
-    "connection aborted",
-    "broken pipe",
-    "connection refused",
-    "bad gateway",
-    "service unavailable",
-    "gateway timeout",
-)
-
 # HTTP status codes that indicate an authentication/authorization problem
 # rather than a transient fault or a bug. These are expected when no
 # Gerrit REST credentials are available (or they are insufficient for the
