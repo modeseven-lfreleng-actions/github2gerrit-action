@@ -471,13 +471,22 @@ def _resolve_issue_id_from_json(json_str: str, github_actor: str) -> str:
     return ""
 
 
-# Show version information when --help is used or in GitHub Actions mode
-if "--help" in sys.argv or _is_github_actions_context():
+def _print_version_banner() -> None:
+    """Print the resolved package version, or a fallback notice.
+
+    Defined as a function so the ``print`` calls do not execute at module
+    scope during import; the banner is only emitted when explicitly invoked.
+    """
     try:
         app_version = get_version("github2gerrit")
         print(f"🏷️  github2gerrit version {app_version}")
     except Exception:
         print("⚠️  github2gerrit version information not available")
+
+
+# Show version information when --help is used or in GitHub Actions mode
+if "--help" in sys.argv or _is_github_actions_context():
+    _print_version_banner()
 
 app: typer.Typer = typer.Typer(
     add_completion=False,

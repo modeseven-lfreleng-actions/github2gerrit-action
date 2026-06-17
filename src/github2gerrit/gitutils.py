@@ -555,6 +555,8 @@ def git_commit_amend(
                 if committer_email and _has_committer_signoff(body):
                     effective_signoff = False
             except GitError:
+                # Unable to read the current commit body (e.g. no HEAD yet);
+                # fall back to honoring the requested signoff setting.
                 pass
     except Exception:
         # Best effort only; default to requested signoff

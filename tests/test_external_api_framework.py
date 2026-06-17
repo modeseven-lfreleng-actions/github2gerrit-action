@@ -222,6 +222,8 @@ def test_curl_download_success(
                     output_path = Path(cmd[o_index + 1])
                     output_path.write_text("downloaded content")
             except (ValueError, IndexError):
+                # No "-o" flag (or no value after it) in the mocked curl
+                # command; nothing to write, so behave like a no-op download.
                 pass
         return MockCompletedProcess()
 
