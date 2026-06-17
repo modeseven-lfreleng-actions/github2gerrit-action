@@ -504,9 +504,12 @@ def _resolve_org(default_org: str | None) -> str:
 if TYPE_CHECKING:
     F = TypeVar("F", bound=Callable[..., object])
 
-    def typed_app_command(
-        *args: object, **kwargs: object
-    ) -> Callable[[F], F]: ...
+    # Typed stub so basedpyright treats @typed_app_command as a typed
+    # decorator. The body raises rather than using an ellipsis so static
+    # analysers do not model it as a procedure that returns None; this
+    # branch is never executed at runtime.
+    def typed_app_command(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
 else:
     typed_app_command = app.command
 
@@ -865,7 +868,7 @@ def main(
     ) -> bool:
         """Return *current* if the CLI flag was explicit, else parse env."""
         source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
-        if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue]
+        if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue, reportUnnecessaryComparison]
             return current
         env_val = os.getenv(env_var)
         if env_val is not None:

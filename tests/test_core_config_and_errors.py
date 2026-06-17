@@ -287,7 +287,11 @@ def test_configure_git_raises_on_git_review_init_failure(
 if TYPE_CHECKING:
     F = TypeVar("F", bound=Callable[..., object])
 
-    def fixture(*args: object, **kwargs: object) -> Callable[[F], F]: ...
+    # Typed stub (raising body, never executed) so basedpyright treats
+    # @fixture as a typed decorator and static analysers do not model it
+    # as a procedure returning None.
+    def fixture(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
 else:
     fixture = pytest.fixture
 

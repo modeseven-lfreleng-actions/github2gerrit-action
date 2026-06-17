@@ -28,7 +28,12 @@ from github2gerrit.config import overlay_missing
 if TYPE_CHECKING:
     F = TypeVar("F", bound=Callable[..., object])
 
-    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]: ...
+    # Typed stub so basedpyright treats @parametrize as a typed decorator
+    # (reportUntypedFunctionDecorator). The body raises rather than using
+    # an ellipsis so static analysers do not model it as a procedure that
+    # returns None; this code is never executed at runtime.
+    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
 else:
     from pytest import mark
 

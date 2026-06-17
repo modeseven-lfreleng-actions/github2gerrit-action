@@ -272,8 +272,9 @@ class SSHConfig:
         try:
             return bool(re.match(regex_pattern, hostname))
         except re.error:
-            # If regex is invalid, fall back to exact match
-            return pattern == hostname
+            # An invalid regex cannot match. The exact-match case is
+            # already handled above, so there is nothing left to match.
+            return False
 
 
 # Global cache for SSH config instances to avoid re-parsing

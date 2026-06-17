@@ -52,8 +52,14 @@ def snapshot_dir_state(directory: Path) -> dict[str, str]:
 if TYPE_CHECKING:
     F = TypeVar("F", bound=Callable[..., object])
 
-    def fixture(*args: object, **kwargs: object) -> Callable[[F], F]: ...
-    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]: ...
+    # Typed stubs (raising bodies, never executed) so basedpyright treats
+    # @fixture/@parametrize as typed decorators and static analysers do not
+    # model them as procedures returning None.
+    def fixture(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
+
+    def parametrize(*args: object, **kwargs: object) -> Callable[[F], F]:
+        raise NotImplementedError
 else:
     from pytest import fixture as _fixture
     from pytest import mark as _mark
