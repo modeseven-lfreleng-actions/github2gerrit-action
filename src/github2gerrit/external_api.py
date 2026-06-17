@@ -327,7 +327,7 @@ def external_api_call(
                 policy=policy,
             )
 
-            last_exc: BaseException | None = None
+            last_exc: Exception | None = None
 
             for attempt in range(1, policy.max_attempts + 1):
                 context.attempt = attempt
@@ -347,7 +347,7 @@ def external_api_call(
 
                     # Call the actual function
                     result = func(*args, **kwargs)
-                except BaseException as exc:
+                except Exception as exc:
                     last_exc = exc
                     duration = time.time() - context.start_time
 

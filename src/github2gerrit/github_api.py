@@ -23,7 +23,6 @@ from collections.abc import Iterable
 from importlib import import_module
 from typing import Any
 from typing import Protocol
-from typing import TypeVar
 from typing import cast
 
 from .error_codes import ExitCode
@@ -35,8 +34,6 @@ from .external_api import external_api_call
 
 # Error message constants to comply with TRY003
 _MSG_PYGITHUB_REQUIRED = "PyGithub required"
-_MSG_MISSING_GITHUB_TOKEN = "missing GITHUB_TOKEN"  # noqa: S105
-_MSG_BAD_GITHUB_REPOSITORY = "bad GITHUB_REPOSITORY"
 
 
 class GithubExceptionType(Exception):
@@ -82,8 +79,12 @@ class GhIssueComment(Protocol):
 
 
 class GhIssue(Protocol):
-    def get_comments(self) -> Iterable[GhIssueComment]: ...
-    def create_comment(self, body: str) -> None: ...
+    def get_comments(self) -> Iterable[GhIssueComment]:
+        """Return the comments on the issue."""
+        raise NotImplementedError
+
+    def create_comment(self, body: str) -> None:
+        """Create a new comment on the issue."""
 
 
 class GhPullRequest(Protocol):
@@ -91,17 +92,28 @@ class GhPullRequest(Protocol):
     title: str | None
     body: str | None
 
-    def as_issue(self) -> GhIssue: ...
-    def edit(self, *, state: str) -> None: ...
+    def as_issue(self) -> GhIssue:
+        """Return the issue view of this pull request."""
+        raise NotImplementedError
+
+    def edit(self, *, state: str) -> None:
+        """Edit the pull request state."""
 
 
 class GhRepository(Protocol):
-    def get_pull(self, number: int) -> GhPullRequest: ...
-    def get_pulls(self, state: str) -> Iterable[GhPullRequest]: ...
+    def get_pull(self, number: int) -> GhPullRequest:
+        """Return the pull request with the given number."""
+        raise NotImplementedError
+
+    def get_pulls(self, state: str) -> Iterable[GhPullRequest]:
+        """Return the pull requests with the given state."""
+        raise NotImplementedError
 
 
 class GhClient(Protocol):
-    def get_repo(self, full: str) -> GhRepository: ...
+    def get_repo(self, full: str) -> GhRepository:
+        """Return the repository for the given full name."""
+        raise NotImplementedError
 
 
 __all__ = [
@@ -119,8 +131,6 @@ __all__ = [
 ]
 
 log = logging.getLogger("github2gerrit.github_api")
-
-_T = TypeVar("_T")
 
 
 def _getenv_str(name: str) -> str:

@@ -57,6 +57,8 @@ def _dbg(msg: str) -> None:
         try:
             print(f"[sitecustomize] {msg}", file=sys.stderr)
         except Exception:
+            # Debug logging must never disrupt interpreter startup; if
+            # writing to stderr fails, silently drop the message.
             pass
 
 
@@ -125,6 +127,8 @@ def _collect_base_dirs(repo_root: Path) -> set[Path]:
     try:
         bases.add(Path.cwd())
     except Exception:
+        # CWD may be unavailable (e.g. deleted); skip it and continue
+        # collecting the remaining base directories.
         pass
     # Repository root (directory containing this file)
     bases.add(repo_root)
@@ -134,6 +138,8 @@ def _collect_base_dirs(repo_root: Path) -> set[Path]:
         try:
             bases.add(Path(gw))
         except Exception:
+            # A malformed GITHUB_WORKSPACE value should not abort cleanup;
+            # skip it and continue with the other base directories.
             pass
     return bases
 

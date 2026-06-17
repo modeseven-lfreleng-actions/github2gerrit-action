@@ -555,6 +555,8 @@ def git_commit_amend(
                 if committer_email and _has_committer_signoff(body):
                     effective_signoff = False
             except GitError:
+                # Unable to read the current commit body (e.g. no HEAD yet);
+                # fall back to honoring the requested signoff setting.
                 pass
     except Exception:
         # Best effort only; default to requested signoff
@@ -613,7 +615,6 @@ def git_commit_new(
             _tf.flush()
             tmp_path = Path(_tf.name)
         message_file = tmp_path
-        message = None
 
     # Determine whether to add -s; only suppress if message already has a
     # sign-off for current committer

@@ -222,7 +222,7 @@ def test_git_last_commit_trailers_parsing_edge_cases(
 ) -> None:
     # Patch git_show to return a crafted commit message body with various
     # trailer forms.
-    import github2gerrit.gitutils as gitutils
+    from github2gerrit.gitutils import git_last_commit_trailers
 
     body = (
         "Subject line\n\n"
@@ -235,10 +235,12 @@ def test_git_last_commit_trailers_parsing_edge_cases(
         "Change-Id: Iabc123abc123abc123abc123abc123abc123ab\n"
     )
 
-    monkeypatch.setattr(gitutils, "git_show", lambda rev, **kw: body)
+    monkeypatch.setattr(
+        "github2gerrit.gitutils.git_show", lambda rev, **kw: body
+    )
 
     # Without filter: expect only proper footer trailers collected.
-    trailers_all = gitutils.git_last_commit_trailers()
+    trailers_all = git_last_commit_trailers()
     # Body "Key:" lines should not be extracted as trailers
     assert "Key" not in trailers_all
     # 'Empty' should be ignored due to empty value
@@ -254,7 +256,7 @@ def test_git_last_commit_trailers_parsing_edge_cases(
     ]
 
     # With filter keys: only Change-Id should be returned.
-    trailers_change = gitutils.git_last_commit_trailers(keys=["Change-Id"])
+    trailers_change = git_last_commit_trailers(keys=["Change-Id"])
     assert list(trailers_change.keys()) == ["Change-Id"]
     assert trailers_change["Change-Id"] == [
         "Ideadbeefdeadbeefdeadbeefdeadbeefdeadbeef",

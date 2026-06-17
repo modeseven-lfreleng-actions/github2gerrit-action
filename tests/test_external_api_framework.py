@@ -222,6 +222,8 @@ def test_curl_download_success(
                     output_path = Path(cmd[o_index + 1])
                     output_path.write_text("downloaded content")
             except (ValueError, IndexError):
+                # No "-o" flag (or no value after it) in the mocked curl
+                # command; nothing to write, so behave like a no-op download.
                 pass
         return MockCompletedProcess()
 
@@ -278,8 +280,6 @@ def test_log_api_metrics_summary(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Test API metrics summary logging."""
-    import logging
-
     # Set up some metrics
     reset_api_metrics()
 

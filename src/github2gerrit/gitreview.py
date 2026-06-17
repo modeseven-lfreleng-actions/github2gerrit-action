@@ -151,11 +151,6 @@ def derive_base_path(host: str) -> str | None:
     return _KNOWN_BASE_PATHS.get(host.lower().strip())
 
 
-# Keep a private alias so internal callers don't break if they were
-# referencing the underscore-prefixed name during development.
-_derive_base_path = derive_base_path
-
-
 # ───────────────────────────────────────────────────────────────────────
 # Pure parser
 # ───────────────────────────────────────────────────────────────────────
