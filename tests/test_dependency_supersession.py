@@ -17,6 +17,7 @@ Covers two mechanisms:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -31,11 +32,52 @@ from github2gerrit.gerrit_query import query_open_changes_by_project
 from github2gerrit.gitreview import GerritInfo
 from github2gerrit.models import GitHubContext
 from github2gerrit.similarity import extract_dependency_package_from_subject
+from github2gerrit.utils import reset_warning_once
 
 
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
+
+
+# Dependency fixture values reused across the supersession tests.
+# Centralising them documents which data is significant to the logic under
+# test (the *package name* must match for a change to be superseded) versus
+# which is arbitrary (the exact version strings).
+_DEP_PACKAGE = "requests"
+_DEP_VERSION_OLD = "2.31.0"
+_DEP_VERSION_NEW = "2.32.0"
+_DEP_VERSION_INTERMEDIATE = "2.31.5"
+_DEP_BUMP_TITLE = (
+    f"Bump {_DEP_PACKAGE} from {_DEP_VERSION_OLD} to {_DEP_VERSION_NEW}"
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_warning_once_state() -> None:
+    """Reset the one-time warning cache before each test.
+
+    Several tests assert warn-once behaviour (for example the truncation
+    warning emitted by the anonymous fallback), which relies on process-wide
+    global state. Resetting it automatically keeps every test isolated so
+    individual tests no longer need to call ``reset_warning_once`` by hand.
+    """
+    reset_warning_once()
+
+
+def _make_change_id(seed: str) -> str:
+    """Return a valid-looking Gerrit Change-Id derived from ``seed``.
+
+    A real Gerrit Change-Id is the letter ``I`` followed by 40 hexadecimal
+    characters (a SHA-1 digest). Tests previously used mnemonic but invalid
+    values such as ``Iexist00...`` that contain non-hex characters. This
+    helper instead derives a truncated SHA-256 digest from a human-readable
+    seed: the exact hash algorithm is unimportant, it only needs to match
+    the ``I`` + 40-hex-character format while keeping failures easy to
+    trace.
+    """
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:40]
+    return f"I{digest}"
 
 
 def _gerrit_change(
@@ -202,10 +244,6 @@ class TestQueryOpenChangesByProject:
         to drive the anonymous fallback, the helper must short-circuit and
         never issue the request, returning an empty list.
         """
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         fake_client = MagicMock()
         fake_client.is_authenticated = False
 
@@ -232,10 +270,6 @@ class TestQueryOpenChangesByProject:
         The query must NOT use owner:self, and only changes whose
         GitHub-PR trailer targets the current repository are returned.
         """
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         ours = _raw_change(
             100,
             "chore: bump requests from 2.31.0 to 2.32.0",
@@ -262,10 +296,6 @@ class TestQueryOpenChangesByProject:
 
     def test_anonymous_fallback_repo_match_is_case_insensitive(self) -> None:
         """Repo trailer matching ignores case differences."""
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         ours = _raw_change(
             200,
             "chore: bump requests from 2.31.0 to 2.32.0",
@@ -283,10 +313,6 @@ class TestQueryOpenChangesByProject:
 
     def test_anonymous_fallback_matches_ghes_host(self) -> None:
         """The host is ignored, so GitHub Enterprise URLs still match."""
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         ours = _raw_change(
             210,
             "chore: bump requests from 2.31.0 to 2.32.0",
@@ -310,10 +336,6 @@ class TestQueryOpenChangesByProject:
         repo in its query string, a non-URL value, and a relative path
         (e.g. ``/org/repo/pull/1``) are all correctly excluded.
         """
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         other = _raw_change(
             220,
             "chore: bump requests from 2.31.0 to 2.32.0",
@@ -346,10 +368,6 @@ class TestQueryOpenChangesByProject:
         GitHub2Gerrit changes (which carry the GitHub-PR trailer) so busy
         projects do not truncate before the relevant changes are seen.
         """
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         fake_client = MagicMock()
         fake_client.is_authenticated = False
         fake_client.get.return_value = []
@@ -368,10 +386,6 @@ class TestQueryOpenChangesByProject:
     ) -> None:
         """Hitting the result cap emits a one-time truncation warning."""
         import logging
-
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
 
         c1 = _raw_change(
             300,
@@ -406,9 +420,6 @@ class TestQueryOpenChangesByProject:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Disabling the fallback flag skips even when repo is known."""
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
         monkeypatch.setenv("G2G_ANON_SUPERSEDE_FALLBACK", "false")
 
         fake_client = MagicMock()
@@ -422,10 +433,6 @@ class TestQueryOpenChangesByProject:
 
     def test_anonymous_fallback_whitespace_repo_skips(self) -> None:
         """A blank/whitespace-only repository must not trigger a query."""
-        from github2gerrit.utils import reset_warning_once
-
-        reset_warning_once()
-
         fake_client = MagicMock()
         fake_client.is_authenticated = False
 
@@ -446,7 +453,16 @@ class TestQueryOpenChangesByProject:
     new=lambda *_a, **_kw: "",
 )
 class TestAbandonSupersededDependencyChanges:
-    """Tests for the post-push abandon sweep."""
+    """Tests for the post-push abandon sweep.
+
+    The class-level ``@patch`` stubs
+    ``gerrit_urls._discover_base_path_for_host`` to return an empty base
+    path for *every* test method below, so URL construction does not attempt
+    host discovery (a network call). The patch is intentionally applied at
+    the class level because all methods exercise URL building; it is not
+    injected as a method argument because the stubbed value is never
+    inspected by the tests.
+    """
 
     @patch("github2gerrit.gerrit_rest.build_client_for_host")
     @patch("github2gerrit.gerrit_query.query_open_changes_by_project")
@@ -789,7 +805,7 @@ class TestStrategy5Integration:
         # Set up GitHub mocks — strategies 1-4 should all fail
         mock_get_pull.return_value = _FakePullRequest(
             number=42,
-            title="Bump requests from 2.31.0 to 2.32.0",
+            title=_DEP_BUMP_TITLE,
             user=_FakeGitHubUser(),
         )
         mock_get_repo.return_value = MagicMock()
@@ -803,10 +819,14 @@ class TestStrategy5Integration:
         mock_gerrit_client.return_value = fake_gerrit
 
         # Strategy 5 — return an open change bumping the same package
+        existing_change_id = _make_change_id("strategy5-existing")
         existing_change = _gerrit_change(
-            change_id="Iexist00000000000000000000000000000000000",
+            change_id=existing_change_id,
             number="999",
-            subject="chore: bump requests from 2.31.0 to 2.31.5",
+            subject=(
+                f"chore: bump {_DEP_PACKAGE} from "
+                f"{_DEP_VERSION_OLD} to {_DEP_VERSION_INTERMEDIATE}"
+            ),
         )
         mock_query_open.return_value = [existing_change]
 
@@ -832,7 +852,7 @@ class TestStrategy5Integration:
         )
 
         result = orch._find_existing_change_for_pr(gh, gerrit)
-        assert result == ["Iexist00000000000000000000000000000000000"]
+        assert result == [existing_change_id]
 
     @patch("github2gerrit.core.build_client")
     @patch("github2gerrit.core.get_repo_from_env")
@@ -956,7 +976,14 @@ class TestStrategy5Integration:
     new=lambda *_a, **_kw: "",
 )
 class TestRealWorldScenarios:
-    """Scenarios taken directly from the issue report."""
+    """Scenarios taken directly from the issue report.
+
+    As with :class:`TestAbandonSupersededDependencyChanges`, the class-level
+    ``@patch`` stubs ``gerrit_urls._discover_base_path_for_host`` for every
+    method so URL construction avoids host discovery. The stub uses ``new=``
+    rather than a mock argument because its return value is fixed and never
+    asserted on.
+    """
 
     @patch("github2gerrit.gerrit_rest.build_client_for_host")
     @patch("github2gerrit.gerrit_query.query_open_changes_by_project")
