@@ -16,19 +16,40 @@ from github2gerrit.gitutils import run_cmd
 from github2gerrit.gitutils import run_cmd_with_retries
 
 
+# Environment variables that pytest, pytest-cov, and pytest-xdist inject so
+# that coverage measurement and test metadata propagate into subprocesses.
+# When a test spawns the current Python interpreter via ``run_cmd`` we clear
+# these so the child does not start its own coverage run (which can emit
+# warnings or write stray data files) and so its output stays deterministic
+# regardless of how the outer pytest session was invoked.
+#
+#   COV_CORE_SOURCE/CONFIG/DATAFILE  pytest-cov subprocess coverage hooks
+#   COVERAGE_PROCESS_START           triggers coverage startup in children
+#   COVERAGE_FILE / COVERAGE_RCFILE  coverage data / config file locations
+#   PYTEST_ADDOPTS                   extra pytest args inherited by children
+#   PYTEST_CURRENT_TEST              current test id (set per test by pytest)
+#   PYTEST_XDIST_WORKER              xdist worker id when running in parallel
+_COVERAGE_ENV_KEYS = (
+    "COV_CORE_SOURCE",
+    "COV_CORE_CONFIG",
+    "COV_CORE_DATAFILE",
+    "COVERAGE_PROCESS_START",
+    "COVERAGE_FILE",
+    "COVERAGE_RCFILE",
+    "PYTEST_ADDOPTS",
+    "PYTEST_CURRENT_TEST",
+    "PYTEST_XDIST_WORKER",
+)
+
+
 def _no_cov_env() -> dict[str, str]:
-    keys = [
-        "COV_CORE_SOURCE",
-        "COV_CORE_CONFIG",
-        "COV_CORE_DATAFILE",
-        "COVERAGE_PROCESS_START",
-        "COVERAGE_FILE",
-        "COVERAGE_RCFILE",
-        "PYTEST_ADDOPTS",
-        "PYTEST_CURRENT_TEST",
-        "PYTEST_XDIST_WORKER",
-    ]
-    return dict.fromkeys(keys, "")
+    """Return an env mapping that disables coverage in subprocesses.
+
+    Every key in :data:`_COVERAGE_ENV_KEYS` is mapped to an empty string so
+    a spawned child process inherits a clean, coverage-free environment. See
+    that constant for the rationale behind each cleared variable.
+    """
+    return dict.fromkeys(_COVERAGE_ENV_KEYS, "")
 
 
 def test_mask_text_replaces_tokens_and_ignores_empty() -> None:
@@ -93,24 +114,31 @@ def test_run_cmd_with_retries_retries_on_transient_error_then_succeeds(
 
     monkeypatch.setattr("time.sleep", _fake_sleep)
 
-    # Script: on first run create a marker and exit non-zero with a transient
-    # error in stderr.
-    # On subsequent runs (marker exists) print success and exit 0.
+    # The helper script creates a marker file and fails with a transient
+    # error on its first run, then succeeds once the marker exists. Writing
+    # the behaviour to a real script file (taking the marker path as an
+    # argument) keeps the test readable and avoids embedding Python source
+    # inside an f-string.
     marker = tmp_path / "attempted"
-
-    code = f"""
-import os, sys, pathlib
-p = pathlib.Path({str(marker)!r})
-if not p.exists():
-    p.write_text("1", encoding="utf-8")
-    print("could not resolve host: example.com", file=sys.stderr)
-    sys.exit(128)
-else:
-    print("ok")
-"""
+    script = tmp_path / "transient_then_succeed.py"
+    script.write_text(
+        "import pathlib\n"
+        "import sys\n"
+        "\n"
+        "marker = pathlib.Path(sys.argv[1])\n"
+        "if not marker.exists():\n"
+        '    marker.write_text("1", encoding="utf-8")\n'
+        '    print("could not resolve host: example.com", file=sys.stderr)\n'
+        "    sys.exit(128)\n"
+        "else:\n"
+        '    print("ok")\n',
+        encoding="utf-8",
+    )
 
     res = run_cmd_with_retries(
-        [sys.executable, "-c", code], cwd=tmp_path, env=_no_cov_env()
+        [sys.executable, str(script), str(marker)],
+        cwd=tmp_path,
+        env=_no_cov_env(),
     )
     # Should succeed after retry, marker must exist, and we should have slept at
     # least once
@@ -262,6 +290,24 @@ def test_git_last_commit_trailers_parsing_edge_cases(
         "Ideadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         "Iabc123abc123abc123abc123abc123abc123ab",
     ]
+
+
+def test_git_last_commit_trailers_returns_empty_on_git_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``git show`` (e.g. fresh repo) yields an empty mapping."""
+    from github2gerrit.gitutils import GitError
+    from github2gerrit.gitutils import git_last_commit_trailers
+
+    def _raise_git_error(rev: str, **_kw: object) -> str:
+        raise GitError("git show HEAD failed")
+
+    monkeypatch.setattr("github2gerrit.gitutils.git_show", _raise_git_error)
+
+    # The implementation catches GitError and returns an empty dict, both
+    # without and with a key filter.
+    assert git_last_commit_trailers() == {}
+    assert git_last_commit_trailers(keys=["Change-Id"]) == {}
 
 
 def test_git_quiet_suppresses_failure_logging(
