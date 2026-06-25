@@ -177,6 +177,7 @@ def _check_automation_only(
 
     # Known automation tools
     known_automation_tools = [
+        "Copilot",
         "dependabot[bot]",
         "dependabot",
         "pre-commit-ci[bot]",
@@ -197,8 +198,8 @@ def _check_automation_only(
     # Check if author is in known automation tools list
     if pr_author not in known_automation_tools:
         log.warning(
-            "PR #%s from '%s' rejected - known automation tools "
-            "(dependabot, pre-commit-ci) required",
+            "PR #%s from '%s' rejected - only known automation tools "
+            "are accepted when AUTOMATION_ONLY is enabled",
             gh.pr_number,
             pr_author,
         )
