@@ -177,6 +177,7 @@ def _check_automation_only(
 
     # Known automation tools
     known_automation_tools = [
+        "Copilot",
         "dependabot[bot]",
         "dependabot",
         "pre-commit-ci[bot]",
