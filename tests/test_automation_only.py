@@ -94,6 +94,30 @@ class TestAutomationOnly:
         # Should not raise any exception
         _check_automation_only(mock_pr, gh)
 
+    def test_copilot_pr_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Copilot PRs should be allowed when automation_only is enabled."""
+        monkeypatch.setenv("AUTOMATION_ONLY", "true")
+
+        mock_pr = MagicMock()
+        mock_pr.user.login = "Copilot"
+
+        gh = GitHubContext(
+            event_name="pull_request",
+            event_action="opened",
+            event_path=None,
+            repository="owner/repo",
+            repository_owner="owner",
+            server_url="https://github.com",
+            run_id="123",
+            sha="abc123",
+            base_ref="main",
+            head_ref="feature",
+            pr_number=1,
+        )
+
+        # Should not raise any exception
+        _check_automation_only(mock_pr, gh)
+
     @patch("github2gerrit.github_api.close_pr")
     def test_regular_user_pr_rejected(
         self, mock_close_pr: Any, monkeypatch: pytest.MonkeyPatch
