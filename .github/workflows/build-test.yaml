@@ -36,8 +36,8 @@ jobs:
     name: "Repository Metadata"
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pull-requests: read
+      contents: read  # Read repository contents (checkout, etc.)
+      pull-requests: read  # Read PR metadata for the metadata action
     timeout-minutes: 5
     steps:
       # yamllint disable-line rule:line-length
@@ -49,6 +49,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: "Gather repository metadata"
         id: repo-metadata
@@ -83,6 +84,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Build Python project'
         id: python-build
@@ -111,6 +114,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: "Python tests [pytest] ${{ matrix.python-version }}"
         # yamllint disable-line rule:line-length
@@ -138,6 +143,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: "Audit dependencies ${{ matrix.python-version }}"
         # yamllint disable-line rule:line-length
@@ -156,6 +163,8 @@ jobs:
     steps:
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: "Generate SBOM"
         id: sbom
@@ -217,8 +226,8 @@ jobs:
             # Grype summary
             {
               echo "## SBOM Summary"
-              echo "SBOM count: ${{ steps.sbom.outputs.component_count }}"
-              echo "Tool used: ${{ steps.sbom.outputs.dependency_manager }}"
+              echo "SBOM count: ${STEPS_SBOM_OUTPUTS_COMPONENT_COUNT}"
+              echo "Tool used: ${STEPS_SBOM_OUTPUTS_DEPENDENCY_MANAGER}"
               echo ""
               echo "## Grype Vulnerability Scan"
               if [ -f grype-results.txt ]; then
@@ -231,6 +240,9 @@ jobs:
               echo "--- Grype scan results ---"
               cat grype-results.txt
             fi
+        env:
+          STEPS_SBOM_OUTPUTS_COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
+          STEPS_SBOM_OUTPUTS_DEPENDENCY_MANAGER: ${{ steps.sbom.outputs.dependency_manager }}
 
       - name: "Check Grype scan results"
         if: >-

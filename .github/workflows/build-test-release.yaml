@@ -14,13 +14,19 @@ on:
 
 permissions: {}
 
+# Serialise repeated runs for the same tag; never cancel an in-flight
+# release. Distinct tags use distinct groups and proceed independently.
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: false
+
 jobs:
   repository-metadata:
     name: "Repository Metadata"
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pull-requests: read
+      contents: read  # Read repository contents (checkout, etc.)
+      pull-requests: read  # Read PR metadata for the metadata action
     timeout-minutes: 5
     steps:
       # yamllint disable-line rule:line-length
@@ -32,6 +38,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: "Gather repository metadata"
         id: repo-metadata
@@ -65,6 +72,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: 'Verify pushed tag'
         id: 'tag-validate'
@@ -83,9 +91,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          STEPS_TAG_VALIDATE_OUTPUTS_TAG_NAME: ${{ steps.tag-validate.outputs.tag_name }}
         run: |
           # Ensure draft release exists
-          TAG="${{ steps.tag-validate.outputs.tag_name }}"
+          TAG="${STEPS_TAG_VALIDATE_OUTPUTS_TAG_NAME}"
           # Check if release exists and get its draft status
           if RELEASE_INFO=$(gh release view "$TAG" \
             --json isDraft 2>/dev/null); then
@@ -127,6 +136,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Build Python project'
         id: 'python-build'
@@ -156,6 +167,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Test Python project [PYTEST]'
         # yamllint disable-line rule:line-length
@@ -183,6 +196,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Audit Python project'
         # yamllint disable-line rule:line-length
@@ -207,6 +222,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: "Generate SBOM"
         id: sbom
@@ -270,8 +287,8 @@ jobs:
             # Grype summary
             {
               echo "## SBOM Summary"
-              echo "SBOM count: ${{ steps.sbom.outputs.component_count }}"
-              echo "Tool used: ${{ steps.sbom.outputs.dependency_manager }}"
+              echo "SBOM count: ${STEPS_SBOM_OUTPUTS_COMPONENT_COUNT}"
+              echo "Tool used: ${STEPS_SBOM_OUTPUTS_DEPENDENCY_MANAGER}"
               echo ""
               echo "## Grype Vulnerability Scan"
               if [ -f grype-results.txt ]; then
@@ -284,6 +301,9 @@ jobs:
               echo "--- Grype scan results ---"
               cat grype-results.txt
             fi
+        env:
+          STEPS_SBOM_OUTPUTS_COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
+          STEPS_SBOM_OUTPUTS_DEPENDENCY_MANAGER: ${{ steps.sbom.outputs.dependency_manager }}
 
       - name: "Check Grype scan results"
         if: >-
@@ -377,6 +397,8 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: '⬇ Download build artefacts'
         # yamllint disable-line rule:line-length
@@ -415,14 +437,17 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Check if release is already promoted'
         id: 'check-promoted'
         shell: bash
         env:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          NEEDS_TAG_VALIDATE_OUTPUTS_TAG: ${{ needs.tag-validate.outputs.tag }}
         run: |
-          TAG="${{ needs.tag-validate.outputs.tag }}"
+          TAG="${NEEDS_TAG_VALIDATE_OUTPUTS_TAG}"
           if gh release view "$TAG" --json isDraft --jq '.isDraft' \
               2>/dev/null | grep -q "false"; then
             echo "Release $TAG is already promoted, skipping promotion"
@@ -449,7 +474,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          NEEDS_TAG_VALIDATE_OUTPUTS_TAG: ${{ needs.tag-validate.outputs.tag }}
         run: |
-          TAG="${{ needs.tag-validate.outputs.tag }}"
+          TAG="${NEEDS_TAG_VALIDATE_OUTPUTS_TAG}"
           RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
           echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"

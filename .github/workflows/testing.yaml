@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: 'Checkout repository'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: "Running local action: ${{ github.repository }}"
         uses: ./
@@ -71,6 +73,8 @@ jobs:
   cli-integration-test:
     name: 'CLI Integration Test'
     runs-on: 'ubuntu-latest'
+    # Dedicated environment scopes access to the Gerrit test secrets
+    environment: 'development'
     permissions:
       contents: read
     timeout-minutes: 15
@@ -80,6 +84,8 @@ jobs:
     steps:
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Setup Python'
         # yamllint disable-line rule:line-length
@@ -121,22 +127,23 @@ jobs:
           G2G_VERBOSE: 'true'
           FETCH_DEPTH: '50'
           USE_PR_AS_COMMIT: 'true'
+          VARS_DEPENDABOT_PR_URL_1: ${{ vars.DEPENDABOT_PR_URL_1 }}
           # lfit/sandbox has correct .gitreview pointing to LF Gerrit
         run: |
           echo "Testing GitHub2Gerrit CLI integration with LF Gerrit server..."
-          echo "Target PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
+          echo "Target PR: ${VARS_DEPENDABOT_PR_URL_1}"
 
           # Install current code in development mode and test CLI directly
           echo "Installing current code: uv pip install --system -e ."
           uv pip install --system -e .
 
-          echo "Running: python -m github2gerrit.cli ${{ vars.DEPENDABOT_PR_URL_1 }}"
-          python -m github2gerrit.cli "${{ vars.DEPENDABOT_PR_URL_1 }}"
+          echo "Running: python -m github2gerrit.cli ${VARS_DEPENDABOT_PR_URL_1}"
+          python -m github2gerrit.cli "${VARS_DEPENDABOT_PR_URL_1}"
 
           echo "✅ Dry-run CLI integration test completed successfully"
           {
             echo "CLI Integration test summary:"
-            echo "- Tested with external PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
+            echo "- Tested with external PR: ${VARS_DEPENDABOT_PR_URL_1}"
             echo "- Target Gerrit: gerrit.linuxfoundation.org"
             echo "- Target Project: sandbox"
             echo "- Mode: DRY_RUN (validation only)"
@@ -167,13 +174,14 @@ jobs:
           DRY_RUN: 'true'
           CLOSE_MERGED_PRS: 'false'
           SYNC_ALL_OPEN_PRS: 'false'
+          VARS_DEPENDABOT_PR_URL_1: ${{ vars.DEPENDABOT_PR_URL_1 }}
         run: |
           echo "Testing GitHub API error handling with invalid token..."
-          echo "Target PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
+          echo "Target PR: ${VARS_DEPENDABOT_PR_URL_1}"
 
           # Capture exit code
           EXIT_CODE=0
-          python -m github2gerrit.cli "${{ vars.DEPENDABOT_PR_URL_1 }}" || EXIT_CODE=$?
+          python -m github2gerrit.cli "${VARS_DEPENDABOT_PR_URL_1}" || EXIT_CODE=$?
           echo "EXIT_CODE=$EXIT_CODE" >> "$GITHUB_ENV"
 
           # Should fail with exit code 4 (GITHUB_API_ERROR)
@@ -187,7 +195,6 @@ jobs:
       - name: 'Verify Error Handling'
         shell: bash
         run: |
-          EXIT_CODE="${{ env.EXIT_CODE }}"
           if [ "${EXIT_CODE}" -eq 4 ] 2>/dev/null; then
             echo "✅ GitHub API error handling working correctly"
             echo "## Error Handling Test ✅" >> "$GITHUB_STEP_SUMMARY"
@@ -225,11 +232,12 @@ jobs:
           G2G_VERBOSE: 'true'
           FETCH_DEPTH: '50'
           USE_PR_AS_COMMIT: 'true'
+          VARS_DEPENDABOT_PR_URL_2: ${{ vars.DEPENDABOT_PR_URL_2 }}
           # lfit/sandbox has correct .gitreview pointing to LF Gerrit
           # Force derivation to be disabled so our overrides take precedence
         run: |
           echo '🚀 Integration Test Summary'
-          echo "Target PR: https://github.com/lfit/sandbox/pull/6"
+          echo "Target PR: ${VARS_DEPENDABOT_PR_URL_2}"
 
           # Configure git with your identity
           # Gerrit private SSH key is linked to this account
@@ -238,11 +246,13 @@ jobs:
 
           # Push to Gerrit
           echo "Pushing change to Gerrit..."
-          python -m github2gerrit.cli "${{ vars.DEPENDABOT_PR_URL_2 }}"
+          python -m github2gerrit.cli "${VARS_DEPENDABOT_PR_URL_2}"
 
   action-integration-test:
     name: 'Action Integration Test'
     runs-on: 'ubuntu-latest'
+    # Dedicated environment scopes access to the Gerrit test secrets
+    environment: 'development'
     permissions:
       contents: read
     timeout-minutes: 15
@@ -252,6 +262,8 @@ jobs:
     steps:
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: 'Setup Python'
         # yamllint disable-line rule:line-length
@@ -288,22 +300,23 @@ jobs:
           ALLOW_DUPLICATES: 'true'
           PRESERVE_GITHUB_PRS: 'true'
           G2G_VERBOSE: 'true'
+          VARS_DEPENDABOT_PR_URL_1: ${{ vars.DEPENDABOT_PR_URL_1 }}
           # lfit/sandbox has correct .gitreview pointing to LF Gerrit
         run: |
           echo "Testing GitHub2Gerrit CLI integration with LF Gerrit server..."
-          echo "Target PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
+          echo "Target PR: ${VARS_DEPENDABOT_PR_URL_1}"
 
           # Install current code in development mode and test CLI directly
           echo "Installing current code: uv pip install --system -e ."
           uv pip install --system -e .
 
-          echo "Running: python -m github2gerrit.cli ${{ vars.DEPENDABOT_PR_URL_1 }}"
-          python -m github2gerrit.cli "${{ vars.DEPENDABOT_PR_URL_1 }}"
+          echo "Running: python -m github2gerrit.cli ${VARS_DEPENDABOT_PR_URL_1}"
+          python -m github2gerrit.cli "${VARS_DEPENDABOT_PR_URL_1}"
 
           echo "✅ Dry-run CLI integration test completed successfully"
           {
             echo "CLI Integration test summary:"
-            echo "- Tested with external PR: ${{ vars.DEPENDABOT_PR_URL_1 }}"
+            echo "- Tested with external PR: ${VARS_DEPENDABOT_PR_URL_1}"
             echo "- Target Gerrit: gerrit.linuxfoundation.org"
             echo "- Target Project: sandbox"
             echo "- Mode: DRY_RUN (validation only)"
@@ -337,11 +350,12 @@ jobs:
           G2G_VERBOSE: 'true'
           FETCH_DEPTH: '50'
           USE_PR_AS_COMMIT: 'true'
+          VARS_DEPENDABOT_PR_URL_2: ${{ vars.DEPENDABOT_PR_URL_2 }}
           # lfit/sandbox has correct .gitreview pointing to LF Gerrit
           # Force derivation to be disabled so our overrides take precedence
         run: |
           echo '🚀 Action Integration Test Summary'
-          echo "Target PR: ${{ vars.DEPENDABOT_PR_URL_2 }}"
+          echo "Target PR: ${VARS_DEPENDABOT_PR_URL_2}"
 
           # Configure git with your identity
           # Gerrit private SSH key is linked to this account
@@ -350,4 +364,4 @@ jobs:
 
           # Push to Gerrit
           echo "Pushing change to Gerrit..."
-          python -m github2gerrit.cli "${{ vars.DEPENDABOT_PR_URL_2 }}"
+          python -m github2gerrit.cli "${VARS_DEPENDABOT_PR_URL_2}"

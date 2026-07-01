@@ -170,14 +170,15 @@ permissions: {}
 
 jobs:
   manual-dispatch:
+    name: "Manual dispatch (G2G)"
     # Manual run: allow optional PR_NUMBER (0 => process all PRs)
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
-      contents: read
-      pull-requests: write
-      issues: write
+      contents: read  # Read repository contents (checkout, etc.)
+      pull-requests: write  # Comment on and update the mirrored PR
+      issues: write  # Post status/back-reference comments on issues
     steps:
       # yamllint disable rule:line-length
       # PR_NUMBER normalization is handled by the composite action
@@ -201,14 +202,15 @@ jobs:
           PR_NUMBER: ${{ inputs.PR_NUMBER }}
 
   github2gerrit:
+    name: "Mirror PR to Gerrit"
     # Only run if we have a proper pull request context
     if: ${{ github.event.pull_request.number || github.event.issue.number }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
-      contents: read
-      pull-requests: write
-      issues: write
+      contents: read  # Read repository contents (checkout, etc.)
+      pull-requests: write  # Comment on and update the mirrored PR
+      issues: write  # Post status/back-reference comments on issues
     steps:
       - name: Run github2gerrit composite action
         uses: ./
