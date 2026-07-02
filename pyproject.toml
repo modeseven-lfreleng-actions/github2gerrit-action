@@ -273,21 +273,6 @@ reportUnsupportedDunderAll = "error"
 
 
 [tool.uv]
-# Supply-chain cooldown: do not resolve anything published in the last
-# 7 days (rolling window; uv records it as a relative span in uv.lock).
-# Requires uv >= 0.9.17 for the relative-duration ("7 days") form.
-exclude-newer = "7 days"
-# cryptography bundles OpenSSL directly in its wheels, so OpenSSL security
-# fixes are delivered as new cryptography releases. Exempt it from the
-# supply-chain cooldown above so those patches are not held back by the
-# rolling window.
-#
-# Added 2026-06-15 to unblock GHSA-537c-gmf6-5ccf ("Vulnerable OpenSSL
-# included in cryptography wheels"; no CVE assigned), fixed in 48.0.1,
-# which the 7-day cooldown was excluding. References:
-#   https://github.com/advisories/GHSA-537c-gmf6-5ccf
-#   https://openssl-library.org/news/secadv/20260609.txt
-exclude-newer-package = { cryptography = "0 days" }
 # uv will manage installation based on this pyproject and lockfile.
 # No extra settings are required here; this stanza reserves the
 # namespace for future use if needed.
