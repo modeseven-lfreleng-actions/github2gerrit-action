@@ -4,10 +4,35 @@
 
 name: "GitHub2Gerrit [R]"
 
+# Reusable workflow wrapping the github2gerrit composite action.
+#
+# Supported caller trigger events:
+#
+#   - pull_request_target (opened/reopened/edited/synchronize/closed):
+#     mirrors the pull request to Gerrit
+#   - push: closes GitHub PRs whose Gerrit changes have merged
+#     (CLOSE_MERGED_PRS flow)
+#   - workflow_dispatch: manual runs (PR_NUMBER selects a single PR;
+#     0 processes all open PRs) and Gerrit-event dispatches
+#     (GERRIT_CHANGE_URL/GERRIT_EVENT_TYPE close the source PR of a
+#     merged or abandoned Gerrit change)
+#
+# Callers with a workflow_dispatch trigger should forward their
+# dispatch inputs, for example:
+#
+#   with:
+#     PR_NUMBER: ${{ inputs.PR_NUMBER || '0' }}
+#     GERRIT_CHANGE_URL: ${{ inputs.GERRIT_CHANGE_URL || '' }}
+#     GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE || '' }}
+#
+# Input defaults match the composite action defaults, so omitting an
+# input never changes behavior relative to calling the action directly.
+
 # yamllint disable-line rule:truthy
 on:
   workflow_call:
     inputs:
+      # Core behavior
       SUBMIT_SINGLE_COMMITS:
         description: "Submit one commit at a time to the Gerrit repository"
         required: false
@@ -23,9 +48,87 @@ on:
         required: false
         default: "10"
         type: string
+      PR_NUMBER:
+        description: "PR number to process on dispatch; 0 processes all open"
+        required: false
+        default: "0"
+        type: string
+      PRESERVE_GITHUB_PRS:
+        description: "Do not close GitHub PRs after pushing to Gerrit"
+        required: false
+        default: true
+        type: boolean
+      CLOSE_MERGED_PRS:
+        description: "Close GitHub PRs when their Gerrit change merges"
+        required: false
+        default: true
+        type: boolean
+      CLEANUP_ABANDONED:
+        description: "Close GitHub PRs for abandoned Gerrit changes"
+        required: false
+        default: true
+        type: boolean
+      CLEANUP_GERRIT:
+        description: "Abandon Gerrit changes when their GitHub PR closes"
+        required: false
+        default: true
+        type: boolean
+      CREATE_MISSING:
+        description: "Create a new change when UPDATE finds no existing change"
+        required: false
+        default: false
+        type: boolean
+      AUTOMATION_ONLY:
+        description: "Accept PRs from known automation tools only"
+        required: false
+        default: true
+        type: boolean
+      NORMALISE_COMMIT:
+        description: "Normalize commit messages to conventional commit format"
+        required: false
+        default: false
+        type: boolean
+      COMMIT_RULES_JSON:
+        description: "JSON commit message validation rules"
+        required: false
+        default: ""
+        type: string
+      ALLOW_DUPLICATES:
+        description: "Allow submitting duplicate changes without error"
+        required: false
+        default: true
+        type: boolean
+      DUPLICATE_TYPES:
+        description: "Comma-separated Gerrit states for evaluating duplicates"
+        required: false
+        default: "open"
+        type: string
+      FORCE:
+        description: "Force PR closure regardless of Gerrit change status"
+        required: false
+        default: false
+        type: boolean
+      DRY_RUN:
+        description: "Validate settings and PR metadata; do not write to Gerrit"
+        required: false
+        default: false
+        type: boolean
+      VERBOSE:
+        description: "Enable verbose output (sets log level to DEBUG)"
+        required: false
+        default: false
+        type: boolean
+      ALLOW_GHE_URLS:
+        description: "Allow GitHub Enterprise URLs in direct URL mode"
+        required: false
+        default: false
+        type: boolean
+
+      # Gerrit connection
       GERRIT_KNOWN_HOSTS:
         description: "known hosts"
         required: false
+        default: ""
         type: string
       GERRIT_SERVER:
         description: "Gerrit hostname ex: git.opendaylight.org"
@@ -45,36 +148,13 @@ on:
       GERRIT_SSH_USER_G2G:
         description: "Gerrit user-id for SSH"
         required: false
+        default: ""
         type: string
       GERRIT_SSH_USER_G2G_EMAIL:
         description: "Email of the SSH user"
         required: false
-        type: string
-      ORGANIZATION:
-        description: "Organization name, e.g. opendaylight"
-        required: false
-        type: string
-        default: ${{ github.repository_owner }}
-      REVIEWERS_EMAIL:
-        description: "Committer emails (comma separated) to notify reviewers"
-        required: false
         default: ""
         type: string
-      ALLOW_GHE_URLS:
-        description: "Allow GitHub Enterprise URLs in direct URL mode"
-        required: false
-        default: false
-        type: boolean
-      PRESERVE_GITHUB_PRS:
-        description: "Do not close GitHub PRs after pushing to Gerrit"
-        required: false
-        default: true
-        type: boolean
-      DRY_RUN:
-        description: "Validate settings and PR metadata; do not write to Gerrit"
-        required: false
-        default: false
-        type: boolean
       GERRIT_HTTP_BASE_PATH:
         description: "Optional HTTP base path for Gerrit REST (e.g. /r)"
         required: false
@@ -90,6 +170,25 @@ on:
         required: false
         default: ""
         type: string
+      G2G_USE_SSH_AGENT:
+        description: "Use SSH agent for auth instead of file-based keys"
+        required: false
+        default: true
+        type: boolean
+
+      # Metadata
+      ORGANIZATION:
+        description: >-
+          Organization name, e.g. opendaylight
+          (defaults to the repository owner)
+        required: false
+        type: string
+        default: ""
+      REVIEWERS_EMAIL:
+        description: "Committer emails (comma separated) to notify reviewers"
+        required: false
+        default: ""
+        type: string
       ISSUE_ID:
         description: "Issue ID to include (e.g., ABC-123)"
         required: false
@@ -100,140 +199,119 @@ on:
         required: false
         default: "[]"
         type: string
-      ALLOW_DUPLICATES:
-        description: "Allow submitting duplicate changes without error"
+
+      # Gerrit event dispatch context (Gerrit -> GitHub reverse flow).
+      # Set these when Gerrit-side automation dispatches the caller
+      # workflow to report a merged/abandoned change; the tool closes
+      # the source GitHub PR and runs cleanup instead of processing
+      # pull requests.
+      GERRIT_CHANGE_URL:
+        description: "Gerrit change URL from a Gerrit event dispatch"
         required: false
-        default: false
-        type: boolean
+        default: ""
+        type: string
+      GERRIT_EVENT_TYPE:
+        description: "Gerrit event type (e.g. change-merged)"
+        required: false
+        default: ""
+        type: string
+      GERRIT_BRANCH:
+        description: "Target branch override from a Gerrit event dispatch"
+        required: false
+        default: ""
+        type: string
     secrets:
       GERRIT_SSH_PRIVKEY_G2G:
         description: "SSH Private key"
         required: true
-  workflow_dispatch:
-    inputs:
-      PR_NUMBER:
-        description: "Pull request number to process, use 0 to process all open"
-        required: false
-        default: "0"
-        type: string
-      SUBMIT_SINGLE_COMMITS:
-        description: "Submit one commit at a time to the Gerrit repository"
-        required: false
-        default: false
-        type: boolean
-      USE_PR_AS_COMMIT:
-        description: "Use PR body and title as commit message"
-        required: false
-        default: false
-        type: boolean
+    outputs:
+      gerrit_change_request_url:
+        description: "Gerrit change URL(s), newline-separated"
+        value: ${{ jobs.github2gerrit.outputs.gerrit_change_request_url }}
+      gerrit_change_request_num:
+        description: "Gerrit change number(s), newline-separated"
+        value: ${{ jobs.github2gerrit.outputs.gerrit_change_request_num }}
+      gerrit_commit_sha:
+        description: "Patch set commit SHA(s), newline-separated"
+        value: ${{ jobs.github2gerrit.outputs.gerrit_commit_sha }}
 
-      GERRIT_KNOWN_HOSTS:
-        description: "known hosts"
-        required: false
-        type: string
-      GERRIT_SSH_USER_G2G:
-        description: "Gerrit user-id for SSH"
-        required: false
-        type: string
-      GERRIT_SSH_USER_G2G_EMAIL:
-        description: "Email of the SSH user"
-        required: false
-        type: string
-
-      PRESERVE_GITHUB_PRS:
-        description: "Do not close GitHub PRs after pushing to Gerrit"
-        required: false
-        default: false
-        type: boolean
-      DRY_RUN:
-        description: "Validate settings and PR metadata; do not write to Gerrit"
-        required: false
-        default: false
-        type: boolean
-      ISSUE_ID:
-        description: "Issue ID to include (e.g., ABC-123)"
-        required: false
-        default: ""
-        type: string
-      ALLOW_DUPLICATES:
-        description: "Allow submitting duplicate changes without error"
-        required: false
-        default: false
-        type: boolean
-
-concurrency:
-  group: reusable-${{ github.workflow }}-${{ github.run_id }}
-  cancel-in-progress: true
-
-# Default to no permissions; each job grants only what it needs.
+# Default to no permissions; the job grants only what it needs.
 permissions: {}
 
 jobs:
-  manual-dispatch:
-    name: "Manual dispatch (G2G)"
-    # Manual run: allow optional PR_NUMBER (0 => process all PRs)
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    permissions:
-      contents: read  # Read repository contents (checkout, etc.)
-      pull-requests: write  # Comment on and update the mirrored PR
-      issues: write  # Post status/back-reference comments on issues
-    steps:
-      # yamllint disable rule:line-length
-      # PR_NUMBER normalization is handled by the composite action
-
-      - name: Run github2gerrit composite action
-        uses: ./
-        with:
-          SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
-          USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
-
-          GERRIT_KNOWN_HOSTS: ${{ inputs.GERRIT_KNOWN_HOSTS }}
-          GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
-          GERRIT_SSH_USER_G2G: ${{ inputs.GERRIT_SSH_USER_G2G }}
-          GERRIT_SSH_USER_G2G_EMAIL: ${{ inputs.GERRIT_SSH_USER_G2G_EMAIL }}
-          ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
-          PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
-          DRY_RUN: ${{ inputs.DRY_RUN }}
-          ISSUE_ID: ${{ inputs.ISSUE_ID }}
-          ISSUE_ID_LOOKUP_JSON: ${{ vars.ISSUE_ID_LOOKUP_JSON }}
-          G2G_NO_GERRIT: ${{ vars.G2G_NO_GERRIT }}
-          PR_NUMBER: ${{ inputs.PR_NUMBER }}
-
   github2gerrit:
-    name: "Mirror PR to Gerrit"
-    # Only run if we have a proper pull request context
-    if: ${{ github.event.pull_request.number || github.event.issue.number }}
+    name: "GitHub2Gerrit"
+    # Run for pull request context (mirror the PR to Gerrit), push
+    # events (close PRs for merged Gerrit changes), and dispatch
+    # events from the caller (manual PR processing or Gerrit-event
+    # dispatches)
+    # yamllint disable-line rule:line-length
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || github.event.issue.number }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
       contents: read  # Read repository contents (checkout, etc.)
       pull-requests: write  # Comment on and update the mirrored PR
       issues: write  # Post status/back-reference comments on issues
+    # Serialize runs per pull request; non-PR runs (push events and
+    # dispatches) queue per event type. Queue rather than cancel so an
+    # in-flight push to Gerrit is never interrupted
+    concurrency:
+      # yamllint disable-line rule:line-length
+      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event_name }}
+      cancel-in-progress: false
+    outputs:
+      # yamllint disable rule:line-length
+      gerrit_change_request_url: ${{ steps.g2g.outputs.gerrit_change_request_url }}
+      gerrit_change_request_num: ${{ steps.g2g.outputs.gerrit_change_request_num }}
+      gerrit_commit_sha: ${{ steps.g2g.outputs.gerrit_commit_sha }}
+      # yamllint enable rule:line-length
     steps:
       - name: Run github2gerrit composite action
-        uses: ./
+        id: g2g
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/github2gerrit-action@f44c168376b369be0f306b6bdc07c80f67cceb05 # v1.3.3
+        env:
+          # Gerrit event dispatch context: when GERRIT_CHANGE_URL and
+          # GERRIT_EVENT_TYPE carry values, the tool closes the source
+          # GitHub PR of the change and returns before any pull
+          # request processing (bulk mode included); empty values are
+          # a no-op
+          GERRIT_CHANGE_URL: ${{ inputs.GERRIT_CHANGE_URL }}
+          GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE }}
+          GERRIT_BRANCH: ${{ inputs.GERRIT_BRANCH }}
         with:
+          PR_NUMBER: ${{ inputs.PR_NUMBER }}
           SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
           USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
           FETCH_DEPTH: ${{ inputs.FETCH_DEPTH }}
+          PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
+          CLOSE_MERGED_PRS: ${{ inputs.CLOSE_MERGED_PRS }}
+          CLEANUP_ABANDONED: ${{ inputs.CLEANUP_ABANDONED }}
+          CLEANUP_GERRIT: ${{ inputs.CLEANUP_GERRIT }}
+          CREATE_MISSING: ${{ inputs.CREATE_MISSING }}
+          AUTOMATION_ONLY: ${{ inputs.AUTOMATION_ONLY }}
+          NORMALISE_COMMIT: ${{ inputs.NORMALISE_COMMIT }}
+          COMMIT_RULES_JSON: ${{ inputs.COMMIT_RULES_JSON }}
+          ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
+          DUPLICATE_TYPES: ${{ inputs.DUPLICATE_TYPES }}
+          FORCE: ${{ inputs.FORCE }}
+          DRY_RUN: ${{ inputs.DRY_RUN }}
+          VERBOSE: ${{ inputs.VERBOSE }}
+          ALLOW_GHE_URLS: ${{ inputs.ALLOW_GHE_URLS }}
           GERRIT_KNOWN_HOSTS: ${{ inputs.GERRIT_KNOWN_HOSTS }}
           GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
-          GERRIT_SSH_USER_G2G: ${{ inputs.GERRIT_SSH_USER_G2G }}
-          GERRIT_SSH_USER_G2G_EMAIL: ${{ inputs.GERRIT_SSH_USER_G2G_EMAIL }}
-
-          REVIEWERS_EMAIL: ${{ inputs.REVIEWERS_EMAIL }}
-          ALLOW_GHE_URLS: ${{ inputs.ALLOW_GHE_URLS }}
-          PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
-          DRY_RUN: ${{ inputs.DRY_RUN }}
-          ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
-          ISSUE_ID: ${{ inputs.ISSUE_ID }}
-          ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
-          G2G_NO_GERRIT: ${{ vars.G2G_NO_GERRIT }}
           GERRIT_SERVER: ${{ inputs.GERRIT_SERVER }}
           GERRIT_SERVER_PORT: ${{ inputs.GERRIT_SERVER_PORT }}
           GERRIT_PROJECT: ${{ inputs.GERRIT_PROJECT }}
+          GERRIT_SSH_USER_G2G: ${{ inputs.GERRIT_SSH_USER_G2G }}
+          GERRIT_SSH_USER_G2G_EMAIL: ${{ inputs.GERRIT_SSH_USER_G2G_EMAIL }}
           GERRIT_HTTP_BASE_PATH: ${{ inputs.GERRIT_HTTP_BASE_PATH }}
           GERRIT_HTTP_USER: ${{ inputs.GERRIT_HTTP_USER }}
           GERRIT_HTTP_PASSWORD: ${{ inputs.GERRIT_HTTP_PASSWORD }}
+          G2G_USE_SSH_AGENT: ${{ inputs.G2G_USE_SSH_AGENT }}
+          ORGANIZATION: ${{ inputs.ORGANIZATION || github.repository_owner }}
+          REVIEWERS_EMAIL: ${{ inputs.REVIEWERS_EMAIL }}
+          ISSUE_ID: ${{ inputs.ISSUE_ID }}
+          ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
+          G2G_NO_GERRIT: ${{ vars.G2G_NO_GERRIT }}

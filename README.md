@@ -93,6 +93,15 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      PR_NUMBER:
+        description: "PR number to process; 0 processes all open"
+        required: false
+        default: "0"
+        type: string
 
 permissions: {}
 
@@ -108,9 +117,16 @@ jobs:
       GERRIT_KNOWN_HOSTS: ${{ vars.GERRIT_KNOWN_HOSTS }}
       GERRIT_SSH_USER_G2G: ${{ vars.GERRIT_SSH_USER_G2G }}
       GERRIT_SSH_USER_G2G_EMAIL: ${{ vars.GERRIT_SSH_USER_G2G_EMAIL }}
+      PR_NUMBER: ${{ inputs.PR_NUMBER || '0' }}
     secrets:
       GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
 ```
+
+The `push` trigger enables closing PRs whose Gerrit changes have
+merged; `workflow_dispatch` enables manual processing. Repositories
+using the Gerrit-side dispatch integration should also declare
+`GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH` as
+dispatch inputs and forward them the same way.
 
 Pin `@main` to a release tag or commit SHA for production use.
 
@@ -224,53 +240,76 @@ via `env:` on the action step when needed. See
 
 Access outputs in later steps with
 `${{ steps.<step-id>.outputs.<output-name> }}`. The reusable workflow
-does not currently re-export these outputs to callers.
+re-exports all three outputs to callers.
 
 ## Reusable workflow interface
 
-The reusable workflow (`.github/workflows/github2gerrit.yaml`) exposes
-a subset of the action inputs via `workflow_call`:
+The reusable workflow (`.github/workflows/github2gerrit.yaml`) wraps
+the composite action for `workflow_call`, supporting caller triggers
+`pull_request_target`, `push` (close PRs for merged Gerrit changes),
+and `workflow_dispatch` (manual runs and Gerrit-event dispatches).
+Input defaults match the composite action defaults.
 
 <!-- markdownlint-disable MD013 -->
 
-| Input                       | Type    | Default          | Description                                   |
-| --------------------------- | ------- | ---------------- | --------------------------------------------- |
-| `GERRIT_KNOWN_HOSTS`        | string  | —                | Known hosts entries for Gerrit SSH            |
-| `GERRIT_SSH_USER_G2G`       | string  | —                | Gerrit SSH username                           |
-| `GERRIT_SSH_USER_G2G_EMAIL` | string  | —                | Gerrit user email address                     |
-| `GERRIT_SERVER`             | string  | `""`             | Gerrit server hostname                        |
-| `GERRIT_SERVER_PORT`        | string  | `"29418"`        | Gerrit SSH port                               |
-| `GERRIT_PROJECT`            | string  | `""`             | Gerrit project name                           |
-| `GERRIT_HTTP_BASE_PATH`     | string  | `""`             | HTTP base path for Gerrit REST                |
-| `GERRIT_HTTP_USER`          | string  | `""`             | Gerrit HTTP user for REST queries             |
-| `GERRIT_HTTP_PASSWORD`      | string  | `""`             | Gerrit HTTP password/token for REST queries   |
-| `ORGANIZATION`              | string  | repository owner | GitHub organization/owner¹                    |
-| `FETCH_DEPTH`               | string  | `"10"`           | Fetch depth for checkout                      |
-| `SUBMIT_SINGLE_COMMITS`     | boolean | `false`          | Submit one commit at a time                   |
-| `USE_PR_AS_COMMIT`          | boolean | `false`          | Use PR title and body as the commit message   |
-| `PRESERVE_GITHUB_PRS`       | boolean | `true`           | Do not close GitHub PRs after pushing         |
-| `ALLOW_DUPLICATES`          | boolean | `false`          | Allow submitting duplicate changes            |
-| `ALLOW_GHE_URLS`            | boolean | `false`          | Allow GitHub Enterprise URLs                  |
-| `DRY_RUN`                   | boolean | `false`          | Check only; do not write to Gerrit            |
-| `ISSUE_ID`                  | string  | `""`             | Issue ID trailer to include                   |
-| `ISSUE_ID_LOOKUP_JSON`      | string  | `"[]"`           | JSON array mapping GitHub actors to Issue IDs |
-| `REVIEWERS_EMAIL`           | string  | `""`             | Comma-separated reviewer emails               |
+| Input                       | Type    | Default          | Description                                      |
+| --------------------------- | ------- | ---------------- | ------------------------------------------------ |
+| `GERRIT_KNOWN_HOSTS`        | string  | `""`             | Known hosts entries for Gerrit SSH               |
+| `GERRIT_SSH_USER_G2G`       | string  | `""`             | Gerrit SSH username                              |
+| `GERRIT_SSH_USER_G2G_EMAIL` | string  | `""`             | Gerrit user email address                        |
+| `GERRIT_SERVER`             | string  | `""`             | Gerrit server hostname                           |
+| `GERRIT_SERVER_PORT`        | string  | `"29418"`        | Gerrit SSH port                                  |
+| `GERRIT_PROJECT`            | string  | `""`             | Gerrit project name                              |
+| `GERRIT_HTTP_BASE_PATH`     | string  | `""`             | HTTP base path for Gerrit REST                   |
+| `GERRIT_HTTP_USER`          | string  | `""`             | Gerrit HTTP user for REST queries                |
+| `GERRIT_HTTP_PASSWORD`      | string  | `""`             | Gerrit HTTP password/token for REST queries      |
+| `G2G_USE_SSH_AGENT`         | boolean | `true`           | Use SSH agent instead of file-based keys         |
+| `ORGANIZATION`              | string  | repository owner | GitHub organization/owner                        |
+| `PR_NUMBER`                 | string  | `"0"`            | PR to process on dispatch; `0` processes all     |
+| `FETCH_DEPTH`               | string  | `"10"`           | Fetch depth for checkout                         |
+| `SUBMIT_SINGLE_COMMITS`     | boolean | `false`          | Submit one commit at a time                      |
+| `USE_PR_AS_COMMIT`          | boolean | `false`          | Use PR title and body as the commit message      |
+| `PRESERVE_GITHUB_PRS`       | boolean | `true`           | Do not close GitHub PRs after pushing            |
+| `CLOSE_MERGED_PRS`          | boolean | `true`           | Close GitHub PRs when their Gerrit change merges |
+| `CLEANUP_ABANDONED`         | boolean | `true`           | Close GitHub PRs for abandoned Gerrit changes    |
+| `CLEANUP_GERRIT`            | boolean | `true`           | Abandon Gerrit changes when their PR closes      |
+| `CREATE_MISSING`            | boolean | `false`          | Create a change when UPDATE finds none           |
+| `AUTOMATION_ONLY`           | boolean | `true`           | Accept PRs from known automation tools only      |
+| `NORMALISE_COMMIT`          | boolean | `false`          | Normalize commit messages                        |
+| `COMMIT_RULES_JSON`         | string  | `""`             | JSON commit message validation rules             |
+| `ALLOW_DUPLICATES`          | boolean | `true`           | Allow submitting duplicate changes               |
+| `DUPLICATE_TYPES`           | string  | `"open"`         | Gerrit states checked for duplicates             |
+| `FORCE`                     | boolean | `false`          | Force PR closure regardless of change status     |
+| `VERBOSE`                   | boolean | `false`          | Verbose output (DEBUG log level)                 |
+| `ALLOW_GHE_URLS`            | boolean | `false`          | Allow GitHub Enterprise URLs                     |
+| `DRY_RUN`                   | boolean | `false`          | Check only; do not write to Gerrit               |
+| `ISSUE_ID`                  | string  | `""`             | Issue ID trailer to include                      |
+| `ISSUE_ID_LOOKUP_JSON`      | string  | `"[]"`           | JSON array mapping GitHub actors to Issue IDs    |
+| `REVIEWERS_EMAIL`           | string  | `""`             | Comma-separated reviewer emails                  |
+| `GERRIT_CHANGE_URL`         | string  | `""`             | Gerrit change URL from a Gerrit event dispatch¹  |
+| `GERRIT_EVENT_TYPE`         | string  | `""`             | Gerrit event type (e.g. `change-merged`)¹        |
+| `GERRIT_BRANCH`             | string  | `""`             | Target branch override (Gerrit event dispatch)¹  |
 
 | Secret                   | Required | Description                                    |
 | ------------------------ | -------- | ---------------------------------------------- |
 | `GERRIT_SSH_PRIVKEY_G2G` | Yes      | SSH private key for the Gerrit automation user |
 
+| Output                      | Description                                |
+| --------------------------- | ------------------------------------------ |
+| `gerrit_change_request_url` | Gerrit change URL(s), newline-separated    |
+| `gerrit_change_request_num` | Gerrit change number(s), newline-separated |
+| `gerrit_commit_sha`         | Patch set commit SHA(s), newline-separated |
+
 <!-- markdownlint-enable MD013 -->
 
-¹ Accepted for compatibility; the action currently derives the
-organization from the repository owner.
+¹ Gerrit → GitHub reverse flow: when Gerrit-side automation
+dispatches the caller workflow to report a merged or abandoned
+change, forward these dispatch inputs and the tool closes the source
+GitHub PR instead of processing pull requests.
 
-The workflow also supports `workflow_dispatch` in this repository for
-manual runs, with `PR_NUMBER` selecting a single PR (`0` processes
-all open PRs). Setting the repository variable `G2G_NO_GERRIT` to
-`true` makes runs skip Gerrit interaction, and features not exposed
-as workflow inputs (cleanup toggles, `AUTOMATION_ONLY`, and others)
-use the action defaults listed above.
+Setting the repository variable `G2G_NO_GERRIT` to `true` makes runs
+skip Gerrit interaction. Test-only settings (`CI_TESTING`,
+`USE_LOCAL_ACTION`) remain composite-action-only by design.
 
 ## Documentation
 
