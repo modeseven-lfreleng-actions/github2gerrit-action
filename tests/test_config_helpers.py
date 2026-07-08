@@ -250,11 +250,11 @@ ANOTHER_UNKNOWN = "third_value"
     ]
     assert len(warning_messages) == 1
     warning_msg = warning_messages[0]
-    assert "Unknown configuration keys found in [onap]:" in warning_msg
+    assert "Unrecognized configuration keys found in [onap]:" in warning_msg
     assert "UNKNOWN_KEY" in warning_msg
     assert "TYPO_KEY" in warning_msg
     assert "ANOTHER_UNKNOWN" in warning_msg
-    assert "Check for typos or missing functionality" in warning_msg
+    assert "Check for typos" in warning_msg
 
 
 def test_filter_known_with_and_without_extras() -> None:

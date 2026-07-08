@@ -108,7 +108,7 @@ inputs:
     required: false
     default: ""
   GERRIT_SERVER_PORT:
-    description: "Gerrit serverSSH TCP/port"
+    description: "Gerrit server SSH TCP port"
     required: false
     default: "29418"
   GERRIT_PROJECT:

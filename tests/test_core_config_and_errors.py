@@ -92,6 +92,149 @@ def test_resolve_target_branch_defaults_to_master(
 # -----------------------------
 
 
+def _gh_context_for_topic(pr_number: int | None = 42) -> Any:
+    from github2gerrit.models import GitHubContext
+
+    return GitHubContext(
+        event_name="pull_request_target",
+        event_action="synchronize",
+        event_path=None,
+        repository="opendaylight/releng-builder",
+        repository_owner="opendaylight",
+        server_url="https://github.com",
+        run_id="123",
+        sha="abc123",
+        base_ref="master",
+        head_ref="feature",
+        pr_number=pr_number,
+    )
+
+
+def test_build_gerrit_topic_formats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from github2gerrit.gerrit_query import build_gerrit_topic
+
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+    assert build_gerrit_topic("releng-builder", 42) == "GH-releng-builder-42"
+    assert build_gerrit_topic("releng-builder") == "GH-releng-builder"
+    # "0" is the documented "process all open PRs" sentinel, not a
+    # real PR number; it must not appear in topics.
+    assert build_gerrit_topic("releng-builder", 0) == "GH-releng-builder"
+    assert build_gerrit_topic("releng-builder", "0") == "GH-releng-builder"
+    monkeypatch.setenv("G2G_TOPIC_PREFIX", "MY")
+    assert build_gerrit_topic("releng-builder", 7) == "MY-releng-builder-7"
+
+
+def test_topic_for_pr_uses_resolved_repo_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Query topics must match the pushed topic, which derives from the
+    # resolved project name (possibly .gitreview-based), not the
+    # GitHub owner/repo pair.
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+    orch = Orchestrator(workspace=tmp_path)
+    orch._repo_names = RepoNames(
+        project_gerrit="releng/builder", project_github="releng-builder"
+    )
+    gh = _gh_context_for_topic(42)
+    assert orch._topic_for_pr(gh) == "GH-releng-builder-42"
+
+
+def test_topic_for_pr_falls_back_to_repository_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+    orch = Orchestrator(workspace=tmp_path)
+    gh = _gh_context_for_topic(42)
+    assert orch._topic_for_pr(gh) == "GH-releng-builder-42"
+
+
+def test_query_topic_matches_pushed_topic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: query topics must equal the git-review push topic."""
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+    monkeypatch.setenv("PR_NUMBER", "42")
+
+    orch = Orchestrator(workspace=tmp_path)
+    repo = RepoNames(
+        project_gerrit="releng/builder", project_github="releng-builder"
+    )
+    orch._repo_names = repo
+    gerrit = GerritInfo(
+        host="gerrit.example.org", port=29418, project="releng/builder"
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+        calls.append(list(cmd))
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("github2gerrit.core.run_cmd", fake_run_cmd)
+
+    orch._push_to_gerrit(
+        gerrit=gerrit,
+        repo=repo,
+        branch="master",
+        reviewers="",
+        single_commits=False,
+    )
+
+    review_cmd = next(
+        cmd for cmd in calls if cmd[:3] == ["git", "review", "--yes"]
+    )
+    pushed_topic = review_cmd[review_cmd.index("-t") + 1]
+
+    gh = _gh_context_for_topic(42)
+    assert orch._topic_for_pr(gh) == pushed_topic
+
+
+def test_push_topic_uses_context_pr_number_in_bulk_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Bulk mode: topic derives from the per-PR context, not env.
+
+    Multi-PR processing runs PRs in parallel threads with per-PR
+    GitHubContext objects; the process-wide PR_NUMBER env var is
+    absent (or stale), so the pushed topic must come from the
+    context's pr_number.
+    """
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+    monkeypatch.delenv("PR_NUMBER", raising=False)
+
+    orch = Orchestrator(workspace=tmp_path)
+    repo = RepoNames(
+        project_gerrit="releng/builder", project_github="releng-builder"
+    )
+    gerrit = GerritInfo(
+        host="gerrit.example.org", port=29418, project="releng/builder"
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run_cmd(cmd: list[str], **kwargs: Any) -> CommandResult:
+        calls.append(list(cmd))
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("github2gerrit.core.run_cmd", fake_run_cmd)
+
+    orch._push_to_gerrit(
+        gerrit=gerrit,
+        repo=repo,
+        branch="master",
+        reviewers="",
+        single_commits=False,
+        gh=_gh_context_for_topic(7),
+    )
+
+    review_cmd = next(
+        cmd for cmd in calls if cmd[:3] == ["git", "review", "--yes"]
+    )
+    assert review_cmd[review_cmd.index("-t") + 1] == "GH-releng-builder-7"
+
+
 def test_push_to_gerrit_topic_default_prefix_with_pr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

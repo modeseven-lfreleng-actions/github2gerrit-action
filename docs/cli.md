@@ -159,26 +159,33 @@ Some settings have no CLI flag and use environment variables:
 
 <!-- markdownlint-disable MD013 -->
 
-| Variable                   | Default                                     | Description                                                                      |
-| -------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------- |
-| `G2G_CONFIG_PATH`          | `~/.config/github2gerrit/configuration.txt` | Path to the per-organization configuration file                                  |
-| `G2G_LOG_LEVEL`            | `WARNING`                                   | Logging level; set `DEBUG` for verbose output                                    |
-| `G2G_TOPIC_PREFIX`         | `GH`                                        | Prefix used when generating Gerrit topics                                        |
-| `G2G_SKIP_GERRIT_COMMENTS` | `false`                                     | Skip posting back-reference comments on Gerrit changes                           |
-| `G2G_ENABLE_DERIVATION`    | `true`                                      | Enable automatic derivation of Gerrit parameters from organization defaults      |
-| `G2G_AUTO_SAVE_CONFIG`     | context-dependent                           | Save derived parameters back to the configuration file                           |
-| `G2G_RESPECT_USER_SSH`     | `false` (`true` in direct URL mode)         | Use the local user's SSH configuration and keys instead of provided key material |
-| `G2G_USE_SSH_AGENT`        | `true`                                      | Use SSH agent authentication; set `false` to force file-based SSH keys           |
-| `G2G_NO_GERRIT`            | `false`                                     | Run the full pipeline without contacting Gerrit (forces dry-run behavior)        |
-| `G2G_DISABLED`             | `false`                                     | Exit immediately with success without processing anything                        |
-| `CLEANUP_ABANDONED`        | `true`                                      | Close GitHub PRs whose Gerrit changes have status abandoned                      |
-| `CLEANUP_GERRIT`           | `true`                                      | Abandon Gerrit changes for closed GitHub PRs                                     |
-| `PR_NUMBER`                | unset                                       | Pull request number to process in CI/CD mode (`0` means bulk mode)               |
-| `SYNC_ALL_OPEN_PRS`        | `false`                                     | Process all open PRs in the repository (bulk mode)                               |
-| `GERRIT_HTTP_USER`         | unset                                       | Username for the Gerrit REST API (when required)                                 |
-| `GERRIT_HTTP_PASSWORD`     | unset                                       | HTTP password/token for the Gerrit REST API                                      |
-| `GERRIT_HTTP_BASE_PATH`    | unset                                       | Gerrit REST base path for non-standard deployments (e.g., `/r`)                  |
-| `GITHUB_TOKEN`             | unset                                       | GitHub API token; required for PR queries, comments, and closing PRs             |
+| Variable                      | Default                                     | Description                                                                      |
+| ----------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------- |
+| `G2G_CONFIG_PATH`             | `~/.config/github2gerrit/configuration.txt` | Path to the per-organization configuration file                                  |
+| `G2G_LOG_LEVEL`               | `WARNING`                                   | Logging level; set `DEBUG` for verbose output                                    |
+| `G2G_TOPIC_PREFIX`            | `GH`                                        | Prefix used when generating Gerrit topics                                        |
+| `G2G_SKIP_GERRIT_COMMENTS`    | `false`                                     | Skip posting back-reference comments on Gerrit changes                           |
+| `G2G_ENABLE_DERIVATION`       | `true`                                      | Enable automatic derivation of Gerrit parameters from organization defaults      |
+| `G2G_AUTO_SAVE_CONFIG`        | context-dependent                           | Save derived parameters back to the configuration file                           |
+| `G2G_RESPECT_USER_SSH`        | `false` (`true` in direct URL mode)         | Use the local user's SSH configuration and keys instead of provided key material |
+| `G2G_USE_SSH_AGENT`           | `true`                                      | Use SSH agent authentication; set `false` to force file-based SSH keys           |
+| `G2G_NO_GERRIT`               | `false`                                     | Run the full pipeline without contacting Gerrit (forces dry-run behavior)        |
+| `G2G_DISABLED`                | `false`                                     | Exit immediately with success without processing anything                        |
+| `CLEANUP_ABANDONED`           | `true`                                      | Close GitHub PRs whose Gerrit changes have status abandoned                      |
+| `CLEANUP_GERRIT`              | `true`                                      | Abandon Gerrit changes for closed GitHub PRs                                     |
+| `PR_NUMBER`                   | unset                                       | Pull request number to process in CI/CD mode (`0` means bulk mode)               |
+| `SYNC_ALL_OPEN_PRS`           | `false`                                     | Process all open PRs in the repository (bulk mode)                               |
+| `GERRIT_HTTP_USER`            | unset                                       | Username for the Gerrit REST API (when required)                                 |
+| `GERRIT_HTTP_PASSWORD`        | unset                                       | HTTP password/token for the Gerrit REST API                                      |
+| `GERRIT_HTTP_BASE_PATH`       | unset                                       | Gerrit REST base path for non-standard deployments (e.g., `/r`)                  |
+| `GITHUB_TOKEN`                | unset                                       | GitHub API token; required for PR queries, comments, and closing PRs             |
+| `GH_TOKEN`                    | unset                                       | Fallback source for `GITHUB_TOKEN` when the latter is unset                      |
+| `GERRIT_CHANGE_URL`           | unset                                       | Gerrit change URL for Gerrit-event dispatch mode (close the source PR)           |
+| `GERRIT_EVENT_TYPE`           | unset                                       | Gerrit event type for dispatch mode (`change-merged` or `change-abandoned`)      |
+| `GERRIT_BRANCH`               | unset                                       | Gerrit branch for dispatch mode change queries                                   |
+| `G2G_DRYRUN_DISABLE_NETWORK`  | `false`                                     | Skip DNS/network checks in dry-run; set automatically by `G2G_NO_GERRIT`         |
+| `G2G_ANON_SUPERSEDE_FALLBACK` | `true`                                      | Allow anonymous supersession queries when Gerrit credentials are unavailable     |
+| `VERIFY_DIGEST_STRICT`        | `true`                                      | Fail (rather than warn) on reconciliation digest mismatch after push             |
 
 <!-- markdownlint-enable MD013 -->
 

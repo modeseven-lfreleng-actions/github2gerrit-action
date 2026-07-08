@@ -307,9 +307,11 @@ dispatches the caller workflow to report a merged or abandoned
 change, forward these dispatch inputs and the tool closes the source
 GitHub PR instead of processing pull requests.
 
-Setting the repository variable `G2G_NO_GERRIT` to `true` makes runs
-skip Gerrit interaction. Test-only settings (`CI_TESTING`,
-`USE_LOCAL_ACTION`) remain composite-action-only by design.
+Repository variables provide operational kill switches: set
+`G2G_NO_GERRIT` to `true` to skip Gerrit interaction, or
+`G2G_DISABLED` to `true` to exit immediately without processing.
+Test-only settings (`CI_TESTING`, `USE_LOCAL_ACTION`) remain
+composite-action-only by design.
 
 ## Documentation
 

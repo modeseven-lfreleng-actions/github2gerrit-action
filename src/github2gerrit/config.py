@@ -79,11 +79,37 @@ KNOWN_KEYS: set[str] = {
     "ALLOW_DUPLICATES",
     "DUPLICATE_TYPES",
     "ISSUE_ID",
+    "ISSUE_ID_LOOKUP_JSON",
+    "COMMIT_RULES_JSON",
+    "CLOSE_MERGED_PRS",
+    "CREATE_MISSING",
+    "AUTOMATION_ONLY",
+    "CLEANUP_ABANDONED",
+    "CLEANUP_GERRIT",
+    "NORMALISE_COMMIT",
+    "VERBOSE",
+    "FORCE",
+    "CI_TESTING",
+    "USE_LOCAL_ACTION",
     "G2G_VERBOSE",
     "G2G_SKIP_GERRIT_COMMENTS",
     "G2G_ENABLE_DERIVATION",
     "G2G_AUTO_SAVE_CONFIG",
+    "G2G_USE_SSH_AGENT",
+    "G2G_NO_GERRIT",
+    "G2G_DISABLED",
+    "G2G_TOPIC_PREFIX",
+    "G2G_LOG_LEVEL",
+    "G2G_SHOW_PROGRESS",
+    "G2G_RESPECT_USER_SSH",
+    "G2G_DRYRUN_DISABLE_NETWORK",
+    "G2G_ANON_SUPERSEDE_FALLBACK",
     "GITHUB_TOKEN",
+    "GH_TOKEN",
+    # Gerrit event dispatch context (workflow_dispatch)
+    "GERRIT_BRANCH",
+    "GERRIT_CHANGE_URL",
+    "GERRIT_EVENT_TYPE",
     # Optional inputs (reusable workflow compatibility)
     "GERRIT_SERVER",
     "GERRIT_SERVER_PORT",
@@ -100,6 +126,7 @@ KNOWN_KEYS: set[str] = {
     "ALLOW_ORPHAN_CHANGES",
     "PERSIST_SINGLE_MAPPING_COMMENT",
     "LOG_RECONCILE_JSON",
+    "VERIFY_DIGEST_STRICT",
 }
 
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -386,14 +413,18 @@ def load_org_config(
 
     normalized = _normalize_keys(result)
 
-    # Report unknown configuration keys to help users catch typos
+    # Report unrecognized configuration keys to help users catch typos.
+    # Unrecognized keys still apply to the environment (see
+    # apply_config_to_env), so a typo produces a setting the tool
+    # never reads rather than an error.
     unknown_keys = set(normalized.keys()) - KNOWN_KEYS
     log.debug("All parsed keys from config: %s", sorted(normalized.keys()))
     log.debug("Known keys: %s", sorted(KNOWN_KEYS))
     if unknown_keys:
         log.warning(
-            "Unknown configuration keys found in [%s]: %s. "
-            "These will be ignored. Check for typos or missing functionality.",
+            "Unrecognized configuration keys found in [%s]: %s. "
+            "These keys still export to the environment, but the tool "
+            "does not consume them directly. Check for typos.",
             effective_org or "default",
             ", ".join(sorted(unknown_keys)),
         )
