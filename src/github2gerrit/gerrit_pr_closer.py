@@ -138,14 +138,12 @@ def check_gerrit_change_status(
     host, change_number = parsed
 
     try:
-        # Build Gerrit REST client for the host
         client = build_client_for_host(host)
 
         # Query change details
         # Gerrit REST API endpoint: GET /changes/{change-id}
         change_data = client.get(f"/changes/{change_number}")
 
-        # Extract status from response
         status = change_data.get("status", "UNKNOWN")
         log.debug("Gerrit change %s status: %s", change_number, status)
     except GerritRestError as exc:
@@ -163,7 +161,6 @@ def check_gerrit_change_status(
         )
         return "UNKNOWN"
     else:
-        # Validate status against allowed values for type safety
         allowed_statuses = ("MERGED", "ABANDONED", "NEW", "UNKNOWN")
         result: Literal["MERGED", "ABANDONED", "NEW", "UNKNOWN"] = (
             status if status in allowed_statuses else "UNKNOWN"
@@ -189,10 +186,8 @@ def extract_pr_url_from_commit(commit_sha: str) -> str | None:
         GitHub PR URL if found, None otherwise
     """
     try:
-        # Get the commit message
         commit_message = git_show(commit_sha, fmt="%B")
 
-        # Parse trailers
         trailers = parse_trailers(commit_message)
 
         # Look for GitHub-PR trailer
@@ -274,7 +269,6 @@ def extract_pr_url_from_gerrit_change(gerrit_change_url: str) -> str | None:
     host, change_number = parsed
 
     try:
-        # Build Gerrit REST client for the host
         client = build_client_for_host(host)
 
         # Query change details including commit message
@@ -287,7 +281,6 @@ def extract_pr_url_from_gerrit_change(gerrit_change_url: str) -> str | None:
             log.debug("No current revision found for change %s", change_number)
             return None
 
-        # Get commit message from the revision data
         revisions = change_data.get("revisions", {})
         revision_data = revisions.get(current_revision, {})
         commit_data = revision_data.get("commit", {})
@@ -297,7 +290,6 @@ def extract_pr_url_from_gerrit_change(gerrit_change_url: str) -> str | None:
             log.debug("No commit message found for change %s", change_number)
             return None
 
-        # Parse trailers to find GitHub-PR URL
         trailers = parse_trailers(commit_message)
         pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
 
@@ -347,28 +339,23 @@ def extract_pr_info_for_display(
         Dictionary of PR information for display
     """
     try:
-        # Get PR title
         title = getattr(pr_obj, "title", "No title")
 
-        # Get PR author
         author = "Unknown"
         user = getattr(pr_obj, "user", None)
         if user:
             author = getattr(user, "login", "Unknown") or "Unknown"
 
-        # Get base branch
         base_branch = "unknown"
         base = getattr(pr_obj, "base", None)
         if base:
             base_branch = getattr(base, "ref", "unknown") or "unknown"
 
-        # Get SHA
         sha = "unknown"
         head = getattr(pr_obj, "head", None)
         if head:
             sha = getattr(head, "sha", "unknown") or "unknown"
 
-        # Build PR info dictionary
         pr_info = {
             "Repository": f"{owner}/{repo}",
             "PR Number": pr_number,
@@ -425,7 +412,6 @@ def close_pr_with_status(
     Returns:
         True if PR was closed (or would be closed in dry-run), False otherwise
     """
-    # Parse PR URL
     parsed = parse_pr_url(pr_url)
     if not parsed:
         log.info("Invalid GitHub PR URL format: %s - skipping", pr_url)
@@ -435,13 +421,11 @@ def close_pr_with_status(
     log.debug("Found GitHub PR: %s/%s#%d", owner, repo, pr_number)
 
     try:
-        # Build GitHub client and get repository
         client = build_client()
 
         # Get the specific repository (not from env, might be different)
         repo_obj = client.get_repo(f"{owner}/{repo}")
 
-        # Fetch the pull request
         try:
             pr_obj = get_pull(repo_obj, pr_number)
         except Exception as exc:
@@ -471,7 +455,6 @@ def close_pr_with_status(
             )
             return False
 
-        # Extract and display PR information
         pr_info = extract_pr_info_for_display(pr_obj, owner, repo, pr_number)
         display_pr_info(
             pr_info, context="Abandoned", progress_tracker=progress_tracker
@@ -521,7 +504,6 @@ def close_pr_with_status(
             close_pr(pr_obj, comment=comment)
             log.debug("SUCCESS: Closed GitHub PR #%d", pr_number)
 
-            # Extract Gerrit change number from URL
             gerrit_change_number = "unknown"
             if gerrit_change_url:
                 match = re.search(r"/c/[^/]+/\+/(\d+)", gerrit_change_url)
@@ -559,7 +541,6 @@ def close_pr_with_status(
         error_type = type(exc).__name__
         error_details = str(exc)
 
-        # Check for common error patterns
         if "401" in error_details or "403" in error_details:
             log.exception(
                 "Authentication/authorization error while closing PR #%d: "
@@ -580,7 +561,6 @@ def close_pr_with_status(
                 error_details,
             )
         else:
-            # Log with full traceback for unexpected errors
             log.exception(
                 "Unexpected error (%s) while closing PR #%d: %s",
                 error_type,
@@ -623,11 +603,14 @@ def close_github_pr_for_merged_gerrit_change(
     """
     log.info("Processing Gerrit change: %s", commit_sha[:8])
 
-    # Check Gerrit change status
     gerrit_status: Literal["MERGED", "ABANDONED", "NEW", "UNKNOWN"] = "UNKNOWN"
     if gerrit_change_url:
         gerrit_status = check_gerrit_change_status(gerrit_change_url)
 
+        # Branches vary in log level and nested close_merged_prs
+        # handling, so a dispatch table would obscure this status
+        # logging.
+        # aislop-ignore-next-line python-repetitive-dispatch
         if gerrit_status == "ABANDONED":
             if close_merged_prs:
                 log.info(
@@ -651,7 +634,6 @@ def close_github_pr_for_merged_gerrit_change(
         elif gerrit_status == "MERGED":
             log.debug("Gerrit change confirmed as MERGED")
 
-    # Extract PR URL from commit
     pr_url = extract_pr_url_from_commit(commit_sha)
     if not pr_url:
         log.info(
@@ -909,7 +891,6 @@ def cleanup_abandoned_prs_single(
     safe_console_print("⛔️ Checking for abandoned Gerrit changes")
     log.debug("Checking Gerrit change: %s", gerrit_change_url)
 
-    # Check Gerrit change status
     status = check_gerrit_change_status(gerrit_change_url)
 
     if status != "ABANDONED":
@@ -921,7 +902,6 @@ def cleanup_abandoned_prs_single(
 
     log.info("Gerrit change is ABANDONED, looking for GitHub PR to close")
 
-    # Extract PR URL from Gerrit change
     pr_url = extract_pr_url_from_gerrit_change(gerrit_change_url)
     if not pr_url:
         log.info(
@@ -979,11 +959,9 @@ def cleanup_abandoned_prs_bulk(
     )
 
     try:
-        # Build GitHub client and get repository
         client = build_client()
         repo_obj = client.get_repo(f"{owner}/{repo}")
 
-        # Get all open PRs
         open_prs = list(iter_open_pulls(repo_obj))
         if not open_prs:
             log.debug("No open pull requests found in %s/%s", owner, repo)
@@ -993,13 +971,11 @@ def cleanup_abandoned_prs_bulk(
 
         closed_count = 0
 
-        # Process each open PR
         for pr in open_prs:
             pr_number = pr.number
             log.debug("Checking PR #%d for Gerrit change status", pr_number)
 
             try:
-                # Get the PR's issue to access comments
                 issue = pr.as_issue()
                 comments = list(issue.get_comments())
 
@@ -1035,7 +1011,6 @@ def cleanup_abandoned_prs_bulk(
                         pr_number,
                     )
 
-                    # Build PR URL from PR object
                     pr_url = (
                         f"https://github.com/{owner}/{repo}/pull/{pr_number}"
                     )
@@ -1058,7 +1033,6 @@ def cleanup_abandoned_prs_bulk(
                     )
 
             except Exception as exc:
-                # Log but don't fail - continue processing other PRs
                 log.warning(
                     "Error processing PR #%d: %s - skipping",
                     pr_number,
@@ -1110,10 +1084,8 @@ def abandon_gerrit_change_for_closed_pr(
     )
 
     try:
-        # Build Gerrit REST client
         gerrit_client = build_client_for_host(gerrit_server)
 
-        # Build expected PR URL to search for in Gerrit changes
         pr_url = f"https://github.com/{repository}/pull/{pr_number}"
 
         # Query for open changes with this PR URL in the commit message
@@ -1149,7 +1121,6 @@ def abandon_gerrit_change_for_closed_pr(
                 if not commit_message:
                     continue
 
-                # Parse trailers to find GitHub-PR
                 trailers = parse_trailers(commit_message)
                 pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
 
@@ -1187,13 +1158,11 @@ def abandon_gerrit_change_for_closed_pr(
             pr_number,
         )
 
-        # Get PR closure information from GitHub
         try:
             client = build_client()
             repo_obj = client.get_repo(repository)
             pr_obj = get_pull(repo_obj, pr_number)
 
-            # Get closure comments
             closure_comments = []
             try:
                 issue = pr_obj.as_issue()
@@ -1221,7 +1190,6 @@ def abandon_gerrit_change_for_closed_pr(
             except Exception as exc:
                 log.debug("Error getting PR comments: %s", exc)
 
-            # Build abandon message
             abandon_message_lines = [
                 f"GitHub pull request #{pr_number} was closed",
                 "",
@@ -1386,7 +1354,6 @@ def cleanup_closed_github_prs(
     )
 
     try:
-        # Build Gerrit REST client
         from .gerrit_rest import build_client_for_host
 
         gerrit_client = build_client_for_host(gerrit_server)
@@ -1408,7 +1375,6 @@ def cleanup_closed_github_prs(
 
         abandoned_count = 0
 
-        # Process each open Gerrit change
         for change_data in changes_data:
             try:
                 change_number = change_data.get("_number", "")
@@ -1418,7 +1384,6 @@ def cleanup_closed_github_prs(
                     "Checking Gerrit change %s (%s)", change_number, subject
                 )
 
-                # Extract commit message to find GitHub PR URL
                 current_revision = change_data.get("current_revision", "")
                 if not current_revision:
                     log.debug(
@@ -1439,7 +1404,6 @@ def cleanup_closed_github_prs(
                     )
                     continue
 
-                # Extract GitHub PR URL from commit trailers
                 trailers = parse_trailers(commit_message)
                 pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
 
@@ -1457,7 +1421,6 @@ def cleanup_closed_github_prs(
                     pr_url,
                 )
 
-                # Parse PR URL to get owner, repo, and PR number
                 parsed = parse_pr_url(pr_url)
                 if not parsed:
                     log.debug(
@@ -1469,7 +1432,6 @@ def cleanup_closed_github_prs(
 
                 owner, repo, pr_number = parsed
 
-                # Check GitHub PR status
                 try:
                     client = build_client()
                     repo_obj = client.get_repo(f"{owner}/{repo}")
@@ -1582,7 +1544,6 @@ def _build_gerrit_abandon_message(pr_obj: Any, pr_url: str) -> str:
     """
     pr_number = pr_obj.number
 
-    # Check for Dependabot supersession
     try:
         issue = pr_obj.as_issue()
         comments = list(issue.get_comments())
@@ -1590,7 +1551,6 @@ def _build_gerrit_abandon_message(pr_obj: Any, pr_url: str) -> str:
         for comment in comments:
             body = getattr(comment, "body", "") or ""
             if "Superseded by" in body:
-                # Extract superseding PR number
                 match = re.search(r"Superseded by #(\d+)", body)
                 if match:
                     new_pr_number = match.group(1)
@@ -1867,7 +1827,6 @@ def abandon_superseded_dependency_changes(
             if not candidate_pkg or candidate_pkg != current_pkg:
                 continue
 
-            # Parse change number for URL construction
             try:
                 candidate_num = int(change.number)
             except (TypeError, ValueError):

@@ -112,14 +112,12 @@ def normalize_subject(subject: str) -> str:
         Normalized subject string.
     """
     s = (subject or "").strip()
-    # Remove conventional commit prefixes
     s = re.sub(
         r"^(feat|fix|docs|style|refactor|test|chore|ci|build|perf)(\(.+?\))?:\s*",
         "",
         s,
         flags=re.IGNORECASE,
     )
-    # Remove lightweight markdown punctuation
     s = re.sub(r"[*_`]", "", s)
     # Normalize versions and commit hashes
     s = re.sub(r"\bv\d+(\.\d+)*(-[\w.]+)?\b", "vx.y.z", s)
@@ -151,7 +149,6 @@ def normalize_body(body: str | None) -> str:
     if not body:
         return ""
     b = body.lower()
-    # Remove URLs
     b = re.sub(r"https?://\S+", "", b)
     # Normalize versions and commit hashes and dates
     b = re.sub(
@@ -374,7 +371,6 @@ def score_files(
 
     def _nf(p: str) -> str:
         q = (p or "").strip().lower()
-        # Remove embedded version-like fragments
         q = re.sub(r"v?\d+\.\d+\.\d+(?:\.\d+)?(?:-[\w.-]+)?", "", q)
         q = re.sub(r"\s+", " ", q).strip()
         return q

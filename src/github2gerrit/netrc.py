@@ -36,6 +36,14 @@ _TOKEN_PASSWORD = "password"  # noqa: S105
 _TOKEN_DEFAULT = "default"  # noqa: S105
 _TOKEN_MACDEF = "macdef"  # noqa: S105
 
+_QUOTED_STRING_ESCAPES = {
+    '"': '"',
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "\\": "\\",
+}
+
 
 def _normalize_host_for_netrc_lookup(host: str) -> str:
     """Normalize a host string for .netrc lookup.
@@ -61,10 +69,8 @@ def _normalize_host_for_netrc_lookup(host: str) -> str:
     # Remove scheme (http://, https://, etc.)
     if "://" in normalized:
         normalized = normalized.split("://", 1)[1]
-    # Remove path components
     if "/" in normalized:
         normalized = normalized.split("/", 1)[0]
-    # Remove port number
     if ":" in normalized:
         normalized = normalized.rsplit(":", 1)[0]
     return normalized
@@ -174,27 +180,16 @@ class NetrcParser:
         Returns:
             Unescaped string content without quotes.
         """
-        # Remove surrounding quotes
         inner = s[1:-1]
-        # Process escape sequences
         result: list[str] = []
         i = 0
         while i < len(inner):
             if inner[i] == "\\" and i + 1 < len(inner):
                 next_char = inner[i + 1]
-                if next_char == '"':
-                    result.append('"')
-                elif next_char == "n":
-                    result.append("\n")
-                elif next_char == "r":
-                    result.append("\r")
-                elif next_char == "t":
-                    result.append("\t")
-                elif next_char == "\\":
-                    result.append("\\")
-                else:
-                    # Unknown escape, keep as-is
-                    result.append(inner[i : i + 2])
+                # Unknown escapes are kept as-is
+                result.append(
+                    _QUOTED_STRING_ESCAPES.get(next_char, inner[i : i + 2])
+                )
                 i += 2
             else:
                 result.append(inner[i])
@@ -228,7 +223,6 @@ class NetrcParser:
             List of tokens, including "\n" tokens for line boundaries.
         """
         tokens: list[str] = []
-        # Process line by line to preserve newline information
         lines: list[str] = []
         for raw_line in content.splitlines():
             # Strip leading whitespace to check for comment
@@ -237,7 +231,6 @@ class NetrcParser:
                 # Preserve blank line marker for macdef parsing
                 lines.append("")
                 continue
-            # Handle inline comments
             processed_line = self._strip_inline_comment(raw_line)
             lines.append(processed_line)
 
@@ -252,7 +245,6 @@ class NetrcParser:
             placeholder_idx += 1
             return placeholder
 
-        # Process each line, preserving newline tokens
         for line in lines:
             # Replace quoted strings with placeholders
             processed_line = self._QUOTED_STRING_PATTERN.sub(
@@ -269,7 +261,6 @@ class NetrcParser:
                         self._unescape_quoted_string(placeholders[raw_token])
                     )
                 elif "\x00QUOTED" in raw_token:
-                    # Handle case where placeholder is part of larger token
                     processed_token = raw_token
                     for placeholder, quoted in placeholders.items():
                         if placeholder in processed_token:

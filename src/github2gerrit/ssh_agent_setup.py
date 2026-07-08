@@ -95,10 +95,8 @@ class SSHAgentManager:
             # Locate ssh-agent executable
             ssh_agent_path = _ensure_tool_available("ssh-agent")
 
-            # Start ssh-agent and capture its output
             result = run_cmd([ssh_agent_path, "-s"], timeout=10)
 
-            # Parse the ssh-agent output to get environment variables
             for line in result.stdout.strip().split("\n"):
                 if line.startswith("SSH_AUTH_SOCK="):
                     # Format: SSH_AUTH_SOCK=/path/to/socket; export
@@ -503,7 +501,6 @@ def setup_ssh_agent_auth(
         )
         if manager.use_existing_agent():
             log.debug("Using existing SSH agent successfully")
-            # Setup known hosts for existing agent
             manager.setup_known_hosts(known_hosts_content)
 
             # Verify existing agent has keys using "ssh-add -l"
@@ -536,14 +533,12 @@ def setup_ssh_agent_auth(
             )
             _raise_no_agent_error()
 
-        # Start new SSH agent and add the private key
         log.debug("Starting new SSH agent with provided private key")
         manager.start_agent()
 
         # Add the private key
         manager.add_key(private_key_content)
 
-        # Setup known hosts
         manager.setup_known_hosts(known_hosts_content)
 
         # Verify key was added successfully using "ssh-add -l"
@@ -558,7 +553,6 @@ def setup_ssh_agent_auth(
         log.debug("Loaded keys: %s", keys_list)
 
     except Exception:
-        # Clean up on failure
         manager.cleanup()
         raise
     else:

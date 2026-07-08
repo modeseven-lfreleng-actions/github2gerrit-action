@@ -14,7 +14,12 @@ Key features:
 - Background-only logging for DEBUG/INFO when Rich is active
 - Seamless fallback to normal logging when Rich is not available
 - Thread-safe operation for concurrent logging
+
+This module is the console-output layer for logging: bare print()
+calls are the deliberate output path when Rich is not installed.
 """
+
+# aislop-ignore-file python-print-debug
 
 from __future__ import annotations
 
@@ -61,7 +66,6 @@ class RichAwareLogger:
         self._context_lock = threading.Lock()
 
         if RICH_AVAILABLE:
-            # Create a dedicated Rich console for logging
             self._rich_console = Console(stderr=True, markup=False)
 
     @classmethod
@@ -136,7 +140,6 @@ class RichAwareHandler(logging.Handler):
         super().__init__()
         self._rich_console = rich_console
 
-        # Set up formatting
         formatter = logging.Formatter("%(levelname)s: %(message)s")
         self.setFormatter(formatter)
 
@@ -159,7 +162,6 @@ class RichAwareHandler(logging.Handler):
                 style = "white"
                 prefix = "i"
 
-            # Print through Rich console
             self._rich_console.print(f"{prefix} {msg}", style=style)
 
         except Exception:
@@ -180,7 +182,6 @@ class VerboseAwareHandler(logging.Handler):
         super().__init__()
         self._rich_console = rich_console
 
-        # Set up formatting for debug messages
         formatter = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
         self.setFormatter(formatter)
 
@@ -209,7 +210,6 @@ class VerboseAwareHandler(logging.Handler):
                         style = "dim white"
                         prefix = "🔍"
 
-                    # Print through Rich console
                     self._rich_console.print(f"{prefix} {msg}", style=style)
                 except Exception:
                     # Fallback to handleError if Rich printing fails

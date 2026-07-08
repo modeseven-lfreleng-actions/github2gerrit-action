@@ -200,10 +200,6 @@ module = ["typer", "typer.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["importlib_metadata"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = ["pytest", "pytest.*"]
 ignore_missing_imports = true
 

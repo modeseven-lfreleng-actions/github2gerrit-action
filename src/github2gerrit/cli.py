@@ -88,15 +88,10 @@ from .utils import parse_bool_env
 
 
 def get_version(package: str) -> str:
-    """Get package version, trying importlib.metadata first, then fallback."""
-    try:
-        from importlib.metadata import version as stdlib_version
+    """Get the installed package version via importlib.metadata."""
+    from importlib.metadata import version
 
-        return str(stdlib_version(package))
-    except ImportError:
-        from importlib_metadata import version as backport_version
-
-        return str(backport_version(package))
+    return str(version(package))
 
 
 # Legacy error handling functions - now use centralized error_codes module
@@ -184,7 +179,6 @@ def _check_automation_only(
         "pre-commit-ci",
     ]
 
-    # Get PR author
     pr_author = getattr(getattr(pr_obj, "user", None), "login", "")
     if not pr_author:
         log.warning("Unable to determine PR author, allowing PR to proceed")
@@ -262,10 +256,8 @@ def _extract_and_display_pr_info(
         # Check if automation_only is enabled and reject non-automation PRs
         _check_automation_only(pr_obj, gh, progress_tracker)
 
-        # Extract PR information
         title, _body = get_pr_title_body(pr_obj)
 
-        # Get additional PR details
         pr_info = {
             "Repository": gh.repository,
             "PR Number": gh.pr_number,
@@ -364,7 +356,6 @@ def _parse_github_target(url: str) -> GitHubPRTarget | GitHubRepoTarget:
 
     owner, repo = parts[0], parts[1]
 
-    # Check for PR URL
     if len(parts) >= 4 and parts[2] in ("pull", "pulls"):
         try:
             pr_number = int(parts[3])
@@ -377,7 +368,6 @@ def _parse_github_target(url: str) -> GitHubPRTarget | GitHubRepoTarget:
 
 
 APP_NAME = "github2gerrit"
-
 
 if TYPE_CHECKING:
     BaseGroup = object
@@ -429,10 +419,8 @@ def _resolve_issue_id_from_json(json_str: str, github_actor: str) -> str:
         return ""
 
     try:
-        # Parse JSON
         lookup_data = json.loads(json_str)
 
-        # Validate it's an array
         if not isinstance(lookup_data, list):
             log.warning(
                 "⚠️ Warning: Issue-ID JSON was not valid (expected array)"
@@ -484,8 +472,11 @@ def _print_version_banner() -> None:
     try:
         app_version = get_version("github2gerrit")
         print(f"🏷️  github2gerrit version {app_version}")
-    except Exception:
-        print("⚠️  github2gerrit version information not available")
+    # The banner is cosmetic: a missing or unreadable package version
+    # must never block CLI startup.
+    # aislop-ignore-next-line swallowed-exception
+    except Exception as exc:
+        print(f"⚠️  github2gerrit version information not available: {exc}")
 
 
 # Show version information when --help is used or in GitHub Actions mode
@@ -531,7 +522,6 @@ def _save_derived_parameters_after_success(data: Inputs) -> None:
     """Save derived parameters to config file after successful Gerrit
     submission."""
     try:
-        # Get the organization used for derivation
         org_for_cfg = (
             data.organization
             or os.getenv("ORGANIZATION")
@@ -756,8 +746,6 @@ def main(
         envvar="G2G_SHOW_PROGRESS",
         help="Show real-time progress updates with Rich formatting.",
     ),
-    # BREAKING CHANGE v0.2.0: Default changed from True to False
-    # for more flexible commit reconciliation
     similarity_files: bool = typer.Option(
         False,
         "--similarity-files/--no-similarity-files",
@@ -852,7 +840,6 @@ def main(
     - No arguments: environment variables determine behaviour (CI/CD mode)
     """
 
-    # Handle version flag first
     if version_flag:
         try:
             app_version = get_version("github2gerrit")
@@ -931,7 +918,6 @@ def main(
 
     # Handle netrc credential loading if enabled
     if not no_netrc:
-        # Get the Gerrit server from environment or CLI
         gerrit_host = gerrit_server or os.getenv("GERRIT_SERVER", "")
         if gerrit_host:
             try:
@@ -963,21 +949,18 @@ def main(
                 safe_typer_echo(f"❌ Failed to parse .netrc file: {e}")
                 sys.exit(int(ExitCode.CONFIGURATION_ERROR))
 
-    # Set up logging level based on verbose flag
     if verbose:
         os.environ["G2G_LOG_LEVEL"] = "DEBUG"
         _reconfigure_logging()
 
-    # Initialize Rich-aware logging system
     setup_rich_aware_logging()
 
-    # Log version to logs in GitHub Actions environment
     if _is_github_actions_context():
         try:
             app_version = get_version("github2gerrit")
             log.debug("github2gerrit version %s", app_version)
-        except Exception:
-            log.warning("Version information not available")
+        except Exception as exc:
+            log.warning("Version information not available: %s", exc)
 
     # Show initial progress if Rich is available and progress is enabled
     if show_progress and not RICH_AVAILABLE:
@@ -1041,7 +1024,6 @@ def main(
     if reuse_strategy:
         os.environ["REUSE_STRATEGY"] = reuse_strategy
 
-    # Validate similarity parameters
     if not (0.0 <= similarity_subject <= 1.0):
         msg = (
             f"similarity_subject must be between 0.0 and 1.0, "
@@ -1231,7 +1213,6 @@ def _build_inputs_from_env() -> Inputs:
 
 
 def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
-    # Initialize progress tracker for processing
     show_progress = env_bool("G2G_SHOW_PROGRESS", True)
     target = gh.repository
 
@@ -1303,7 +1284,6 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
             gh.event_action,
         )
 
-        # Update progress tracker for this PR
         progress_tracker.update_operation(f"Processing PR #{pr_number}...")
         progress_tracker.pr_processed()
 
@@ -1391,7 +1371,6 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
         )
         pr_tasks.append((pr, per_ctx))
 
-    # Process PRs in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         log.debug(
             "Processing %d PRs with %d parallel workers",
@@ -1495,7 +1474,6 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
         }
     )
 
-    # Stop progress tracker and show final results
     if failed_count == 0:
         progress_tracker.update_operation("Processing completed ✅")
     else:
@@ -1544,7 +1522,6 @@ def _process_single(
     gh: GitHubContext,
     progress_tracker: G2GProgressTracker | DummyProgressTracker | None = None,
 ) -> tuple[bool, SubmissionResult]:
-    # Create temporary directory for all git operations
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
 
@@ -1770,7 +1747,6 @@ def _process_single(
 
 
 def _load_effective_inputs() -> Inputs:
-    # Build inputs from environment (used by URL callback path)
     data = _build_inputs_from_env()
 
     # Detect GitHub CI mode and configure accordingly
@@ -1789,7 +1765,6 @@ def _load_effective_inputs() -> Inputs:
     )
     cfg = load_org_config(org_for_cfg)
 
-    # Get repository for GERRIT_PROJECT derivation
     repository = os.getenv("GITHUB_REPOSITORY", "")
 
     # Apply dynamic parameter derivation for missing Gerrit parameters
@@ -1939,7 +1914,6 @@ def _process_close_gerrit_change(
     # Check if close_merged_prs is enabled
     close_merged_prs = env_bool("CLOSE_MERGED_PRS", True)
 
-    # Check Gerrit change status
     status = check_gerrit_change_status(gerrit_change_url)
 
     # Validate status: without --force, reject MERGED/ABANDONED changes
@@ -1956,7 +1930,9 @@ def _process_close_gerrit_change(
             error_msg,
         )
 
-    # Log status information
+    # Branches vary in log level and nested close_merged_prs handling,
+    # so a dispatch table would obscure this status logging.
+    # aislop-ignore-next-line python-repetitive-dispatch
     if status == "ABANDONED":
         if close_merged_prs:
             log.debug(
@@ -1983,7 +1959,6 @@ def _process_close_gerrit_change(
 
     log.debug("Found GitHub PR URL: %s", pr_url)
 
-    # Parse PR URL to get owner info for auto-discovery
     parsed = parse_pr_url(pr_url)
     if not parsed:
         log.error("Failed to parse PR URL: %s", pr_url)
@@ -2007,6 +1982,9 @@ def _process_close_gerrit_change(
             progress_tracker=None,
             close_merged_prs=close_merged_prs,
         )
+    # log.exception records the caught error and traceback; keep
+    # processing so one PR failure cannot abort the remaining closures.
+    # aislop-ignore-next-line silent-recovery
     except Exception:
         log.exception("Failed to close GitHub PR #%d", pr_number)
 
@@ -2028,7 +2006,6 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
     """
     log.info("🔄 Processing merged Gerrit changes to close GitHub PRs")
 
-    # Initialize progress tracker
     show_progress = env_bool("G2G_SHOW_PROGRESS", True)
     target = gh.repository
 
@@ -2054,7 +2031,6 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
                 with gh.event_path.open() as f:
                     event_payload = json.load(f)
 
-                # Extract commit SHAs from the push event
                 if "commits" in event_payload:
                     commit_shas = [
                         commit["id"]
@@ -2141,7 +2117,6 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
 def _process() -> None:
     data = _load_effective_inputs()
 
-    # Validate inputs
     try:
         _validate_inputs(data)
     except ConfigurationError as exc:
@@ -2151,11 +2126,11 @@ def _process() -> None:
 
     gh = _read_github_context()
 
-    # --- G2G_NO_GERRIT: leverage DRY_RUN infrastructure ---
-    # G2G_NO_GERRIT reuses the existing DRY_RUN + G2G_DRYRUN_DISABLE_NETWORK
-    # code paths so that all tool logic runs but Gerrit network operations
-    # are no-ops.  Cleanup tasks (abandoned-PR / Gerrit-change sweeps) are
-    # also suppressed because they would hit a non-existent server.
+    # G2G_NO_GERRIT reuses the existing DRY_RUN +
+    # G2G_DRYRUN_DISABLE_NETWORK code paths so that all tool logic runs
+    # but Gerrit network operations are no-ops. Cleanup tasks
+    # (abandoned-PR / Gerrit-change sweeps) are also suppressed because
+    # they would hit a non-existent server.
     no_gerrit = env_bool("G2G_NO_GERRIT", False)
 
     if no_gerrit:
@@ -2336,7 +2311,6 @@ def _process() -> None:
     # 2. Direct Gerrit change URL provided in CLI
     # 3. Gerrit event dispatched via workflow_dispatch (GERRIT_CHANGE_URL set)
 
-    # Check for Gerrit event inputs from workflow_dispatch
     gerrit_event_change_url = os.getenv("GERRIT_CHANGE_URL")
     gerrit_event_type = os.getenv("GERRIT_EVENT_TYPE")
 
@@ -2469,7 +2443,6 @@ def _process() -> None:
     ):
         bulk_success = _process_bulk(data, gh)
 
-        # Log external API metrics summary
         try:
             log_api_metrics_summary()
         except Exception as exc:
@@ -2702,7 +2675,6 @@ def _process() -> None:
             # Don't fail the whole pipeline if cleanup fails
             log.warning("Gerrit cleanup failed: %s", exc)
 
-    # Log external API metrics summary
     try:
         log_api_metrics_summary()
     except Exception as exc:
@@ -2911,7 +2883,6 @@ def _validate_inputs(data: Inputs) -> None:
                 _MSG_MISSING_REQUIRED_INPUT.format(field_name=field_name)
             )
 
-    # Validate fetch depth is a positive integer
     if data.fetch_depth <= 0:
         log.error("Invalid FETCH_DEPTH: %s", data.fetch_depth)
         raise ConfigurationError(_MSG_INVALID_FETCH_DEPTH)

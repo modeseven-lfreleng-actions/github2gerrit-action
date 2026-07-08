@@ -243,7 +243,6 @@ class ReconciliationMatcher:
         """Pass A: Match commits that already have Change-ID trailers."""
         remaining = []
 
-        # Build lookup map for Gerrit changes
         gerrit_by_id = {change.change_id: change for change in gerrit_changes}
 
         for commit in commits:
@@ -291,7 +290,6 @@ class ReconciliationMatcher:
         """Pass B: Match by exact normalized subject."""
         remaining = []
 
-        # Build lookup map by normalized subject
         gerrit_by_subject: dict[str, list[GerritChange]] = {}
         for change in gerrit_changes:
             if change.change_id in used_changes:
@@ -351,7 +349,6 @@ class ReconciliationMatcher:
         """Pass C: Match by file signature (same set of files)."""
         remaining = []
 
-        # Build lookup map by file signature
         gerrit_by_files: dict[str, list[GerritChange]] = {}
         for change in gerrit_changes:
             if change.change_id in used_changes:
@@ -392,7 +389,6 @@ class ReconciliationMatcher:
                 strategy_counts.get(MatchStrategy.FILE_SIGNATURE, 0) + 1
             )
 
-            # Remove from candidates
             candidates.remove(gerrit_change)
             if not candidates:
                 del gerrit_by_files[file_sig]
@@ -417,7 +413,6 @@ class ReconciliationMatcher:
         """Pass D: Match by subject token similarity (Jaccard)."""
         remaining = []
 
-        # Get available Gerrit changes
         available_changes = [
             change
             for change in gerrit_changes
@@ -461,7 +456,6 @@ class ReconciliationMatcher:
                     strategy_counts.get(MatchStrategy.SUBJECT_SIMILARITY, 0) + 1
                 )
 
-                # Remove from available changes
                 available_changes.remove(gerrit_change)
 
                 log.debug(

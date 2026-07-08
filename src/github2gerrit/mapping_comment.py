@@ -40,7 +40,6 @@ class ChangeIdMapping:
         if not self.change_ids:
             raise ValueError(_MSG_NO_CHANGE_IDS)
 
-        # Validate Change-Id format
         for cid in self.change_ids:
             if not cid.startswith("I") or len(cid) < 8:
                 raise ValueError(_MSG_INVALID_CHANGE_ID_FORMAT)
@@ -120,7 +119,6 @@ def parse_mapping_comments(comment_bodies: list[str]) -> ChangeIdMapping | None:
             continue
 
         try:
-            # Extract the mapping block
             start_idx = body.find(start_marker)
             end_idx = body.find(end_marker)
 

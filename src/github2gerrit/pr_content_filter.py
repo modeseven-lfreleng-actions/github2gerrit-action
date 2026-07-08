@@ -136,15 +136,12 @@ class DependabotRule(FilterRule):
         log.info("Applying Dependabot filtering rules")
         filtered = body
 
-        # Step 1: Expand collapsed sections
         if config.expand_release_notes or config.expand_commits:
             filtered = self._expand_html_details(filtered)
 
-        # Step 2: Remove compatibility images
         if config.remove_compatibility_images:
             filtered = self._remove_compatibility_images(filtered)
 
-        # Step 3: Truncate at command instructions
         if config.truncate_at_commands:
             filtered = self._truncate_at_dependabot_commands(filtered)
 
@@ -229,7 +226,6 @@ class PRContentFilter:
         if not self.config.enabled or not body:
             return False
 
-        # Check author-specific rules first
         if author in self.config.author_rules:
             rule_name = self.config.author_rules[author]
             return any(
@@ -270,7 +266,6 @@ class PRContentFilter:
         """Apply global pre-processing rules."""
         processed = body
 
-        # Remove title duplication first, before other processing
         if self.config.deduplicate_title_in_body:
             processed = self._remove_title_duplication(title, processed)
 
@@ -280,17 +275,13 @@ class PRContentFilter:
         """Apply global post-processing rules."""
         processed = body
 
-        # Remove emoji codes
         if self.config.remove_emoji_codes:
             processed = self._remove_emoji_codes(processed)
 
-        # Clean HTML and markdown
         processed = self._clean_html_and_markdown(processed)
 
-        # Clean up whitespace
         processed = self._clean_whitespace(processed)
 
-        # Remove trailing ellipses
         processed = self._remove_trailing_ellipses(processed)
 
         return processed
@@ -301,12 +292,10 @@ class PRContentFilter:
         # e.g., "<h3>:sparkles: New features</h3>" -> "<h3>New features</h3>"
         content = re.sub(r"(<[^>]*>)\s*:[a-z_]+:\s*", r"\1", content)
 
-        # Remove emoji codes while preserving line structure
         lines = content.splitlines()
         cleaned_lines = []
 
         for line in lines:
-            # Remove emoji codes from each line
             cleaned_line = _EMOJI_PATTERN.sub("", line)
             # Clean up multiple spaces that might result from emoji removal
             cleaned_line = re.sub(r"  +", " ", cleaned_line)
@@ -404,7 +393,6 @@ class PRContentFilter:
         if first_content_line_idx is None:
             return body  # No content found
 
-        # Clean both title and first content line for comparison
         title_clean = self._clean_for_comparison(title)
         first_line_clean = self._clean_for_comparison(first_content_line)
 
@@ -429,9 +417,7 @@ class PRContentFilter:
 
     def _clean_for_comparison(self, text: str) -> str:
         """Clean text for comparison by removing markdown and punctuation."""
-        # Remove markdown links
         cleaned = _MARKDOWN_LINK_PATTERN.sub(r"\1", text)
-        # Remove trailing periods and normalize spacing
         cleaned = cleaned.strip().rstrip(".")
         return cleaned
 
@@ -452,12 +438,10 @@ class PRContentFilter:
         cleaned_lines = []
 
         for line in lines:
-            # Remove lines that are just "..." or whitespace + "..."
             stripped = line.strip()
             if stripped == "..." or stripped == "…":
                 continue
 
-            # Remove trailing ellipses from lines
             cleaned_line = re.sub(r"\s*\.{3,}\s*$", "", line)
             cleaned_line = re.sub(r"\s*…\s*$", "", cleaned_line)
             cleaned_lines.append(cleaned_line)
@@ -478,7 +462,6 @@ def create_default_filter() -> PRContentFilter:
     """Create a filter with default configuration."""
     config = FilterConfig()
 
-    # Set up default author mappings
     config.author_rules.update(
         {
             "dependabot[bot]": "dependabot",

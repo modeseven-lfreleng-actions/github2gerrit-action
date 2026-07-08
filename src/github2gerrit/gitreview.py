@@ -42,30 +42,12 @@ from typing import Final
 
 log = logging.getLogger(__name__)
 
-# ───────────────────────────────────────────────────────────────────────
-# Constants
-# ───────────────────────────────────────────────────────────────────────
-
 DEFAULT_GERRIT_PORT: int = 29418
 """Default Gerrit SSH port when the ``port=`` line is absent."""
-
-# ───────────────────────────────────────────────────────────────────────
-# Precompiled regex patterns for INI-style .gitreview files
-#
-# These patterns:
-#   • are multiline (``(?m)``)
-#   • are case-insensitive on the key name (``(?i)``)
-#   • tolerate optional horizontal whitespace around ``=``
-#   • strip trailing whitespace / ``\r`` so Windows line endings are handled
-# ───────────────────────────────────────────────────────────────────────
 
 _HOST_RE = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+?)[ \t\r]*$")
 _PORT_RE = re.compile(r"(?mi)^port[ \t]*=[ \t]*(\d+)[ \t\r]*$")
 _PROJECT_RE = re.compile(r"(?mi)^project[ \t]*=[ \t]*(.+?)[ \t\r]*$")
-
-# ───────────────────────────────────────────────────────────────────────
-# Data model
-# ───────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -121,10 +103,6 @@ the addition of the optional ``base_path`` field (default ``None``).
 """
 
 
-# ───────────────────────────────────────────────────────────────────────
-# Well-known Gerrit base paths
-# ───────────────────────────────────────────────────────────────────────
-
 _KNOWN_BASE_PATHS: dict[str, str] = {
     "gerrit.linuxfoundation.org": "infra",
 }
@@ -149,11 +127,6 @@ def derive_base_path(host: str) -> str | None:
         not in the known-hosts table.
     """
     return _KNOWN_BASE_PATHS.get(host.lower().strip())
-
-
-# ───────────────────────────────────────────────────────────────────────
-# Pure parser
-# ───────────────────────────────────────────────────────────────────────
 
 
 def parse_gitreview(text: str) -> GitReviewInfo | None:
@@ -212,11 +185,6 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
     return info
 
 
-# ───────────────────────────────────────────────────────────────────────
-# Local file reader
-# ───────────────────────────────────────────────────────────────────────
-
-
 def read_local_gitreview(path: Path | None = None) -> GitReviewInfo | None:
     """Read and parse a local ``.gitreview`` file.
 
@@ -245,11 +213,6 @@ def read_local_gitreview(path: Path | None = None) -> GitReviewInfo | None:
     else:
         log.debug("Local .gitreview at %s missing required fields", target)
     return info
-
-
-# ───────────────────────────────────────────────────────────────────────
-# Remote fetch: raw.githubusercontent.com  (stdlib only)
-# ───────────────────────────────────────────────────────────────────────
 
 
 def _build_branch_list(
@@ -374,11 +337,6 @@ def fetch_gitreview_raw(
     return None
 
 
-# ───────────────────────────────────────────────────────────────────────
-# Remote fetch: GitHub API  (requires PyGithub — lazy import)
-# ───────────────────────────────────────────────────────────────────────
-
-
 def fetch_gitreview_github_api(
     repo_obj: Any,
     *,
@@ -418,11 +376,6 @@ def fetch_gitreview_github_api(
     elif info is None:
         log.debug("GitHub API: .gitreview not available or missing fields")
     return info
-
-
-# ───────────────────────────────────────────────────────────────────────
-# Unified fetch: tries all strategies in priority order
-# ───────────────────────────────────────────────────────────────────────
 
 
 def fetch_gitreview(
@@ -501,11 +454,6 @@ def fetch_gitreview(
     return None
 
 
-# ───────────────────────────────────────────────────────────────────────
-# Convenience: host-only accessor (replaces config._read_gitreview_host)
-# ───────────────────────────────────────────────────────────────────────
-
-
 def read_gitreview_host(
     repository: str | None = None,
     *,
@@ -534,10 +482,6 @@ def read_gitreview_host(
     )
     return info.host if info else None
 
-
-# ───────────────────────────────────────────────────────────────────────
-# Factory: build GitReviewInfo from explicit parameters
-# ───────────────────────────────────────────────────────────────────────
 
 _BASE_PATH_UNSET: Final[object] = object()
 """Sentinel value for :func:`make_gitreview_info` to distinguish
