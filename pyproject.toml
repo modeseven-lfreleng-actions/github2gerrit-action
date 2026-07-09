@@ -216,6 +216,12 @@ disallow_untyped_calls = false
 
 [tool.coverage.run]
 branch = true
+# Keep transient coverage data out of the working tree so tests that
+# inspect on-disk repository content never see .coverage* files.
+# During pytest runs tests/conftest.py sets COVERAGE_FILE (env), which
+# takes precedence; this value covers direct coverage invocations and
+# satisfies python-test-action's data_file configuration check.
+data_file = "${TMPDIR-/tmp}/.coverage.github2gerrit"
 source = ["github2gerrit"]
 omit = [
   "tests/*",
