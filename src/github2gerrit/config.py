@@ -304,8 +304,8 @@ def _load_ini(path: Path) -> configparser.RawConfigParser:
 
         preprocessed = "\n".join(out_lines) + ("\n" if out_lines else "")
         cp.read_string(preprocessed)
-    except FileNotFoundError:
-        log.debug("Config file not found: %s", path)
+    except FileNotFoundError as exc:
+        log.debug("Config file not found: %s (%s)", path, exc)
     except Exception as exc:
         log.warning("Failed to read config file %s: %s", path, exc)
     return cp
@@ -600,7 +600,6 @@ def apply_parameter_derivation(
     if not organization:
         return cfg
 
-    # Check execution context to determine derivation strategy
     is_github_actions = _is_github_actions_context()
     enable_derivation = os.getenv(
         "G2G_ENABLE_DERIVATION", "true"
@@ -711,7 +710,6 @@ def save_derived_parameters_to_config(
             )
             return
 
-        # Parse existing content using configparser
         cp = _load_ini(config_file)
 
         # Find or create the organization section
@@ -730,7 +728,6 @@ def save_derived_parameters_to_config(
 
         # Only write if we added parameters
         if params_added:
-            # Write the updated configuration
             with config_file.open("w", encoding="utf-8") as f:
                 cp.write(f)
 

@@ -13,7 +13,6 @@ import re
 
 log = logging.getLogger(__name__)
 
-
 # Trailer key constants
 GITHUB_PR_TRAILER = "GitHub-PR"
 GITHUB_HASH_TRAILER = "GitHub-Hash"
@@ -56,7 +55,6 @@ def parse_trailers(commit_message: str) -> dict[str, list[str]]:
             trailer_start = i + 1
             break
 
-    # Parse trailer lines
     for raw_line in lines[trailer_start:]:
         line = raw_line.strip()
         if ":" in line:
@@ -182,13 +180,10 @@ def normalize_subject_for_matching(subject: str) -> str:
     if not subject:
         return ""
 
-    # Remove common prefixes and suffixes
     normalized = subject.strip()
 
-    # Remove version numbers and tags in brackets/parentheses
     normalized = re.sub(r"\s*[\[\(][vV]?\d+[\.\d]*[\]\)]\s*", " ", normalized)
 
-    # Remove "WIP:", "DRAFT:", etc. prefixes
     normalized = re.sub(
         r"^\s*(WIP|DRAFT|TODO|FIXME|HACK):\s*",
         "",
@@ -196,7 +191,6 @@ def normalize_subject_for_matching(subject: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Remove trailing punctuation and whitespace
     normalized = re.sub(r"[.!]+\s*$", "", normalized)
 
     # Normalize whitespace
@@ -235,7 +229,6 @@ def compute_file_signature(file_paths: list[str]) -> str:
     # Sort for deterministic ordering
     normalized_paths.sort()
 
-    # Create hash of the sorted, normalized path list
     content = "\n".join(normalized_paths)
     hash_obj = hashlib.sha256(content.encode("utf-8"))
     return hash_obj.hexdigest()[:12]  # 12 hex chars = 48 bits

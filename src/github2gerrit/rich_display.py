@@ -6,7 +6,12 @@ Rich display utilities for enhanced CLI output.
 
 Provides formatted output for PR information, progress tracking, and
 operation status using Rich formatting library.
+
+This module is the console-display layer for the CLI: bare print()
+calls are the deliberate output path when Rich is not installed.
 """
+
+# aislop-ignore-file python-print-debug
 
 from __future__ import annotations
 
@@ -172,7 +177,6 @@ def display_pr_info(
     # Use Rich display context to manage logging interference
     display_context_id = f"pr_info_display_{id(pr_info)}"
 
-    # Build display title with context
     if context:
         display_title = f"{context} Pull Request Details"
     elif title:
@@ -249,7 +253,6 @@ class ProgressTracker:
 
     def start(self) -> None:
         """Start the progress display with in-place updates."""
-        # Start Rich display context to manage logging interference
         if self.rich_available:
             context_id = f"progress_tracker_{id(self)}"
             self._rich_context = RichDisplayContext(context_id)
@@ -265,7 +268,6 @@ class ProgressTracker:
 
     def stop(self) -> None:
         """Stop the progress display."""
-        # Clean up Rich display context
         if self._rich_context:
             import contextlib
 

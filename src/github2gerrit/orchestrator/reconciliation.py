@@ -55,11 +55,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def perform_reconciliation(
     inputs: Inputs,
     gh: GitHubContext,
@@ -217,11 +212,6 @@ def perform_reconciliation(
         plan, log_json=getattr(inputs, "log_reconcile_json", False)
     )
     return plan.change_ids
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _query_and_validate_topic_changes(
@@ -400,11 +390,6 @@ def _emit_summary_json(
         "RECONCILE_SUMMARY json=%s",
         json.dumps(summary),
     )
-
-
-# ---------------------------------------------------------------------------
-# Minimal dataclass for future expansion (placeholder for Phase 2)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)

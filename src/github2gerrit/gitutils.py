@@ -362,11 +362,6 @@ def run_cmd_with_retries(
         return res
 
 
-# ----------------------------
-# Git helper functions
-# ----------------------------
-
-
 def git(
     args: Sequence[str],
     *,

@@ -156,7 +156,6 @@ class SSHConfig:
             keyword = parts[0].lower()
 
             if keyword == "host":
-                # Start new host entry
                 if current_entry:
                     entries.append(current_entry)
 
@@ -301,7 +300,6 @@ def get_ssh_user_for_gerrit(
     default_config_path = Path.home() / ".ssh" / "config"
     cache_key = str(default_config_path)
 
-    # Get or create cached SSH config instance
     if cache_key not in _ssh_config_cache:
         _ssh_config_cache[cache_key] = SSHConfig()
 
@@ -417,7 +415,6 @@ def get_git_user_email() -> str | None:
             log.debug("Git executable not found in PATH")
             return None
 
-        # Validate git executable path for security
         if not _validate_git_executable(git_path):
             log.debug("Git executable validation failed: %s", git_path)
             return None

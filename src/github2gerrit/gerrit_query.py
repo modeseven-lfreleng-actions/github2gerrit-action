@@ -54,18 +54,15 @@ class GerritChange:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GerritChange":
         """Create GerritChange from Gerrit REST API response."""
-        # Extract files from current revision
-        files = []
-        current_revision = data.get("current_revision", "")
-        if current_revision and "revisions" in data:
-            revision_data = data["revisions"].get(current_revision, {})
-            files = list(revision_data.get("files", {}).keys())
-
-        # Extract commit message
+        files: list[str] = []
         commit_message = ""
-        if current_revision and "revisions" in data:
-            revision_data = data["revisions"].get(current_revision, {})
-            commit_message = revision_data.get("commit", {}).get("message", "")
+        current_revision = data.get("current_revision", "")
+        if current_revision:
+            revisions = data.get("revisions") or {}
+            revision_data = revisions.get(current_revision) or {}
+            files = list((revision_data.get("files") or {}).keys())
+            commit_info = revision_data.get("commit") or {}
+            commit_message = commit_info.get("message", "")
 
         return cls(
             change_id=data.get("change_id", ""),
@@ -101,7 +98,6 @@ def query_changes_by_topic(
     if statuses is None:
         statuses = ["NEW"]
 
-    # Build query string
     status_query = " OR ".join(f"status:{status}" for status in statuses)
     query = f'topic:"{_gerrit_quote(topic)}" AND ({status_query})'
 
@@ -407,7 +403,6 @@ def extract_pr_metadata_from_commit_message(
             trailer_start = i + 1
             break
 
-    # Parse trailer lines
     for raw_line in lines[trailer_start:]:
         line = raw_line.strip()
         if ":" in line:
@@ -446,7 +441,6 @@ def validate_pr_metadata_match(
             change.commit_message
         )
 
-        # Check GitHub-PR URL match
         pr_url = metadata.get("GitHub-PR", "")
         if pr_url and pr_url != expected_pr_url:
             log.debug(
@@ -457,7 +451,6 @@ def validate_pr_metadata_match(
             )
             continue
 
-        # Check GitHub-Hash match
         github_hash = metadata.get("GitHub-Hash", "")
         if github_hash and github_hash != expected_github_hash:
             log.debug(

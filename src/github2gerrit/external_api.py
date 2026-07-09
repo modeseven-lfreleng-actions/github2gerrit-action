@@ -170,7 +170,6 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
 
     # GitHub API specific errors (if PyGithub is available)
     if api_type == ApiType.GITHUB:
-        # Import GitHub exception types to check isinstance
         try:
             from .github_api import GithubExceptionType
             from .github_api import RateLimitExceededExceptionType
@@ -178,7 +177,6 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
             GithubExceptionType = type(None)  # type: ignore[misc,assignment]
             RateLimitExceededExceptionType = type(None)  # type: ignore[misc,assignment]
 
-        # Check by class name or isinstance for mock/test exceptions
         exc_name = exc.__class__.__name__
         if exc_name in (
             "RateLimitExceededException",
@@ -191,7 +189,6 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
             status = getattr(exc, "status", None)
             if isinstance(status, int) and 500 <= status <= 599:
                 return True
-            # Check for rate limit in error data
             data = getattr(exc, "data", "")
             if isinstance(data, str | bytes):
                 try:
@@ -212,7 +209,6 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
 
     # Gerrit REST specific errors - check for wrapped HTTP errors
     if api_type == ApiType.GERRIT_REST:
-        # Handle GerritRestError that wraps HTTP errors
         if "HTTP 5" in str(exc) or "HTTP 429" in str(exc):
             return True
         # Also check for original HTTP errors that caused the GerritRestError
@@ -509,7 +505,6 @@ def curl_download(
         if silent:
             cmd.append("-sS")
 
-        # Write HTTP status code to stdout
         cmd.extend(["-w", "%{http_code}"])
 
         # Set timeout
@@ -546,7 +541,6 @@ def curl_download(
                 )
             ) from exc
 
-        # Initialize variables
         result = None
         http_status = "unknown"
 
@@ -560,7 +554,6 @@ def curl_download(
                 check=False,
             )
 
-            # Extract HTTP status code from stdout
             http_status = result.stdout.strip() if result.stdout else "unknown"
 
             if result.returncode != 0:

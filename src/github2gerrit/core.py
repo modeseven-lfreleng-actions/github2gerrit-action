@@ -74,6 +74,7 @@ from .models import Inputs
 from .pr_content_filter import filter_pr_body
 from .reconcile_matcher import LocalCommit
 from .reconcile_matcher import create_local_commit
+from .rich_display import safe_console_print
 from .ssh_common import merge_known_hosts_content
 from .utils import env_bool
 from .utils import is_verbose_mode
@@ -99,9 +100,7 @@ except ImportError:
         SSHAgentManager = None
         setup_ssh_agent_auth = None
 
-
 log = logging.getLogger("github2gerrit.core")
-
 
 # Error message constants to comply with TRY003
 _MSG_MISSING_PR_CONTEXT = "missing PR context"
@@ -112,7 +111,6 @@ _MSG_MISSING_GERRIT_SERVER = (
 )
 _MSG_MISSING_GERRIT_PROJECT = "missing GERRIT_PROJECT"
 _MSG_DNS_RESOLUTION_FAILED = "DNS resolution failed for '%s'"
-
 
 # Removed _insert_issue_id_into_commit_message - dead code
 # All commit message building now uses _build_commit_message_with_trailers
@@ -132,7 +130,6 @@ def _clean_ellipses_from_message(message: str) -> str:
         if stripped == "..." or stripped == "…":
             continue
 
-        # Remove trailing ellipses from lines
         cleaned_line = re.sub(r"\s*\.{3,}\s*$", "", line)
         cleaned_line = re.sub(r"\s*…\s*$", "", cleaned_line)
         cleaned_lines.append(cleaned_line)
@@ -158,9 +155,7 @@ def _clean_squash_title_line(title_line: str | None) -> str:
     if not title_line:
         return ""
 
-    # Remove markdown links
     title_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title_line)
-    # Remove trailing ellipsis/truncation
     title_line = re.sub(r"\s*[.]{3,}.*$", "", title_line)
     # Split on common separators to avoid leaking body content
     for separator in [". Bumps ", " Bumps ", ". - ", " - "]:
@@ -225,11 +220,6 @@ def _clean_squash_title_line(title_line: str | None) -> str:
         # leakage.
 
     return title_line
-
-
-# ---------------------
-# Utility functions
-# ---------------------
 
 
 def _match_first_group(pattern: str, text: str) -> str | None:
@@ -414,7 +404,6 @@ class Orchestrator:
             existing_trailers = ""
 
             if current_change:
-                # Extract current commit message
                 rev = str(current_change.get("current_revision") or "")
                 revisions = current_change.get("revisions") or {}
                 if rev and rev in revisions:
@@ -473,7 +462,6 @@ class Orchestrator:
                                 existing_trailers = "\n".join(lines[i:])
                                 break
 
-            # Build new commit message preserving metadata and trailers
             if title and description:
                 new_message = f"{title}\n\n{description}"
             elif title:
@@ -541,7 +529,6 @@ class Orchestrator:
             return
 
         try:
-            # Get PR title and body
             client = build_client()
             repo = get_repo_from_env(client)
             pr_obj = get_pull(repo, int(gh.pr_number))
@@ -580,7 +567,6 @@ class Orchestrator:
                     log.debug("PR title: %s", pr_title)
                     log.debug("Gerrit subject: %s", gerrit_subject)
 
-                    # Update with PR title and body
                     self._update_gerrit_change_metadata(
                         gerrit=gerrit,
                         change_id=change_id,
@@ -655,7 +641,6 @@ class Orchestrator:
                     current_revision = change.get("current_revision", "")
                     revisions = change.get("revisions", {})
 
-                    # Get patchset number
                     patchset_num = 0
                     if current_revision and current_revision in revisions:
                         patchset_num = revisions[current_revision].get(
@@ -676,7 +661,6 @@ class Orchestrator:
                         }
                     )
 
-                    # Log detailed info
                     if patchset_num > 1:
                         log.debug(
                             "✅ Verified %s: Change %s, patchset %d, status=%s",
@@ -772,7 +756,6 @@ class Orchestrator:
 
         change_ids: list[str] = []
 
-        # Build expected metadata for matching
         expected_pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
         meta_trailers = self._build_pr_metadata_trailers(gh)
         expected_github_hash = ""
@@ -800,7 +783,6 @@ class Orchestrator:
 
             log.debug("Querying Gerrit for topic: %s", topic)
 
-            # Build client using centralized URL builder
             from .gerrit_rest import build_client_for_host
 
             client = build_client_for_host(gerrit.host)
@@ -893,7 +875,6 @@ class Orchestrator:
             mapping = parse_mapping_comments(comment_bodies)
 
             if mapping and mapping.change_ids:
-                # Validate consistency
                 from .mapping_comment import validate_mapping_consistency
 
                 if validate_mapping_consistency(
@@ -1203,7 +1184,6 @@ class Orchestrator:
         if resolved_rules.has_rules:
             base_body = apply_body_rules(base_body, resolved_rules)
 
-        # Build trailers in proper order
         trailers_ordered: list[str] = []
 
         # 0. Custom trailer-location commit rules
@@ -1233,7 +1213,9 @@ class Orchestrator:
                 log.debug(
                     "✅ Added Issue-ID %s to commit message", issue_id_value
                 )
-                print(f"✅ Added Issue-ID {issue_id_value} to commit message")
+                safe_console_print(
+                    f"✅ Added Issue-ID {issue_id_value} to commit message"
+                )
         elif preserve_existing and "Issue-ID" in existing_trailers:
             # Preserve existing Issue-ID
             for issue_id_val in existing_trailers["Issue-ID"]:
@@ -1347,7 +1329,6 @@ class Orchestrator:
             repo = get_repo_from_env(client)
             pr_obj = get_pull(repo, int(gh_context.pr_number))
 
-            # Build metadata
             mode_str = "multi-commit" if multi else "squash"
             meta = self._build_pr_metadata_trailers(gh_context)
             gh_hash = ""
@@ -1388,11 +1369,9 @@ class Orchestrator:
                     [c.body or "" for c in comments]
                 )
                 if comment_indices:
-                    # Update the latest mapping comment
                     latest_idx = comment_indices[-1]
                     latest_comment = comments[latest_idx]
 
-                    # Create new mapping for update
                     new_mapping = ChangeIdMapping(
                         pr_url=pr_url,
                         mode=mode_str,
@@ -1427,10 +1406,6 @@ class Orchestrator:
                 getattr(gh_context, "pr_number", "?"),
                 exc,
             )
-
-    # ------------------------------------------------------------------
-    # Create-missing fallback helpers
-    # ------------------------------------------------------------------
 
     def _should_create_missing(
         self,
@@ -1743,7 +1718,6 @@ class Orchestrator:
         branch = self._resolve_target_branch()
         base_ref = f"origin/{branch}"
 
-        # Get commit range: commits in HEAD not in base branch
         try:
             # Ensure workspace is prepared (consolidated git fetch)
             self._ensure_workspace_prepared(branch)
@@ -1767,19 +1741,16 @@ class Orchestrator:
 
         for index, commit_sha in enumerate(commit_list):
             try:
-                # Get commit subject
                 subject = run_cmd(
                     ["git", "show", "-s", "--pretty=format:%s", commit_sha],
                     cwd=self.workspace,
                 ).stdout.strip()
 
-                # Get full commit message
                 commit_message = run_cmd(
                     ["git", "show", "-s", "--pretty=format:%B", commit_sha],
                     cwd=self.workspace,
                 ).stdout
 
-                # Get modified files
                 files_output = run_cmd(
                     [
                         "git",
@@ -1795,7 +1766,6 @@ class Orchestrator:
                     f.strip() for f in files_output.splitlines() if f.strip()
                 ]
 
-                # Create LocalCommit object
                 local_commit = create_local_commit(
                     index=index,
                     sha=commit_sha,
@@ -1847,10 +1817,6 @@ class Orchestrator:
         self._prepared_branch: str | None = None
         # Track git-review setup state to avoid redundant setup
         self._git_review_initialized: bool = False
-
-    # ---------------
-    # Public API
-    # ---------------
 
     def validate_gerrit_server(self, gerrit_host: str | None) -> None:
         """Validate that the Gerrit server hostname can be resolved via DNS.
@@ -1988,8 +1954,6 @@ class Orchestrator:
 
         self._configure_git(gerrit, inputs)
 
-        # Phase 3: Robust reconciliation with multi-pass matching
-        # For UPDATE operations, enforce finding existing changes
         forced_reuse_ids: list[str] = []
         if is_update_operation or is_edit_operation:
             log.debug("🔍 Searching for existing Gerrit change(s) to update...")
@@ -2010,7 +1974,6 @@ class Orchestrator:
                 if not should_create:
                     raise  # propagate the original error
 
-                # --- Fall back to CREATE mode ---
                 log.warning(
                     "🔄 Falling back from UPDATE → CREATE for PR #%s "
                     "(create-missing authorised)",
@@ -2025,14 +1988,10 @@ class Orchestrator:
                 # Notify on the PR that we are creating from scratch
                 self._post_create_missing_notice(gh)
 
-        # Optimization: Determine reuse Change-IDs BEFORE preparing commits.
-        # This avoids redundant preparation calls - previously we prepared
-        # commits once initially, then if reuse_ids were found, we prepared
-        # them again, discarding the first preparation's work. Now we determine
-        # reuse_ids first, then prepare commits only once with the correct IDs.
+        # Determine reuse Change-IDs before preparing commits so the
+        # preparation step runs only once, with the correct IDs.
         reuse_ids: list[str] = []
         if inputs.submit_single_commits:
-            # Extract local commits for multi-commit reconciliation
             local_commits = self._extract_local_commits_for_reconciliation(
                 inputs, gh
             )
@@ -2123,7 +2082,6 @@ class Orchestrator:
 
         self._comment_on_pull_request(gh, gerrit, result)
 
-        # Validate that no unexpected files were committed
         self._validate_committed_files(gh, result)
 
         # Post-push supersession sweep (Option A fallback).
@@ -2176,10 +2134,6 @@ class Orchestrator:
         self._cleanup_ssh()
         return result
 
-    # ---------------
-    # Step scaffolds
-    # ---------------
-
     def _guard_pull_request_context(self, gh: GitHubContext) -> None:
         if gh.pr_number is None:
             raise OrchestratorError(_MSG_MISSING_PR_CONTEXT)
@@ -2203,7 +2157,6 @@ class Orchestrator:
         """
         from .gitreview import parse_gitreview
 
-        # --- Strategy 1: local file ---
         if path.exists():
             # Read file with explicit error handling so IO failures
             # produce a distinct message from malformed content.
@@ -2226,7 +2179,6 @@ class Orchestrator:
 
         log.info(".gitreview not found locally; attempting remote fetch")
 
-        # --- Strategy 2: GitHub API (PyGithub) ---
         repo_obj: Any | None = None
         try:
             client = build_client()
@@ -2659,7 +2611,6 @@ class Orchestrator:
                 "SSH agent setup failed, falling back to file-based SSH: %s",
                 exc,
             )
-            # Clean up any partial SSH agent setup before fallback
             if self._ssh_agent_manager:
                 self._ssh_agent_manager.cleanup()
                 self._ssh_agent_manager = None
@@ -2746,7 +2697,6 @@ class Orchestrator:
 
         log.debug("SSH key file created successfully: %s", key_path)
 
-        # Write known hosts to tool-specific location
         known_hosts_path = tool_ssh_dir / "known_hosts"
         with open(known_hosts_path, "w", encoding="utf-8") as f:
             f.write(effective_known_hosts.strip() + "\n")
@@ -3165,7 +3115,6 @@ class Orchestrator:
             start_point,
         )
 
-        # Step 1: Try deepening first (cheaper than full unshallow)
         if self._deepen_repository(depth=100):
             log.debug("Retrying checkout after deepening...")
             try:
@@ -3178,7 +3127,6 @@ class Orchestrator:
                 log.info("Checkout succeeded after deepening repository")
                 return
 
-        # Step 2: Full unshallow as last resort
         log.info("Deepening insufficient, performing full unshallow...")
         if not self._unshallow_repository():
             log.error(
@@ -3244,7 +3192,6 @@ class Orchestrator:
             "clone. Attempting graduated deepening to recover..."
         )
 
-        # Step 1: Try deepening first (cheaper than full unshallow)
         if self._deepen_repository(depth=100):
             log.debug("Retrying merge --squash after deepening...")
             # Reset the failed merge state before retrying
@@ -3277,7 +3224,6 @@ class Orchestrator:
                 log.info("Merge --squash succeeded after deepening repository")
                 return
 
-        # Step 2: Full unshallow as last resort
         log.info(
             "Deepening insufficient, performing full unshallow for merge..."
         )
@@ -3348,7 +3294,6 @@ class Orchestrator:
                         walk_exc,
                     )
 
-                # Remove the directory tree
                 shutil.rmtree(self._ssh_temp_dir)
                 log.debug(
                     "Securely cleaned up temporary SSH directory: %s",
@@ -3529,12 +3474,10 @@ class Orchestrator:
                 author=author, no_edit=True, signoff=True, cwd=self.workspace
             )
 
-            # Get current commit message
             cur_msg = run_cmd(
                 ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
                 cwd=self.workspace,
             ).stdout
-            # Clean ellipses from commit message
             cur_msg = _clean_ellipses_from_message(cur_msg)
 
             # Determine Change-ID to use (reuse if provided)
@@ -3542,7 +3485,6 @@ class Orchestrator:
             if reuse_change_ids and idx < len(reuse_change_ids):
                 desired_change_id = reuse_change_ids[idx]
 
-            # Build topic for metadata
             if "/" in gh.repository:
                 repo_name = gh.repository.split("/")[-1]
             else:
@@ -3576,14 +3518,12 @@ class Orchestrator:
                     author=author,
                     cwd=self.workspace,
                 )
-            # Extract newly added Change-Id from last commit trailers
             trailers = git_last_commit_trailers(
                 keys=["Change-Id"], cwd=self.workspace
             )
             for cid in trailers.get("Change-Id", []):
                 if cid:
                     change_ids.append(cid)
-            # Return to base branch for next iteration context
             run_cmd(["git", "checkout", branch], cwd=self.workspace)
         # Deduplicate while preserving order
         seen = set()
@@ -3629,7 +3569,6 @@ class Orchestrator:
             ["git", "rev-parse", "HEAD"], cwd=self.workspace
         ).stdout.strip()
 
-        # Create temp branch from base and merge-squash PR head
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
         os.environ["G2G_TMP_BRANCH"] = tmp_branch
 
@@ -3716,7 +3655,6 @@ class Orchestrator:
                 merge_exc, base_sha, head_sha
             )
 
-            # Log error at debug level - user-friendly message comes later
             log.debug("Git merge --squash failed: %s", error_details)
             if recovery_msg:
                 log.debug("Suggested recovery: %s", recovery_msg)
@@ -3803,7 +3741,6 @@ class Orchestrator:
             # Apply conventional commit normalization if enabled
             if inputs.normalise_commit and gh.pr_number:
                 try:
-                    # Get PR author for normalization context
                     client = build_client()
                     repo = get_repo_from_env(client)
                     pr_obj = get_pull(repo, int(gh.pr_number))
@@ -3837,7 +3774,6 @@ class Orchestrator:
                     body_start += 1
                 if body_start < len(message_lines):
                     out.append("")
-                    # Clean up ellipses from body lines
                     body_content = "\n".join(message_lines[body_start:])
                     cleaned_body_content = _clean_ellipses_from_message(
                         body_content
@@ -3894,7 +3830,6 @@ class Orchestrator:
                 msg += "\n\n" + "\n".join(signed_off)
             return msg
 
-        # Build message parts
         raw_lines = _collect_log_lines()
         message_lines, signed_off, _existing_cids = _parse_message_parts(
             raw_lines
@@ -3902,13 +3837,10 @@ class Orchestrator:
         clean_lines = _build_clean_message_lines(message_lines)
         pr_str = str(gh.pr_number or "").strip()
         reuse_cid = _maybe_reuse_change_id(pr_str)
-        # Phase 3: if external reuse list provided, override with first
-        # Change-Id
         if reuse_change_ids:
             cand = reuse_change_ids[0]
             if cand:
                 reuse_cid = cand
-        # Build base message with Signed-off-by
         base_msg = _compose_base_message(clean_lines, signed_off)
 
         # Use centralized function to build complete message with all trailers
@@ -4023,7 +3955,6 @@ class Orchestrator:
         if title:
             # Remove markdown links like [text](url) and keep just the text
             title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title)
-            # Remove any trailing ellipsis or truncation indicators
             title = re.sub(r"\s*[.]{3,}.*$", "", title)
             # Ensure title doesn't accidentally contain body content
             # Split on common separators and take only the first meaningful part
@@ -4031,7 +3962,6 @@ class Orchestrator:
                 if separator in title:
                     title = title.split(separator)[0].strip()
                     break
-            # Remove any remaining markdown or formatting artifacts
             title = re.sub(r"[*_`]", "", title)
             title = title.strip()
 
@@ -4041,7 +3971,6 @@ class Orchestrator:
                     title, author_login, self.workspace
                 )
 
-        # Get current commit message with all trailers
         current_body = git_show("HEAD", fmt="%B", cwd=self.workspace)
 
         # Split into message body and trailer block
@@ -4070,12 +3999,10 @@ class Orchestrator:
                 # Found non-trailer after trailers, stop
                 break
 
-        # Extract existing trailers
         existing_trailers = []
         if found_trailer_block:
             existing_trailers = lines[trailer_start_idx:]
 
-        # Build new message: title + body + preserved trailers
         new_message_parts = []
         if title:
             new_message_parts.append(title)
@@ -4094,7 +4021,6 @@ class Orchestrator:
 
         commit_message = "\n".join(new_message_parts).strip()
 
-        # Get current author
         author = run_cmd(
             ["git", "show", "-s", "--pretty=format:%an <%ae>", "HEAD"],
             cwd=self.workspace,
@@ -4234,7 +4160,6 @@ class Orchestrator:
             )
             log.debug("Working directory: %s", self.workspace)
 
-            # Execute the git review command
             run_cmd(args, cwd=self.workspace, env=env)
             log.debug("Successfully pushed changes to Gerrit")
         except CommandError as exc:
@@ -4368,7 +4293,6 @@ class Orchestrator:
                 f"{error_details}"
             )
             raise OrchestratorError(msg) from exc
-        # Cleanup temporary branch used during preparation
         else:
             # Successful push: emit mapping comment (Phase 2)
             try:
@@ -4388,7 +4312,6 @@ class Orchestrator:
                     "Failed to emit Change-Id map comment (success path): %s",
                     exc_emit,
                 )
-        # Cleanup temporary branch used during preparation
         tmp_branch = (os.getenv("G2G_TMP_BRANCH", "") or "").strip()
         if tmp_branch:
             # Switch back to the target branch, then delete the temp branch
@@ -4478,7 +4401,6 @@ class Orchestrator:
             return
 
         try:
-            # Get current organization for config lookup
             org = os.getenv("ORGANIZATION") or os.getenv(
                 "GITHUB_REPOSITORY_OWNER"
             )
@@ -4570,7 +4492,6 @@ class Orchestrator:
             return
 
         try:
-            # Get config path
             config_path = os.getenv("G2G_CONFIG_PATH", "").strip()
             if not config_path:
                 config_path = "~/.config/github2gerrit/configuration.txt"
@@ -4803,7 +4724,6 @@ class Orchestrator:
         # matching
         normalized_output = " ".join(combined_lower.split())
 
-        # Check for SSH host key verification failures first
         if (
             "host key verification failed" in combined_lower
             or "no ed25519 host key is known" in combined_lower
@@ -4868,7 +4788,6 @@ class Orchestrator:
                 "SSH public key authentication failed. The SSH key may be "
                 "invalid, not authorized for this user, or the wrong key type."
             )
-        # Check for general SSH permission issues
         elif "permission denied" in combined_lower:
             return "SSH permission denied - check SSH key and user permissions"
         elif "could not read from remote repository" in combined_lower:
@@ -4876,7 +4795,6 @@ class Orchestrator:
                 "Could not read from remote repository - check SSH "
                 "authentication and repository access permissions"
             )
-        # Check for Gerrit-specific issues
         elif "missing issue-id" in combined_lower:
             return "Missing Issue-ID in commit message."
         elif "commit not associated to any issue" in combined_lower:
@@ -4901,7 +4819,6 @@ class Orchestrator:
             lines = combined_output.split("\n")
             for line in lines:
                 if "! [remote rejected]" in line:
-                    # Extract the reason in parentheses
                     if "(" in line and ")" in line:
                         reason = line[line.find("(") + 1 : line.find(")")]
                         return f"Gerrit rejected the push: {reason}"
@@ -4947,9 +4864,7 @@ class Orchestrator:
             # include current revision
             query = f"limit:1 is:open project:{repo.project_gerrit} {cid}"
             path = f"/changes/?q={query}&o=CURRENT_REVISION&n=1"
-            # Build single API base URL via centralized discovery
             api_base_url = url_builder.api_url()
-            # Build Gerrit REST client with retry/timeout
             from .gerrit_rest import build_client_for_host
 
             client = build_client_for_host(
@@ -5017,7 +4932,6 @@ class Orchestrator:
 
         if use_ssh:
             repo_url = repo_ssh_url
-            # Set up SSH environment for private repos
             env = {
                 "GIT_SSH_COMMAND": build_git_ssh_command(),
                 **build_non_interactive_ssh_env(),
@@ -5032,7 +4946,6 @@ class Orchestrator:
             ["git", "remote", "add", "origin", repo_url], cwd=self.workspace
         )
 
-        # Fetch base branch and PR head with CLI's fallback logic
         fetch_success = False
 
         if base_ref:
@@ -5108,11 +5021,9 @@ class Orchestrator:
         try:
             parsed = urllib.parse.urlparse(server_url)
 
-            # Validate scheme
             if parsed.scheme not in ("http", "https"):
                 raise OrchestratorError(f"Invalid URL scheme: {parsed.scheme}")  # noqa: TRY003, TRY301
 
-            # Validate hostname exists
             hostname = parsed.hostname
             if not hostname:
                 raise OrchestratorError("Invalid URL: missing hostname")  # noqa: TRY003, TRY301
@@ -5182,7 +5093,6 @@ class Orchestrator:
                 msg = f"No IP addresses found for hostname: {hostname}"
                 raise OrchestratorError(msg)
 
-            # Extract and validate all unique IP addresses
             ip_addresses = set()
             for addr_info in addr_infos:
                 ip_str = addr_info[4][
@@ -5288,7 +5198,6 @@ class Orchestrator:
         repo_full = gh.repository.strip() if gh.repository else ""
         pr_num_str = str(gh.pr_number) if gh.pr_number else "0"
 
-        # Get GitHub token
         token = os.getenv("GITHUB_TOKEN", "").strip()
         if not token:
             msg = "No GITHUB_TOKEN available for API fallback"
@@ -5297,7 +5206,6 @@ class Orchestrator:
         # Determine API base URL with validation to prevent SSRF
         server_url = gh.server_url or "https://github.com"
         api_base = self._validate_and_get_api_base_url(server_url)
-        # Get PR details to find head SHA
         pr_api_url = f"{api_base}/repos/{repo_full}/pulls/{pr_num_str}"
         headers = {
             "Authorization": f"token {token}",
@@ -5329,7 +5237,6 @@ class Orchestrator:
         if not (workspace / ".git").exists():
             run_cmd(["git", "init"], cwd=workspace)
 
-        # Extract archive
         archive_path = workspace / "archive.zip"
         archive_path.write_bytes(archive_data)
 
@@ -5359,11 +5266,9 @@ class Orchestrator:
                         target.unlink()
                 shutil.move(str(item), str(target))
 
-        # Clean up
         source_dir.rmdir()
         archive_path.unlink()
 
-        # Create expected branch
         run_cmd(["git", "checkout", "-B", "g2g_pr_head"], cwd=workspace)
 
         log.info("Successfully set up workspace using GitHub API archive")
@@ -5378,7 +5283,6 @@ class Orchestrator:
 
         # Download commit-msg hook using centralized curl framework
         try:
-            # Create centralized URL builder for hook URLs
             url_builder = create_gerrit_url_builder(gerrit.host)
             hook_url = url_builder.hook_url("commit-msg")
 
@@ -5417,7 +5321,6 @@ class Orchestrator:
             if size < 128 or size > 65536:
                 _raise_orch(_MSG_HOOK_SIZE_BOUNDS)
 
-            # Validate content characteristics
             text_head = ""
             try:
                 with open(hook_path, "rb") as fh:
@@ -5465,7 +5368,6 @@ class Orchestrator:
             log.debug(
                 "Found existing Change-Id(s) in footer: %s", existing_change_ids
             )
-            # Clean up any duplicate Change-IDs in the message body
             self._clean_change_ids_from_body(author)
             return [c for c in existing_change_ids if c]
 
@@ -5550,7 +5452,6 @@ class Orchestrator:
         trailers."""
         lines = message.splitlines()
 
-        # Parse proper trailers using the fixed trailer parser
         trailers = _parse_trailers(message)
         change_id_trailers = trailers.get("Change-Id", [])
         signed_off_trailers = trailers.get("Signed-off-by", [])
@@ -5592,7 +5493,6 @@ class Orchestrator:
         body_lines = []
         for i in range(trailer_start):
             line = lines[i]
-            # Remove any Change-Id references from body lines
             if "Change-Id:" in line:
                 # If line starts with Change-Id:, skip it entirely
                 if line.strip().startswith("Change-Id:"):
@@ -5609,7 +5509,6 @@ class Orchestrator:
                     # Pattern to match "Change-Id: <value>" where value can
                     # contain word chars, hyphens, etc.
                     line = re.sub(r"Change-Id:\s*[A-Za-z0-9._-]+\b", "", line)
-                    # Clean up extra whitespace
                     line = re.sub(r"\s+", " ", line).strip()
                     if line != original_line:
                         log.debug(
@@ -5620,7 +5519,6 @@ class Orchestrator:
                         )
             body_lines.append(line)
 
-        # Remove trailing empty lines from body
         while body_lines and not body_lines[-1].strip():
             body_lines.pop()
 
@@ -5746,7 +5644,6 @@ class Orchestrator:
             if not csha:
                 log.debug("Empty commit SHA, skipping")
                 continue
-            # Build SSH command based on available authentication method
             ssh_cmd: list[str] = []
             try:
                 log.debug("Executing SSH command for commit %s", csha)
@@ -6088,7 +5985,6 @@ class Orchestrator:
             msg = "GitHub API validation failed"
             raise OrchestratorError(msg) from exc
 
-        # Log effective targets
         log.debug(
             "Dry-run targets: Gerrit project=%s branch=%s topic_prefix=GH-%s",
             repo.project_gerrit,
@@ -6139,10 +6035,6 @@ class Orchestrator:
             url_builder = create_gerrit_url_builder(host, base_path)
             api_url = url_builder.api_url()
             log.warning("Gerrit REST probe failed for %s: %s", api_url, exc)
-
-    # ---------------
-    # Helpers
-    # ---------------
 
     def _resolve_target_branch(self) -> str:
         # Preference order:
@@ -6240,7 +6132,6 @@ class Orchestrator:
             return
 
         try:
-            # Get files changed in the GitHub PR
             from .github_api import build_client
             from .github_api import get_pull
             from .github_api import get_repo_from_env
@@ -6249,7 +6140,6 @@ class Orchestrator:
             repo = get_repo_from_env(client)
             pr_obj = get_pull(repo, int(gh.pr_number))
 
-            # Get list of files changed in the PR
             github_files = set()
             for file in pr_obj.get_files():  # type: ignore[attr-defined]
                 github_files.add(file.filename)
@@ -6260,10 +6150,8 @@ class Orchestrator:
                 sorted(github_files),
             )
 
-            # Check files in each commit SHA that was pushed to Gerrit
             for commit_sha in result.commit_shas:
                 try:
-                    # Get files changed in the Gerrit commit
                     from .gitutils import run_cmd
 
                     files_output = run_cmd(
@@ -6290,7 +6178,6 @@ class Orchestrator:
                         sorted(gerrit_files),
                     )
 
-                    # Check for unexpected files
                     unexpected_files = gerrit_files - github_files
                     if unexpected_files:
                         # Filter out known safe files that might legitimately
@@ -6518,6 +6405,10 @@ class Orchestrator:
             if head_result.returncode == 0:
                 log.error("Current HEAD: %s", head_result.stdout.strip())
 
+        # log.exception records the caught error and traceback; this
+        # diagnostic helper must never mask the original merge failure
+        # being analyzed.
+        # aislop-ignore-next-line silent-recovery
         except Exception:
             log.exception("Failed to gather debug context")
 
@@ -6552,7 +6443,6 @@ class Orchestrator:
         except Exception as e:
             log.debug("Failed to check existing git identity: %s", e)
 
-        # Configure git identity using Gerrit credentials
         user_name = inputs.gerrit_ssh_user_g2g or "github2gerrit-bot"
         user_email = (
             inputs.gerrit_ssh_user_g2g_email or "github2gerrit@example.com"
@@ -6583,8 +6473,3 @@ class Orchestrator:
                 log.exception("Failed to configure git user identity")
                 msg = "Cannot configure git user identity"
                 raise OrchestratorError(msg) from global_e
-
-
-# ---------------------
-# Utility functions
-# ---------------------

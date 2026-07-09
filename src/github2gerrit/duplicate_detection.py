@@ -70,7 +70,6 @@ class ChangeFingerprint:
 
     def _normalize_title(self, title: str) -> str:
         """Normalize PR title for comparison."""
-        # Remove common prefixes/suffixes
         normalized = title.strip()
 
         # Remove conventional commit prefixes like "feat:", "fix:", etc.
@@ -82,7 +81,6 @@ class ChangeFingerprint:
             flags=re.IGNORECASE,
         )
 
-        # Remove markdown formatting
         normalized = re.sub(r"[*_`]", "", normalized)
 
         # Remove version number variations for dependency updates
@@ -92,7 +90,6 @@ class ChangeFingerprint:
         normalized = re.sub(r"\b\d+(\.\d+)+(-\w+)?\b", "x.y.z", normalized)
         normalized = re.sub(r"\b\d+\.\d+\b", "x.y.z", normalized)
 
-        # Remove specific commit hashes
         normalized = re.sub(r"\b[a-f0-9]{7,40}\b", "commit_hash", normalized)
 
         # Normalize whitespace
@@ -130,7 +127,6 @@ class ChangeFingerprint:
                 if overlap_ratio > 0:
                     return self._titles_similar(other, 0.6)
 
-        # Check title similarity even without file changes
         return self._titles_similar(other, similarity_threshold)
 
     def _titles_similar(
@@ -359,7 +355,6 @@ class DuplicateDetector:
             normalized_pr_subject,
         )
 
-        # Build Gerrit REST URL using centralized URL builder
         url_builder = create_gerrit_url_builder(gerrit_host)
 
         # Track which base path actually works for constructing display URLs
@@ -689,7 +684,6 @@ class DuplicateDetector:
                     if isinstance(num, int):
                         all_nums.append(num)
 
-                    # Log special handling
                     if (
                         is_perfect_dependency_match
                         and agg < config.similarity_threshold
@@ -711,7 +705,6 @@ class DuplicateDetector:
             if hits:
                 hits_sorted = sorted(hits, key=lambda t: t[0], reverse=True)
 
-                # Log each matching change individually and display on console
                 for s, u, _ in hits_sorted:
                     if u:
                         log.debug("Score: %.2f  URL: %s", s, u)
@@ -809,11 +802,9 @@ def check_for_duplicates(
             "GitHub repository: %s", getattr(repo, "full_name", "unknown")
         )
 
-        # Get the target PR
         target_pr = repo.get_pull(gh.pr_number)
         log.debug("Retrieved PR #%s: %s", target_pr.number, target_pr.title)
 
-        # Create detector and check
         duplicate_types = os.getenv("DUPLICATE_TYPES", "open")
         log.debug(
             "Checking for duplicates in Gerrit changes with states: %s",

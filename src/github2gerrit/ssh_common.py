@@ -129,7 +129,6 @@ def build_git_ssh_command(
 
     ssh_cmd = f"ssh {' '.join(ssh_options)}"
 
-    # Log masked version for security
     if key_path:
         masked_cmd = ssh_cmd.replace(str(key_path), "[KEY_PATH]")
         log.debug("Generated SSH command: %s", masked_cmd)

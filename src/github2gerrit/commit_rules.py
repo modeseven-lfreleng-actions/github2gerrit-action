@@ -72,10 +72,6 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
 # Valid values for CommitRule.location
 VALID_LOCATIONS = frozenset({"trailer", "body"})
 
@@ -135,11 +131,6 @@ class ResolvedCommitRules:
             if rule.key == key:
                 return rule.value
         return None
-
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
 
 
 def _parse_rule_entry(
@@ -230,11 +221,6 @@ def _parse_rules_list(
     return rules
 
 
-# ---------------------------------------------------------------------------
-# Top-level JSON parsing
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CommitRulesConfig:
     """Parsed representation of the full ``COMMIT_RULES_JSON`` document."""
@@ -314,11 +300,6 @@ def parse_commit_rules_json(json_str: str) -> CommitRulesConfig | None:
     return config
 
 
-# ---------------------------------------------------------------------------
-# Resolution
-# ---------------------------------------------------------------------------
-
-
 def resolve_rules(
     config: CommitRulesConfig | None,
     *,
@@ -378,11 +359,6 @@ def resolve_rules(
         )
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Application helpers
-# ---------------------------------------------------------------------------
 
 
 def apply_body_rules(

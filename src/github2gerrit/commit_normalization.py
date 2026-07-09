@@ -149,7 +149,6 @@ class CommitNormalizer:
         if self._is_conventional_commit(title):
             return False
 
-        # Check for automation patterns
         return self._is_automation_pr(title, author)
 
     def normalize_commit_title(self, title: str, author: str) -> str:
@@ -165,7 +164,6 @@ class CommitNormalizer:
         # Determine the appropriate conventional commit type
         commit_type = self._determine_commit_type(title, author)
 
-        # Clean and normalize the title
         normalized_title = self._clean_title(title)
 
         # Apply conventional commit format
@@ -181,7 +179,6 @@ class CommitNormalizer:
 
     def _is_automation_pr(self, title: str, author: str) -> bool:
         """Check if this is an automation PR that should be normalized."""
-        # Check for known automation authors
         automation_authors = [
             "dependabot[bot]",
             "dependabot-preview[bot]",
@@ -195,7 +192,6 @@ class CommitNormalizer:
         ):
             return True
 
-        # Check for automation patterns in title
         automation_patterns = [
             r"^bump\s+",
             r"^update\s+.*\s+from\s+.*\s+to\s+",
@@ -216,10 +212,8 @@ class CommitNormalizer:
             self.workspace,
         )
 
-        # Check .pre-commit-config.yaml
         self._check_precommit_config()
 
-        # Check .github/release-drafter.yml
         self._check_release_drafter_config()
 
         # Analyze git history
@@ -239,12 +233,10 @@ class CommitNormalizer:
 
             ci_config = config.get("ci", {})
 
-            # Check autofix commit message
             autofix_msg = ci_config.get("autofix_commit_msg", "")
             if autofix_msg:
                 self._extract_preferences_from_message(autofix_msg)
 
-            # Check autoupdate commit message
             autoupdate_msg = ci_config.get("autoupdate_commit_msg", "")
             if autoupdate_msg:
                 self._extract_preferences_from_message(autoupdate_msg)
@@ -272,7 +264,6 @@ class CommitNormalizer:
                     titles = rule.get("title", [])
 
                     for title_pattern in titles:
-                        # Extract conventional commit type from pattern
                         if title_pattern.startswith(
                             "/"
                         ) and title_pattern.endswith("/i"):
@@ -292,7 +283,6 @@ class CommitNormalizer:
     def _analyze_git_history(self) -> None:
         """Analyze recent git history for conventional commit patterns."""
         try:
-            # Get recent commit messages
             git_cmd = shutil.which("git")
             if not git_cmd:
                 log.debug("git command not found in PATH")
@@ -332,7 +322,6 @@ class CommitNormalizer:
                                 1
                             )
 
-            # Update preferences based on analysis
             if type_counts:
                 # Determine most common capitalization
                 if capitalization_examples:
@@ -344,7 +333,6 @@ class CommitNormalizer:
                     else:
                         self.preferences.capitalization = "lower"
 
-                # Update preferred types
                 for commit_type in type_counts:
                     if commit_type in CONVENTIONAL_COMMIT_TYPES:
                         self.preferences.preferred_types[commit_type] = (
@@ -374,13 +362,11 @@ class CommitNormalizer:
         """Determine the appropriate conventional commit type."""
         title_lower = title.lower()
 
-        # Check for dependabot patterns first
         if "dependabot" in author.lower() or any(
             re.search(pattern, title_lower) for pattern in DEPENDABOT_PATTERNS
         ):
             return self.preferences.dependency_type
 
-        # Check for pre-commit.ci patterns
         if "pre-commit" in author.lower() or "pre-commit" in title_lower:
             return self.preferences.automation_type
 
@@ -395,10 +381,8 @@ class CommitNormalizer:
 
     def _clean_title(self, title: str) -> str:
         """Clean and normalize the title text."""
-        # Remove markdown links
         title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title)
 
-        # Remove trailing ellipsis
         title = re.sub(r"\s*[.]{3,}.*$", "", title)
 
         # Remove markdown bold/code formatting but preserve underscores

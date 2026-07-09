@@ -244,7 +244,6 @@ def get_pull(repo: GhRepository, number: int) -> GhPullRequest:
         pr = repo.get_pull(number)
     except Exception as exc:
         if is_github_api_permission_error(exc):
-            # Extract repository name for better error message
             repo_name = getattr(repo, "full_name", "unknown")
             raise GitHub2GerritError(
                 ExitCode.GITHUB_API_ERROR,

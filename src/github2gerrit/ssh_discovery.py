@@ -165,7 +165,6 @@ def fetch_ssh_host_keys(
                 _MSG_NO_KEYS_FOUND.format(hostname=hostname, port=port)
             )
 
-        # Validate that we got proper known_hosts format
         lines = result.stdout.strip().split("\n")
         valid_lines = []
 
@@ -260,8 +259,8 @@ def extract_gerrit_info_from_gitreview(content: str) -> tuple[str, int] | None:
         elif key == "port":
             try:
                 port = int(value)
-            except ValueError:
-                log.warning("Invalid port in .gitreview: %s", value)
+            except ValueError as exc:
+                log.warning("Invalid port in .gitreview: %s (%s)", value, exc)
 
     return (hostname, port) if hostname else None
 
@@ -289,7 +288,6 @@ def discover_and_save_host_keys(
     # Discover the host keys
     host_keys = fetch_ssh_host_keys(hostname, port)
 
-    # Save to configuration file
     save_host_keys_to_config(host_keys, organization, config_path)
 
     return host_keys
@@ -343,7 +341,6 @@ def save_host_keys_to_config(
         if config_file.exists():
             existing_content = config_file.read_text(encoding="utf-8")
 
-        # Parse existing content to find the organization section
         lines = existing_content.split("\n")
         new_lines = []
         in_org_section = False
@@ -353,7 +350,6 @@ def save_host_keys_to_config(
         for line in lines:
             stripped = line.strip()
 
-            # Check for section headers
             if stripped.startswith("[") and stripped.endswith("]"):
                 section_name = stripped[1:-1].strip().lower()
                 in_org_section = section_name == organization.lower()
@@ -402,7 +398,6 @@ def save_host_keys_to_config(
                 section_end, f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"'
             )
 
-        # Write the updated configuration
         config_file.write_text("\n".join(new_lines), encoding="utf-8")
 
         log.debug(

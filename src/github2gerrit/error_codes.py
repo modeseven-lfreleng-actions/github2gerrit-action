@@ -311,7 +311,6 @@ def _is_github_exception_with_permission_error(exception: Exception) -> bool:
         status = _get_exc_attr(exception, "status")
         if status in (401, 403, 404):
             return True
-        # Check for data attribute with status
         data = _get_exc_attr(exception, "data")
         if isinstance(data, dict) and data.get("status") in (401, 403, 404):
             return True
@@ -327,7 +326,6 @@ def _has_permission_related_http_status(exception: Exception) -> bool:
             if isinstance(status, int) and status in (401, 403, 404):
                 return True
 
-    # Check for requests.HTTPError or similar
     response = _get_exc_attr(exception, "response")
     if response is not None:
         status = getattr(response, "status_code", None)
@@ -348,12 +346,10 @@ def _matches_github_permission_patterns(exception: Exception) -> bool:
         "requires authentication",
     ]
 
-    # Check high-confidence patterns first
     for pattern in github_api_patterns:
         if pattern in error_str:
             return True
 
-    # Check for HTTP status indicators in context
     status_indicators = ["401", "403", "forbidden", "unauthorized"]
     context_indicators = ["api", "http", "github", "request", "response"]
     if any(indicator in error_str for indicator in status_indicators) and any(
@@ -394,7 +390,6 @@ def is_gerrit_connection_error(exception: Exception) -> bool:
     """
     error_str = str(exception).lower()
 
-    # Define regex patterns for Gerrit connection errors
     gerrit_patterns = [
         r"connection refused",
         r"connection timed out",
@@ -425,7 +420,6 @@ def is_network_error(exception: Exception) -> bool:
     """
     error_str = str(exception).lower()
 
-    # Define regex patterns for network errors
     network_patterns = [
         r"network is unreachable",
         r"name resolution failed",
@@ -527,7 +521,6 @@ def convert_orchestrator_error(
         error_msg, original_exception
     )
 
-    # Create user-friendly message based on exit code
     if exit_code == ExitCode.CONFIGURATION_ERROR:
         user_message = (
             "❌ Configuration validation failed; check required parameters"
