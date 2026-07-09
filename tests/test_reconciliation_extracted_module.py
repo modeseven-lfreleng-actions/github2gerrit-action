@@ -133,6 +133,49 @@ def test_reconciliation_topic_reuse_path(monkeypatch: pytest.MonkeyPatch):
     assert result == [change.change_id], "Expected reuse of existing Change-Id"
 
 
+def test_reconciliation_queries_canonical_topic(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Topic discovery must query the topic format the push side uses."""
+    gh = _DummyGH()
+    gerrit = _DummyGerrit()
+    inputs = _inputs(reuse_strategy="topic")
+    monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
+
+    seen_topics: list[str] = []
+
+    def capture_topic(
+        client: object, topic: str, **kwargs: object
+    ) -> list[GerritChange]:
+        seen_topics.append(topic)
+        return []
+
+    monkeypatch.setattr(recon_mod, "query_changes_by_topic", capture_topic)
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host",
+        lambda *a, **k: object(),
+    )
+
+    local_commits = [_local_commit(0, "sha0", "feat: initial")]
+
+    # Resolved project name provided (e.g. from .gitreview)
+    perform_reconciliation(
+        inputs=inputs,
+        gh=gh,
+        gerrit=gerrit,
+        local_commits=local_commits,
+        project_github="releng-builder",
+    )
+    # Fallback derivation from gh.repository
+    perform_reconciliation(
+        inputs=inputs,
+        gh=gh,
+        gerrit=gerrit,
+        local_commits=local_commits,
+    )
+    assert seen_topics == ["GH-releng-builder-5", "GH-repo-5"]
+
+
 def test_reconciliation_comment_fallback_extension(
     monkeypatch: pytest.MonkeyPatch,
 ):

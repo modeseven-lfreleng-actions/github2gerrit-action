@@ -188,7 +188,7 @@ class TestFindExistingChange:
         mock_change.change_id = "I1234567890abcdef"
 
         def mock_query_changes_by_topic(client, topic, statuses=None):
-            if topic == "GH-owner-repo-42":
+            if topic == "GH-repo-42":
                 return [mock_change]
             return []
 
@@ -303,7 +303,7 @@ class TestEnforceExistingChange:
 
         error_msg = str(exc_info.value)
         assert "UPDATE operation requires existing Gerrit change" in error_msg
-        assert "GH-owner-repo-42" in error_msg
+        assert "GH-repo-42" in error_msg
         assert "PR #42" in error_msg
 
     def test_enforce_returns_change_ids_when_found(

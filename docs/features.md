@@ -44,8 +44,8 @@ When a PR updates (for example, Dependabot rebases or updates dependencies):
 1. The `synchronize` event triggers UPDATE mode.
 2. The tool recovers the existing Gerrit change using five strategies,
    in order:
-   - Topic-based query (`GH-<owner>-<repo>-<pr-number>`, where `<repo>` is
-     the GitHub repository name without the owner prefix)
+   - Topic-based query (`<prefix>-<project>-<pr-number>`, matching the
+     topic the tool pushed; see "Topic naming" under Behavior Details)
    - `GitHub-Hash` trailer matching
    - `GitHub-PR` trailer URL matching
    - Mapping comment parsing from PR comments
@@ -702,12 +702,11 @@ Lookup logic:
 
 - Branch resolution: uses `GITHUB_BASE_REF` as the target branch for Gerrit,
   defaulting to `master` when unset.
-- Topic naming: pushes use `<prefix>-<project>-<pr-number>`, where
-  `<prefix>` comes from `G2G_TOPIC_PREFIX` (default `GH`) and `<project>`
-  is the Gerrit project path with `/` replaced by `-` (or the GitHub
-  repository name when `.gitreview` is unavailable). Change recovery
-  queries use `GH-<owner>-<repo>-<pr-number>` with the GitHub owner and
-  repository name.
+- Topic naming: pushes and change recovery queries use
+  `<prefix>-<project>-<pr-number>`, where `<prefix>` comes from
+  `G2G_TOPIC_PREFIX` (default `GH`) and `<project>` is the Gerrit
+  project path with `/` replaced by `-` (or the GitHub repository name
+  when `.gitreview` is unavailable).
 - GitHub Enterprise support: direct URL mode accepts enterprise GitHub hosts
   when explicitly enabled via `--allow-ghe-urls` or `ALLOW_GHE_URLS="true"`
   (default: off). The tool determines the GitHub API base URL from

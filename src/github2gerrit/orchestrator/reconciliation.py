@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from github2gerrit.gerrit_query import GerritChange
+from github2gerrit.gerrit_query import build_gerrit_topic
+from github2gerrit.gerrit_query import derive_project_github
 from github2gerrit.gerrit_query import query_changes_by_topic
 from github2gerrit.gitreview import GerritInfo
 from github2gerrit.mapping_comment import parse_mapping_comments
@@ -64,6 +66,7 @@ def perform_reconciliation(
     expected_pr_url: str | None = None,
     expected_github_hash: str | None = None,
     is_update_operation: bool = False,
+    project_github: str | None = None,
 ) -> list[str]:
     """
     Build and apply a reconciliation plan (Phase 2).
@@ -80,6 +83,9 @@ def perform_reconciliation(
       expected_pr_url: Optional authoritative PR URL.
       expected_github_hash: Optional expected GitHub-Hash trailer.
       is_update_operation: True if this is a PR update (synchronize event).
+      project_github: Resolved GitHub-style project name used for
+        topic construction; derived from ``gh.repository`` when
+        omitted.
 
     Returns:
       Ordered list of Change-Ids (plan.mapping_order).
@@ -132,6 +138,7 @@ def perform_reconciliation(
             allow_orphans=getattr(inputs, "allow_orphan_changes", False),
             expected_pr_url=expected_pr_url,
             expected_github_hash=expected_github_hash,
+            project_github=project_github,
         )
 
     # 2. Comment fallback (only if topic yielded nothing)
@@ -221,12 +228,14 @@ def _query_and_validate_topic_changes(
     allow_orphans: bool,
     expected_pr_url: str,
     expected_github_hash: str | None,
+    project_github: str | None = None,
 ) -> list[GerritChange]:
     """Query and filter Gerrit changes by topic with metadata validation."""
-    topic = (
-        f"GH-{gh.repository_owner}-{gh.repository.split('/')[-1]}-"
-        f"{gh.pr_number}"
-    )
+    if project_github is None:
+        project_github = derive_project_github(gh.repository)
+    # Must match the topic pushed via git-review (see
+    # core.Orchestrator._push_to_gerrit).
+    topic = build_gerrit_topic(project_github, gh.pr_number)
     try:
         from github2gerrit.gerrit_rest import (
             build_client_for_host,  # lazy import

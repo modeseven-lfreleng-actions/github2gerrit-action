@@ -315,3 +315,4 @@ jobs:
           ISSUE_ID: ${{ inputs.ISSUE_ID }}
           ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
           G2G_NO_GERRIT: ${{ vars.G2G_NO_GERRIT }}
+          G2G_DISABLED: ${{ vars.G2G_DISABLED }}

@@ -8,6 +8,7 @@ based on topics, with support for pagination and safe parsing.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -22,6 +23,51 @@ from .utils import log_warning_once
 
 
 log = logging.getLogger(__name__)
+
+
+def build_gerrit_topic(
+    project_github: str,
+    pr_number: int | str | None = None,
+) -> str:
+    """Build the canonical Gerrit topic for a GitHub pull request.
+
+    The topic format is ``<prefix>-<project_github>[-<pr_number>]``
+    where ``<prefix>`` comes from ``G2G_TOPIC_PREFIX`` (default
+    ``GH``) and ``project_github`` is the GitHub-style project name
+    (Gerrit project path with ``/`` replaced by ``-``, or the GitHub
+    repository name when no ``.gitreview`` mapping exists).
+
+    This single helper serves both the push path (git-review ``-t``)
+    and every topic-based query/recovery path, guaranteeing that
+    lookups match the topics the tool pushes.
+
+    Args:
+        project_github: GitHub-style project name (no owner prefix).
+        pr_number: Pull request number; omitted from the topic when
+            falsy or ``0``/``"0"`` (the documented sentinel meaning
+            "process all open PRs", never a real PR number).
+
+    Returns:
+        The canonical topic string.
+    """
+    prefix = os.getenv("G2G_TOPIC_PREFIX", "GH").strip() or "GH"
+    if pr_number is not None:
+        pr_str = str(pr_number).strip()
+        if pr_str and pr_str != "0":
+            return f"{prefix}-{project_github}-{pr_str}"
+    return f"{prefix}-{project_github}"
+
+
+def derive_project_github(repository: str) -> str:
+    """Derive a GitHub-style project name from ``owner/repo``.
+
+    Fallback used when resolved repository names are unavailable
+    (mirrors the fallback branch of
+    ``core.Orchestrator._derive_repo_names``).
+    """
+    if "/" in repository:
+        return repository.split("/")[-1]
+    return repository
 
 
 def _gerrit_quote(value: str) -> str:

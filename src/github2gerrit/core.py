@@ -725,6 +725,22 @@ class Orchestrator:
         except Exception as exc:
             log.warning("Patchset verification failed (non-fatal): %s", exc)
 
+    def _topic_for_pr(self, gh: GitHubContext) -> str:
+        """Build the canonical Gerrit topic for the current PR.
+
+        Uses the resolved repository names when available so query
+        topics always match the topic pushed via git-review; falls
+        back to deriving the project name from the GitHub repository.
+        """
+        from .gerrit_query import build_gerrit_topic
+        from .gerrit_query import derive_project_github
+
+        if self._repo_names is not None:
+            project_github = self._repo_names.project_github
+        else:
+            project_github = derive_project_github(gh.repository)
+        return build_gerrit_topic(project_github, gh.pr_number)
+
     def _find_existing_change_for_pr(
         self,
         gh: GitHubContext,
@@ -774,12 +790,8 @@ class Orchestrator:
         try:
             from .gerrit_query import query_changes_by_topic
 
-            # Construct topic name
-            if "/" in gh.repository:
-                repo_name = gh.repository.split("/")[-1]
-            else:
-                repo_name = gh.repository
-            topic = f"GH-{gh.repository_owner}-{repo_name}-{gh.pr_number}"
+            # Construct topic name (must match the pushed topic)
+            topic = self._topic_for_pr(gh)
 
             log.debug("Querying Gerrit for topic: %s", topic)
 
@@ -1522,11 +1534,7 @@ class Orchestrator:
         change_ids = self._find_existing_change_for_pr(gh, gerrit)
 
         if not change_ids:
-            if "/" in gh.repository:
-                repo_name = gh.repository.split("/")[-1]
-            else:
-                repo_name = gh.repository
-            topic = f"GH-{gh.repository_owner}-{repo_name}-{gh.pr_number}"
+            topic = self._topic_for_pr(gh)
 
             msg = (
                 f"UPDATE operation requires existing Gerrit change, but "  # noqa: S608
@@ -1581,6 +1589,7 @@ class Orchestrator:
         operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
         is_update_op = operation_mode == "update"
 
+        repo_names = self._repo_names
         change_ids = perform_reconciliation(
             inputs=inputs,
             gh=gh,
@@ -1589,6 +1598,7 @@ class Orchestrator:
             expected_pr_url=expected_pr_url,
             expected_github_hash=expected_github_hash or None,
             is_update_operation=is_update_op,
+            project_github=(repo_names.project_github if repo_names else None),
         )
         # Store lightweight plan snapshot (only fields needed for verify)
         try:
@@ -1630,10 +1640,7 @@ class Orchestrator:
             log.debug("Incomplete plan data; skipping verification")
             return
 
-        topic = (
-            f"GH-{gh.repository_owner}-{gh.repository.split('/')[-1]}-"
-            f"{gh.pr_number}"
-        )
+        topic = self._topic_for_pr(gh)
         try:
             from .gerrit_query import query_changes_by_topic
             from .gerrit_rest import build_client_for_host
@@ -1817,6 +1824,9 @@ class Orchestrator:
         self._prepared_branch: str | None = None
         # Track git-review setup state to avoid redundant setup
         self._git_review_initialized: bool = False
+        # Resolved repository names (set during execute) used for
+        # canonical topic construction in query/recovery paths
+        self._repo_names: RepoNames | None = None
 
     def validate_gerrit_server(self, gerrit_host: str | None) -> None:
         """Validate that the Gerrit server hostname can be resolved via DNS.
@@ -1890,6 +1900,9 @@ class Orchestrator:
 
         gitreview = self._read_gitreview(self.workspace / ".gitreview", gh)
         repo_names = self._derive_repo_names(gitreview, gh)
+        # Retain resolved names for topic construction in query/recovery
+        # paths so they always agree with the pushed topic.
+        self._repo_names = repo_names
         log.debug(
             "execute: inputs.dry_run=%s, inputs.ci_testing=%s",
             inputs.dry_run,
@@ -2046,6 +2059,7 @@ class Orchestrator:
             reviewers=self._resolve_reviewers(inputs),
             single_commits=inputs.submit_single_commits,
             prepared=prep,
+            gh=gh,
         )
 
         result = self._query_gerrit_for_results(
@@ -3485,14 +3499,8 @@ class Orchestrator:
             if reuse_change_ids and idx < len(reuse_change_ids):
                 desired_change_id = reuse_change_ids[idx]
 
-            if "/" in gh.repository:
-                repo_name = gh.repository.split("/")[-1]
-            else:
-                repo_name = gh.repository
-            if gh.pr_number:
-                topic = f"GH-{gh.repository_owner}-{repo_name}-{gh.pr_number}"
-            else:
-                topic = f"GH-{gh.repository_owner}-{repo_name}"
+            # Build topic for metadata (must match the pushed topic)
+            topic = self._topic_for_pr(gh)
 
             # Use centralized function to build complete message
             # with all trailers
@@ -4090,6 +4098,7 @@ class Orchestrator:
         reviewers: str,
         single_commits: bool,
         prepared: PreparedChange | None = None,
+        gh: GitHubContext | None = None,
     ) -> None:
         """Push prepared commit(s) to Gerrit using git-review."""
         log.debug(
@@ -4103,13 +4112,18 @@ class Orchestrator:
         if single_commits:
             tmp_branch = os.getenv("G2G_TMP_BRANCH", "tmp_branch")
             run_cmd(["git", "checkout", tmp_branch], cwd=self.workspace)
-        prefix = os.getenv("G2G_TOPIC_PREFIX", "GH").strip() or "GH"
-        pr_num = os.getenv("PR_NUMBER", "").strip()
-        topic = (
-            f"{prefix}-{repo.project_github}-{pr_num}"
-            if pr_num
-            else f"{prefix}-{repo.project_github}"
-        )
+        from .gerrit_query import build_gerrit_topic
+
+        # Prefer the per-PR GitHub context (correct in bulk mode, where
+        # multiple PRs process in parallel threads and the process-wide
+        # PR_NUMBER env var cannot identify individual PRs); fall back
+        # to the environment for single-PR and direct invocations.
+        pr_num: int | str | None
+        if gh is not None and gh.pr_number:
+            pr_num = gh.pr_number
+        else:
+            pr_num = os.getenv("PR_NUMBER", "").strip() or None
+        topic = build_gerrit_topic(repo.project_github, pr_num)
 
         # Use our specific SSH configuration
         env = self._ssh_env()
