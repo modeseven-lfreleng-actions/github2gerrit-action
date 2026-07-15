@@ -190,6 +190,77 @@ class TestReconcileFinalStateChanges:
         assert kwargs["gerrit_status"] == "MERGED"
         assert kwargs["close_merged_prs"] is True
 
+    def test_merged_change_comments_when_close_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLOSE_MERGED_PRS", "false")
+        with (
+            mock.patch.object(
+                self.orchestrator,
+                "_lookup_change_state",
+                return_value={
+                    "status": "MERGED",
+                    "number": "146080",
+                    "current_revision": "deadbeef",
+                },
+            ),
+            mock.patch(
+                "github2gerrit.gerrit_pr_closer.close_pr_with_status",
+            ) as mock_close,
+            mock.patch("github2gerrit.core.build_client"),
+            mock.patch("github2gerrit.core.get_repo_from_env"),
+            mock.patch("github2gerrit.core.get_pull"),
+            mock.patch("github2gerrit.core.create_pr_comment") as mock_comment,
+        ):
+            result = self._run(["I" + "a" * 40])
+
+        # Pipeline still stops, the PR stays open, and users get an
+        # explanatory comment instead of silence
+        assert result is not None
+        mock_close.assert_not_called()
+        mock_comment.assert_called_once()
+        comment_body = mock_comment.call_args.args[1]
+        assert "merged" in comment_body
+        assert "146080" in comment_body
+
+    def test_multiple_merged_changes_reference_all_urls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLOSE_MERGED_PRS", "true")
+        states = iter(
+            [
+                {
+                    "status": "MERGED",
+                    "number": "101",
+                    "current_revision": "aaa",
+                },
+                {
+                    "status": "MERGED",
+                    "number": "102",
+                    "current_revision": "bbb",
+                },
+            ]
+        )
+        with (
+            mock.patch.object(
+                self.orchestrator,
+                "_lookup_change_state",
+                side_effect=lambda *_a, **_k: next(states),
+            ),
+            mock.patch(
+                "github2gerrit.gerrit_pr_closer.close_pr_with_status",
+                return_value=True,
+            ) as mock_close,
+        ):
+            result = self._run(["I" + "a" * 40, "I" + "b" * 40])
+
+        assert result is not None
+        assert result.change_numbers == ["101", "102"]
+        # The PR close/comment must reference every reconciled change
+        change_url_arg = mock_close.call_args.kwargs["gerrit_change_url"]
+        assert "101" in change_url_arg
+        assert "102" in change_url_arg
+
     def test_abandoned_change_stops_with_abandoned_status(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

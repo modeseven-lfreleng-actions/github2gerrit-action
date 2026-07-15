@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from typing import Literal
 from urllib.request import Request
 from urllib.request import urlopen
 
@@ -1970,12 +1971,12 @@ class Orchestrator:
                 shas.append(info["current_revision"])
 
         # Overall status: MERGED wins for messaging purposes
-        overall_status = (
+        overall_status: Literal["MERGED", "ABANDONED"] = (
             "MERGED"
             if any(info["status"] == "MERGED" for _, info in states)
             else "ABANDONED"
         )
-        change_ref = urls[0] if urls else ", ".join(change_ids)
+        change_ref = ", ".join(urls) if urls else ", ".join(change_ids)
         log.info(
             "Gerrit change(s) for PR #%s already %s: %s",
             gh.pr_number,
@@ -1986,16 +1987,33 @@ class Orchestrator:
         close_merged_prs = env_bool("CLOSE_MERGED_PRS", True)
         pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
         try:
-            from .gerrit_pr_closer import close_pr_with_status
+            if close_merged_prs or overall_status == "ABANDONED":
+                # Closes the PR, or posts a comment-only notification
+                # for ABANDONED changes when CLOSE_MERGED_PRS is false
+                from .gerrit_pr_closer import close_pr_with_status
 
-            close_pr_with_status(
-                pr_url=pr_url,
-                gerrit_change_url=urls[0] if urls else None,
-                gerrit_status=overall_status,  # type: ignore[arg-type]
-                dry_run=False,
-                progress_tracker=None,
-                close_merged_prs=close_merged_prs,
-            )
+                close_pr_with_status(
+                    pr_url=pr_url,
+                    gerrit_change_url=change_ref if urls else None,
+                    gerrit_status=overall_status,
+                    dry_run=False,
+                    progress_tracker=None,
+                    close_merged_prs=close_merged_prs,
+                )
+            else:
+                # close_pr_with_status posts no comment for MERGED
+                # changes when CLOSE_MERGED_PRS is false; comment here
+                # so the early pipeline stop is explained on the PR
+                client = build_client()
+                repo_obj = get_repo_from_env(client)
+                pr_obj = get_pull(repo_obj, int(gh.pr_number))
+                comment = (
+                    "The Gerrit change for this pull request has "
+                    f"merged: {change_ref}\n\n"
+                    "No further patchsets can be submitted; this pull "
+                    "request is now redundant and can be closed."
+                )
+                create_pr_comment(pr_obj, comment)
         except Exception as exc:
             log.warning(
                 "Failed to reconcile GitHub PR #%s for %s Gerrit change: %s",

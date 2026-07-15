@@ -296,8 +296,13 @@ jobs:
         run: |
           # Extract owner/repo from a job_workflow_ref such as:
           # owner/repo/.github/workflows/github2gerrit.yaml@refs/tags/v1.4.1
-          echo "repository=${JOB_WORKFLOW_REF%%/.github/*}" \
-            >> "$GITHUB_OUTPUT"
+          repository="${JOB_WORKFLOW_REF%%/.github/*}"
+          if [[ ! "$repository" =~ ^[^/@]+/[^/@]+$ ]]; then
+            echo "Error: cannot derive owner/repo from" \
+              "job_workflow_ref: ${JOB_WORKFLOW_REF}" >&2
+            exit 1
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
 
       - name: Checkout github2gerrit action at workflow SHA
         # yamllint disable-line rule:line-length
