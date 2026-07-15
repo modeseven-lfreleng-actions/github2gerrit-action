@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from typing import Literal
 from urllib.request import Request
 from urllib.request import urlopen
 
@@ -1860,6 +1861,173 @@ class Orchestrator:
             )
             raise OrchestratorError(_MSG_DNS_RESOLUTION_FAILED % host) from exc
 
+    def _lookup_change_state(
+        self,
+        gerrit: GerritInfo,
+        change_id: str,
+    ) -> dict[str, str] | None:
+        """Query Gerrit for the current state of a change by Change-Id.
+
+        Scopes the query to the Gerrit project to avoid ambiguous
+        Change-Id lookups across projects.
+
+        Returns:
+            Dict with 'status', 'number' and 'current_revision' keys,
+            or None when the change cannot be found or queried.
+        """
+        try:
+            from .gerrit_rest import build_client_for_host
+
+            client = build_client_for_host(
+                gerrit.host, timeout=8.0, max_attempts=3
+            )
+            query = f"change:{change_id} project:{gerrit.project}"
+            encoded_q = urllib.parse.quote(query, safe="")
+            data = client.get(f"/changes/?q={encoded_q}&n=1&o=CURRENT_REVISION")
+            if isinstance(data, list) and data:
+                change = data[0]
+                if isinstance(change, dict):
+                    return {
+                        "status": str(change.get("status", "")),
+                        "number": str(change.get("_number", "")),
+                        "current_revision": str(
+                            change.get("current_revision", "")
+                        ),
+                    }
+        except Exception as exc:
+            log.debug("Failed to query state for change %s: %s", change_id, exc)
+        return None
+
+    def _reconcile_final_state_changes(
+        self,
+        *,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        change_ids: list[str],
+    ) -> SubmissionResult | None:
+        """Reconcile GitHub PR state against final-state Gerrit changes.
+
+        When reconciliation resolves existing Change-Id(s) for a PR,
+        verify their status in Gerrit before pushing. If every resolved
+        change is already MERGED or ABANDONED, pushing a new patchset
+        would be rejected ("change ... closed"). Instead, act on the
+        GitHub PR:
+
+        - MERGED: close the PR with an explanatory comment (honoring
+          CLOSE_MERGED_PRS; when false, comment only).
+        - ABANDONED: close or comment per CLOSE_MERGED_PRS.
+
+        Returns:
+            SubmissionResult describing the existing change(s) when the
+            pipeline should stop (all changes final), or None to
+            proceed with the normal push flow.
+        """
+        if not change_ids or not gh.pr_number:
+            return None
+
+        states: list[tuple[str, dict[str, str]]] = []
+        for cid in change_ids:
+            info = self._lookup_change_state(gerrit, cid)
+            if info is None:
+                # Fail open: unknown state must not block submission
+                return None
+            states.append((cid, info))
+
+        final_states = {"MERGED", "ABANDONED"}
+        if not all(info["status"] in final_states for _, info in states):
+            open_ids = [
+                cid
+                for cid, info in states
+                if info["status"] not in final_states
+            ]
+            closed_ids = [
+                cid for cid, info in states if info["status"] in final_states
+            ]
+            if closed_ids:
+                log.warning(
+                    "Some reused Gerrit change(s) are already closed "
+                    "(%s); proceeding with open change(s): %s",
+                    ", ".join(closed_ids),
+                    ", ".join(open_ids),
+                )
+            return None
+
+        # All resolved changes are in a final state
+        url_builder = create_gerrit_url_builder(gerrit.host)
+        urls: list[str] = []
+        nums: list[str] = []
+        shas: list[str] = []
+        for _cid, info in states:
+            if info["number"]:
+                try:
+                    change_number = int(info["number"])
+                except ValueError:
+                    continue
+                urls.append(
+                    url_builder.change_url(gerrit.project, change_number)
+                )
+                nums.append(info["number"])
+            if info["current_revision"]:
+                shas.append(info["current_revision"])
+
+        # Overall status: MERGED wins for messaging purposes
+        overall_status: Literal["MERGED", "ABANDONED"] = (
+            "MERGED"
+            if any(info["status"] == "MERGED" for _, info in states)
+            else "ABANDONED"
+        )
+        change_ref = ", ".join(urls) if urls else ", ".join(change_ids)
+        log.info(
+            "Gerrit change(s) for PR #%s already %s: %s",
+            gh.pr_number,
+            overall_status.lower(),
+            change_ref,
+        )
+
+        close_merged_prs = env_bool("CLOSE_MERGED_PRS", True)
+        pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
+        try:
+            if close_merged_prs or overall_status == "ABANDONED":
+                # Closes the PR, or posts a comment-only notification
+                # for ABANDONED changes when CLOSE_MERGED_PRS is false
+                from .gerrit_pr_closer import close_pr_with_status
+
+                close_pr_with_status(
+                    pr_url=pr_url,
+                    gerrit_change_url=change_ref if urls else None,
+                    gerrit_status=overall_status,
+                    dry_run=False,
+                    progress_tracker=None,
+                    close_merged_prs=close_merged_prs,
+                )
+            else:
+                # close_pr_with_status posts no comment for MERGED
+                # changes when CLOSE_MERGED_PRS is false; comment here
+                # so the early pipeline stop is explained on the PR
+                client = build_client()
+                repo_obj = get_repo_from_env(client)
+                pr_obj = get_pull(repo_obj, int(gh.pr_number))
+                comment = (
+                    "The Gerrit change for this pull request has "
+                    f"merged: {change_ref}\n\n"
+                    "No further patchsets can be submitted; this pull "
+                    "request is now redundant and can be closed."
+                )
+                create_pr_comment(pr_obj, comment)
+        except Exception as exc:
+            log.warning(
+                "Failed to reconcile GitHub PR #%s for %s Gerrit change: %s",
+                gh.pr_number,
+                overall_status.lower(),
+                exc,
+            )
+
+        return SubmissionResult(
+            change_urls=urls,
+            change_numbers=nums,
+            commit_shas=shas,
+        )
+
     def execute(
         self,
         inputs: Inputs,
@@ -2031,6 +2199,18 @@ class Orchestrator:
                 reuse_ids = self._perform_robust_reconciliation(
                     inputs, gh, gerrit, single_commit
                 )
+
+        # State reconciliation: when every Gerrit change resolved for
+        # this PR is already in a final state (merged/abandoned), the
+        # PR is redundant. Act on the GitHub PR instead of pushing a
+        # patchset that Gerrit will reject with "change ... closed".
+        early_result = self._reconcile_final_state_changes(
+            gh=gh,
+            gerrit=gerrit,
+            change_ids=reuse_ids,
+        )
+        if early_result is not None:
+            return early_result
 
         # Now prepare commits once with the correct reuse_ids
         if inputs.submit_single_commits:
@@ -4276,8 +4456,13 @@ class Orchestrator:
             # Analyze the specific failure reason from git review output
             error_details = self._analyze_gerrit_push_failure(exc)
 
-            # Always log the error details, even if not in verbose mode
-            log.exception("Gerrit push failed: %s", error_details)
+            # Log the analyzed error; reserve the full traceback for
+            # verbose/debug mode to keep console output actionable
+            if is_verbose_mode():
+                log.exception("Gerrit push failed: %s", error_details)
+            else:
+                # Deliberately omit the traceback outside verbose mode
+                log.error("Gerrit push failed: %s", error_details)  # noqa: TRY400
 
             # In debug mode, also show the raw command output
             if is_verbose_mode():
@@ -4827,6 +5012,11 @@ class Orchestrator:
             )
             if rejection_match:
                 reason = rejection_match.group(1).strip()
+                if re.search(r"change\s+\S+\s+closed", reason):
+                    return (
+                        "Gerrit change is closed (merged or abandoned) "
+                        f"and cannot accept new patchsets: {reason}"
+                    )
                 return f"Gerrit rejected the push: {reason}"
 
             # Fallback: look line by line
@@ -4835,6 +5025,12 @@ class Orchestrator:
                 if "! [remote rejected]" in line:
                     if "(" in line and ")" in line:
                         reason = line[line.find("(") + 1 : line.find(")")]
+                        if re.search(r"change\s+\S+\s+closed", reason):
+                            return (
+                                "Gerrit change is closed (merged or "
+                                "abandoned) and cannot accept new "
+                                f"patchsets: {reason}"
+                            )
                         return f"Gerrit rejected the push: {reason}"
                     return f"Gerrit rejected the push: {line.strip()}"
             return "Gerrit rejected the push for an unknown reason"

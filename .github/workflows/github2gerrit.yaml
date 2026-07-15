@@ -6,6 +6,13 @@ name: "GitHub2Gerrit [R]"
 
 # Reusable workflow wrapping the github2gerrit composite action.
 #
+# The composite action is not pinned to a separate version: this
+# workflow checks out the action from its own repository at the exact
+# commit the caller pinned this workflow to (github.job_workflow_sha)
+# and runs it as a local action. Workflow and action therefore always
+# ship as one unit with matching input interfaces, and the Python tool
+# itself installs as the latest release from PyPI at runtime (uvx).
+#
 # Supported caller trigger events:
 #
 #   - pull_request_target (opened/reopened/edited/synchronize/closed):
@@ -267,10 +274,48 @@ jobs:
       gerrit_commit_sha: ${{ steps.g2g.outputs.gerrit_commit_sha }}
       # yamllint enable rule:line-length
     steps:
+      # Check out the target repository first; the composite action's
+      # internal checkout is skipped (SKIP_CHECKOUT) so it cannot wipe
+      # the bundled action checkout performed below
+      - name: Checkout target repository
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: ${{ inputs.FETCH_DEPTH }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      # Resolve the repository that provides this reusable workflow so
+      # the bundled action ships from the exact same commit; the
+      # workflow and action interfaces then never drift apart
+      - name: Resolve workflow source repository
+        id: workflow-source
+        shell: bash
+        env:
+          JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+        run: |
+          # Extract owner/repo from a job_workflow_ref such as:
+          # owner/repo/.github/workflows/github2gerrit.yaml@refs/tags/v1.4.1
+          repository="${JOB_WORKFLOW_REF%%/.github/*}"
+          if [[ ! "$repository" =~ ^[^/@]+/[^/@]+$ ]]; then
+            echo "Error: cannot derive owner/repo from" \
+              "job_workflow_ref: ${JOB_WORKFLOW_REF}" >&2
+            exit 1
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout github2gerrit action at workflow SHA
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.workflow-source.outputs.repository }}
+          ref: ${{ github.job_workflow_sha }}
+          path: .g2g-action
+          persist-credentials: false
+
       - name: Run github2gerrit composite action
         id: g2g
-        # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/github2gerrit-action@f44c168376b369be0f306b6bdc07c80f67cceb05 # v1.3.3
+        uses: ./.g2g-action
         env:
           # Gerrit event dispatch context: when GERRIT_CHANGE_URL and
           # GERRIT_EVENT_TYPE carry values, the tool closes the source
@@ -281,6 +326,7 @@ jobs:
           GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE }}
           GERRIT_BRANCH: ${{ inputs.GERRIT_BRANCH }}
         with:
+          SKIP_CHECKOUT: true
           PR_NUMBER: ${{ inputs.PR_NUMBER }}
           SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
           USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
