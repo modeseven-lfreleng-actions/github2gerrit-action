@@ -4,6 +4,12 @@
 
 # Path-specific configurations.
 paths:
+  .github/workflows/github2gerrit.yaml:
+    ignore:
+      # actionlint's github context schema does not yet include the
+      # documented job_workflow_ref/job_workflow_sha properties that
+      # identify the reusable workflow's own repository and commit
+      - 'property "job_workflow_(ref|sha)" is not defined in object type .+'
   .github/workflows/testing.yaml:
     ignore:
       # Ignore deliberate test failure

@@ -22,6 +22,15 @@ inputs:
     description: "Fetch depth for checkout"
     required: false
     default: "10"
+  SKIP_CHECKOUT:
+    description: >-
+      Skip the internal repository checkout. Set when the caller has
+      already checked out the target repository at the desired ref
+      (e.g. the bundled reusable workflow, which also checks out this
+      action into the workspace and must not have it deleted by a
+      nested checkout)
+    required: false
+    default: "false"
   PR_NUMBER:
     description: "Pull request number to process, use 0 to process all open"
     required: false
@@ -205,7 +214,8 @@ runs:
         fi
 
     - name: "Checkout repository"
-      if: steps.disabled-check.outputs.disabled != 'true'
+      # yamllint disable-line rule:line-length
+      if: steps.disabled-check.outputs.disabled != 'true' && inputs.SKIP_CHECKOUT != 'true'
       # yamllint disable-line rule:line-length
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       with:
