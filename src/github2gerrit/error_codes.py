@@ -473,6 +473,19 @@ def map_orchestrator_error_to_exit_code(
     if original_exception and is_network_error(original_exception):
         return ExitCode.NETWORK_ERROR
 
+    # Final-state Gerrit change patterns: pushing a patchset to a
+    # merged/abandoned change is a state problem, not a connection
+    # problem. Check before the connection patterns because these
+    # messages also contain "failed to push".
+    final_state_patterns = [
+        r"change is closed \(merged or abandoned\)",
+        r"cannot accept new patchsets",
+        r"change\s+\S+\s+closed",
+    ]
+
+    if any(re.search(pattern, error_lower) for pattern in final_state_patterns):
+        return ExitCode.GERRIT_CHANGE_ALREADY_FINAL
+
     # Gerrit connection error patterns
     gerrit_patterns = [
         r"failed to push",
@@ -542,6 +555,12 @@ def convert_orchestrator_error(
             "❌ Git repository access failed; check repository permissions"
         )
         details = f"Repository issue: {error_msg}"
+    elif exit_code == ExitCode.GERRIT_CHANGE_ALREADY_FINAL:
+        user_message = (
+            "❌ Gerrit change is already merged or abandoned; "
+            "no new patchsets can be pushed"
+        )
+        details = f"Gerrit change state issue: {error_msg}"
     else:
         user_message = "❌ Operation failed; check logs for details"
         details = error_msg
