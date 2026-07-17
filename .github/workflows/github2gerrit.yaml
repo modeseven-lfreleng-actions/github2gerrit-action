@@ -8,8 +8,8 @@ name: "GitHub2Gerrit [R]"
 #
 # The composite action is not pinned to a separate version: this
 # workflow checks out the action from its own repository at the exact
-# commit the caller pinned this workflow to (github.job_workflow_sha)
-# and runs it as a local action. Workflow and action therefore always
+# commit the caller pinned this workflow to (job.workflow_sha) and
+# runs it as a local action. Workflow and action therefore always
 # ship as one unit with matching input interfaces, and the Python tool
 # itself installs as the latest release from PyPI at runtime (uvx).
 #
@@ -122,6 +122,16 @@ on:
         type: boolean
       VERBOSE:
         description: "Enable verbose output (sets log level to DEBUG)"
+        required: false
+        default: false
+        type: boolean
+      G2G_NO_GERRIT:
+        description: >-
+          Test mode: skip all Gerrit server interactions. When true,
+          takes precedence over the G2G_NO_GERRIT repository variable
+          (used by CI to exercise the workflow_call path without
+          Gerrit access); when false or omitted, the repository
+          variable applies
         required: false
         default: false
         type: boolean
@@ -287,29 +297,54 @@ jobs:
 
       # Resolve the repository that provides this reusable workflow so
       # the bundled action ships from the exact same commit; the
-      # workflow and action interfaces then never drift apart
+      # workflow and action interfaces then never drift apart.
+      # job.workflow_repository/job.workflow_sha identify the reusable
+      # workflow on github.com; the legacy github.job_workflow_ref and
+      # github.job_workflow_sha properties act as a fallback for GitHub
+      # Enterprise Server, where the job context properties are not
+      # available
       - name: Resolve workflow source repository
         id: workflow-source
         shell: bash
         env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
           JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+          LEGACY_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
-          # Extract owner/repo from a job_workflow_ref such as:
-          # owner/repo/.github/workflows/github2gerrit.yaml@refs/tags/v1.4.1
-          repository="${JOB_WORKFLOW_REF%%/.github/*}"
+          # Resolve the workflow source repository and commit
+          source="job context"
+          repository="$JOB_WORKFLOW_REPOSITORY"
+          workflow_sha="$JOB_WORKFLOW_SHA"
+          if [[ -z "$repository" ]]; then
+            # Fall back to extracting owner/repo from a ref such as:
+            # owner/repo/.github/workflows/github2gerrit.yaml@refs/tags/v1.4.2
+            source="legacy github context"
+            repository="${JOB_WORKFLOW_REF%%/.github/*}"
+            workflow_sha="$LEGACY_WORKFLOW_SHA"
+          fi
           if [[ ! "$repository" =~ ^[^/@]+/[^/@]+$ ]]; then
-            echo "Error: cannot derive owner/repo from" \
-              "job_workflow_ref: ${JOB_WORKFLOW_REF}" >&2
+            echo "Error: cannot derive owner/repo (source: ${source};" \
+              "job.workflow_repository: '${JOB_WORKFLOW_REPOSITORY}';" \
+              "github.job_workflow_ref: '${JOB_WORKFLOW_REF}')" >&2
             exit 1
           fi
+          if [[ -z "$workflow_sha" ]]; then
+            echo "Error: cannot derive workflow commit SHA (source:" \
+              "${source}; job.workflow_sha: '${JOB_WORKFLOW_SHA}';" \
+              "github.job_workflow_sha: '${LEGACY_WORKFLOW_SHA}')" >&2
+            exit 1
+          fi
+          echo "Workflow source: ${repository}@${workflow_sha} (${source})"
           echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "sha=$workflow_sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout github2gerrit action at workflow SHA
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ steps.workflow-source.outputs.repository }}
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ steps.workflow-source.outputs.sha }}
           path: .g2g-action
           persist-credentials: false
 
@@ -360,5 +395,5 @@ jobs:
           REVIEWERS_EMAIL: ${{ inputs.REVIEWERS_EMAIL }}
           ISSUE_ID: ${{ inputs.ISSUE_ID }}
           ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
-          G2G_NO_GERRIT: ${{ vars.G2G_NO_GERRIT }}
+          G2G_NO_GERRIT: ${{ inputs.G2G_NO_GERRIT || vars.G2G_NO_GERRIT }}
           G2G_DISABLED: ${{ vars.G2G_DISABLED }}

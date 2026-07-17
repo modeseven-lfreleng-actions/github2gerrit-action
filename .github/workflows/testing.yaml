@@ -16,6 +16,12 @@ on:
       - '!.github/**'
       - '!.*'
       - '!tox.ini'
+      # Re-include the workflows this suite guards: the reusable
+      # workflow smoke test must run when the workflow plumbing
+      # changes (the v1.4.2 regression shipped in a workflow-only
+      # change that never triggered this suite)
+      - '.github/workflows/github2gerrit.yaml'
+      - '.github/workflows/testing.yaml'
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -24,6 +30,28 @@ concurrency:
 permissions: {}
 
 jobs:
+  ### Test the reusable workflow path used by production callers ###
+  # This exercises the workflow_call plumbing that the composite
+  # action tests below cannot reach: the bundled-action checkout and
+  # the workflow source repository resolution from the job context.
+  # Runs on every trigger event (pull_request, push and
+  # workflow_dispatch) so all supported caller invocation modes get
+  # coverage. G2G_NO_GERRIT keeps the run hermetic: no Gerrit server
+  # access takes place.
+  reusable-workflow-test:
+    name: 'Test Reusable Workflow'
+    permissions:
+      contents: read  # Checkout for the mirror job and bundled action
+      pull-requests: write  # Comment on and update mirrored PRs
+      issues: write  # Post status/back-reference comments on issues
+    uses: ./.github/workflows/github2gerrit.yaml
+    with:
+      G2G_NO_GERRIT: true
+      AUTOMATION_ONLY: false
+      GERRIT_KNOWN_HOSTS: 'dummy-host ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC...'
+    secrets:
+      GERRIT_SSH_PRIVKEY_G2G: 'dummy-key'
+
   ### Test the GitHub Action in this Repository (PR context only) ###
   tests:
     name: 'Test GitHub Action'
