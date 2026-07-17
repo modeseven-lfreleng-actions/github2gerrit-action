@@ -6,10 +6,12 @@
 paths:
   .github/workflows/github2gerrit.yaml:
     ignore:
-      # actionlint's github context schema does not yet include the
-      # documented job_workflow_ref/job_workflow_sha properties that
-      # identify the reusable workflow's own repository and commit
+      # actionlint's context schemas do not yet include the documented
+      # properties that identify the reusable workflow's own repository
+      # and commit: job.workflow_repository/job.workflow_sha and the
+      # legacy github.job_workflow_ref/job_workflow_sha (GHES fallback)
       - 'property "job_workflow_(ref|sha)" is not defined in object type .+'
+      - 'property "workflow_(repository|sha)" is not defined in object type .+'
   .github/workflows/testing.yaml:
     ignore:
       # Ignore deliberate test failure
