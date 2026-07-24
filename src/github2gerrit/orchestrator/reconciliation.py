@@ -104,22 +104,9 @@ def perform_reconciliation(
         expected_pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
 
     # For UPDATE operations, use lower similarity threshold for rebased commits
-    similarity_threshold = getattr(inputs, "similarity_subject", 0.7)
-    if is_update_operation:
-        # Apply percentage-based reduction for updates - commit messages may
-        # have changed slightly due to rebasing or amendments
-        update_factor = getattr(inputs, "similarity_update_factor", 0.75)
-        # Ensure factor is in valid range [0.0, 1.0]
-        update_factor = max(0.0, min(1.0, update_factor))
-        # Apply multiplier with floor at 0.5 to prevent too-loose matching
-        similarity_threshold = max(0.5, similarity_threshold * update_factor)
-        log.info(
-            "UPDATE operation detected - using relaxed similarity "
-            "threshold: %.2f (base=%.2f, factor=%.2f)",
-            similarity_threshold,
-            getattr(inputs, "similarity_subject", 0.7),
-            update_factor,
-        )
+    similarity_threshold = _compute_similarity_threshold(
+        inputs, is_update_operation
+    )
 
     log.debug(
         "Recon strategy=%s commits=%d pr=%s update=%s",
@@ -143,27 +130,16 @@ def perform_reconciliation(
 
     # 2. Comment fallback (only if topic yielded nothing)
     if "comment" in strategy and not gerrit_changes:
-        mapped_ids = _attempt_comment_based_reuse(
+        comment_ids = _reconcile_via_comments(
             gh=gh,
+            inputs=inputs,
+            strategy=strategy,
             expected_pr_url=expected_pr_url,
             expected_github_hash=expected_github_hash,
+            local_commits=local_commits,
         )
-        if mapped_ids:
-            ordered = _extend_or_generate(
-                mapped_ids, len(local_commits), local_commits
-            )
-            plan = ReconciliationPlan(
-                change_ids=ordered,
-                reused_ids=mapped_ids[: len(local_commits)],
-                new_ids=ordered[len(mapped_ids) :],
-                orphan_change_ids=[],
-                digest=_compute_plan_digest(ordered),
-                strategy=strategy,
-            )
-            _maybe_emit_summary(
-                plan, log_json=getattr(inputs, "log_reconcile_json", False)
-            )
-            return plan.change_ids
+        if comment_ids is not None:
+            return comment_ids
 
     # 3. Matcher path
     if gerrit_changes:
@@ -173,39 +149,126 @@ def perform_reconciliation(
             if is_update_operation
             else getattr(inputs, "similarity_subject", 0.7)
         )
-
-        matcher = ReconciliationMatcher(
-            similarity_threshold=effective_threshold,
-            allow_duplicate_subjects=True,
-            require_file_match=getattr(inputs, "similarity_files", True),
-        )
-        result = matcher.reconcile(local_commits, gerrit_changes)
-        ordered = result.change_ids
-        reused_ids = ordered[: result.reused_count]
-        new_ids = ordered[result.reused_count :]
-        orphan_ids = [c.change_id for c in result.orphaned_changes]
-        plan = ReconciliationPlan(
-            change_ids=ordered,
-            reused_ids=reused_ids,
-            new_ids=new_ids,
-            orphan_change_ids=orphan_ids,
-            digest=_compute_plan_digest(ordered),
+        return _reconcile_via_matcher(
+            inputs=inputs,
+            gerrit=gerrit,
             strategy=strategy,
+            effective_threshold=effective_threshold,
+            local_commits=local_commits,
+            gerrit_changes=gerrit_changes,
         )
-        # Apply orphan policy (with REST side-effects)
-        orphan_policy = getattr(inputs, "orphan_policy", "comment")
-        actions = _apply_orphan_policy(orphan_ids, orphan_policy, gerrit=gerrit)
-        if actions.has_actions():
-            log.info(
-                "ORPHAN_ACTIONS json=%s",
-                json.dumps(actions.as_dict(), separators=(",", ":")),
-            )
-        _maybe_emit_summary(
-            plan, log_json=getattr(inputs, "log_reconcile_json", False)
-        )
-        return plan.change_ids
 
     # 4. All new path
+    return _reconcile_all_new(inputs, strategy, local_commits)
+
+
+def _compute_similarity_threshold(
+    inputs: Inputs, is_update_operation: bool
+) -> float:
+    """Resolve the similarity threshold, relaxing it for updates."""
+    similarity_threshold = getattr(inputs, "similarity_subject", 0.7)
+    if is_update_operation:
+        # Apply percentage-based reduction for updates - commit messages may
+        # have changed slightly due to rebasing or amendments
+        update_factor = getattr(inputs, "similarity_update_factor", 0.75)
+        # Ensure factor is in valid range [0.0, 1.0]
+        update_factor = max(0.0, min(1.0, update_factor))
+        # Apply multiplier with floor at 0.5 to prevent too-loose matching
+        similarity_threshold = max(0.5, similarity_threshold * update_factor)
+        log.info(
+            "UPDATE operation detected - using relaxed similarity "
+            "threshold: %.2f (base=%.2f, factor=%.2f)",
+            similarity_threshold,
+            getattr(inputs, "similarity_subject", 0.7),
+            update_factor,
+        )
+    return similarity_threshold
+
+
+def _reconcile_via_comments(
+    *,
+    gh: GitHubContext,
+    inputs: Inputs,
+    strategy: str,
+    expected_pr_url: str,
+    expected_github_hash: str | None,
+    local_commits: list[LocalCommit],
+) -> list[str] | None:
+    """Attempt legacy comment-based reuse.
+
+    Returns the ordered Change-Id list when a mapping is found, or ``None``
+    when no comment-based mapping is available (caller should continue).
+    """
+    mapped_ids = _attempt_comment_based_reuse(
+        gh=gh,
+        expected_pr_url=expected_pr_url,
+        expected_github_hash=expected_github_hash,
+    )
+    if not mapped_ids:
+        return None
+    ordered = _extend_or_generate(mapped_ids, len(local_commits), local_commits)
+    plan = ReconciliationPlan(
+        change_ids=ordered,
+        reused_ids=mapped_ids[: len(local_commits)],
+        new_ids=ordered[len(mapped_ids) :],
+        orphan_change_ids=[],
+        digest=_compute_plan_digest(ordered),
+        strategy=strategy,
+    )
+    _maybe_emit_summary(
+        plan, log_json=getattr(inputs, "log_reconcile_json", False)
+    )
+    return plan.change_ids
+
+
+def _reconcile_via_matcher(
+    *,
+    inputs: Inputs,
+    gerrit: GerritInfo | None,
+    strategy: str,
+    effective_threshold: float,
+    local_commits: list[LocalCommit],
+    gerrit_changes: list[GerritChange],
+) -> list[str]:
+    """Run the multi-pass matcher and apply the orphan policy."""
+    matcher = ReconciliationMatcher(
+        similarity_threshold=effective_threshold,
+        allow_duplicate_subjects=True,
+        require_file_match=getattr(inputs, "similarity_files", True),
+    )
+    result = matcher.reconcile(local_commits, gerrit_changes)
+    ordered = result.change_ids
+    reused_ids = ordered[: result.reused_count]
+    new_ids = ordered[result.reused_count :]
+    orphan_ids = [c.change_id for c in result.orphaned_changes]
+    plan = ReconciliationPlan(
+        change_ids=ordered,
+        reused_ids=reused_ids,
+        new_ids=new_ids,
+        orphan_change_ids=orphan_ids,
+        digest=_compute_plan_digest(ordered),
+        strategy=strategy,
+    )
+    # Apply orphan policy (with REST side-effects)
+    orphan_policy = getattr(inputs, "orphan_policy", "comment")
+    actions = _apply_orphan_policy(orphan_ids, orphan_policy, gerrit=gerrit)
+    if actions.has_actions():
+        log.info(
+            "ORPHAN_ACTIONS json=%s",
+            json.dumps(actions.as_dict(), separators=(",", ":")),
+        )
+    _maybe_emit_summary(
+        plan, log_json=getattr(inputs, "log_reconcile_json", False)
+    )
+    return plan.change_ids
+
+
+def _reconcile_all_new(
+    inputs: Inputs,
+    strategy: str,
+    local_commits: list[LocalCommit],
+) -> list[str]:
+    """Build a plan where every commit gets a freshly generated Change-Id."""
     new_ids = [_generate_change_id(c.sha) for c in local_commits]
     plan = ReconciliationPlan(
         change_ids=new_ids,

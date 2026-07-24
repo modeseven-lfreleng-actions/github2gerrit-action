@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from github2gerrit.gerrit_pr_closer import _apply_pr_close_action
 from github2gerrit.gerrit_pr_closer import _build_closure_comment
 from github2gerrit.gerrit_pr_closer import _env_bool
 from github2gerrit.gerrit_pr_closer import (
@@ -1061,3 +1062,58 @@ class TestAbandonGerritChangeForClosedPr:
         assert "Comment by user2" in abandon_message
         assert "Comment by user3" in abandon_message
         assert "Closing this now" in abandon_message
+
+
+class TestApplyPrCloseActionMessage:
+    """The close message must reflect the actual Gerrit status."""
+
+    @patch("github2gerrit.gerrit_pr_closer.safe_console_print")
+    @patch("github2gerrit.gerrit_pr_closer.close_pr")
+    def test_merged_status_message_not_abandoned(
+        self, _mock_close, mock_console
+    ):
+        _apply_pr_close_action(
+            MagicMock(),
+            123,
+            "comment",
+            "https://gerrit.example.org/c/proj/+/456",
+            should_close=True,
+            gerrit_status="MERGED",
+        )
+        message = mock_console.call_args[0][0]
+        assert "merged Gerrit change 456" in message
+        assert "abandoned" not in message
+
+    @patch("github2gerrit.gerrit_pr_closer.safe_console_print")
+    @patch("github2gerrit.gerrit_pr_closer.close_pr")
+    def test_unknown_status_message_has_no_status_adjective(
+        self, _mock_close, mock_console
+    ):
+        _apply_pr_close_action(
+            MagicMock(),
+            7,
+            "comment",
+            "https://gerrit.example.org/c/proj/+/9",
+            should_close=True,
+            gerrit_status="UNKNOWN",
+        )
+        message = mock_console.call_args[0][0]
+        assert "with Gerrit change 9" in message
+        assert "abandoned" not in message
+        assert "merged" not in message
+
+    @patch("github2gerrit.gerrit_pr_closer.safe_console_print")
+    @patch("github2gerrit.gerrit_pr_closer.close_pr")
+    def test_abandoned_status_message_says_abandoned(
+        self, _mock_close, mock_console
+    ):
+        _apply_pr_close_action(
+            MagicMock(),
+            5,
+            "comment",
+            "https://gerrit.example.org/c/proj/+/321",
+            should_close=True,
+            gerrit_status="ABANDONED",
+        )
+        message = mock_console.call_args[0][0]
+        assert "abandoned Gerrit change 321" in message

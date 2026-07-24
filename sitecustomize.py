@@ -55,6 +55,7 @@ def _debug_enabled() -> bool:
 def _dbg(msg: str) -> None:
     if _debug_enabled():
         try:
+            # aislop-ignore-next-line python-print-debug -- gated debug logger
             print(f"[sitecustomize] {msg}", file=sys.stderr)
         except Exception:
             # Debug logging must never disrupt interpreter startup; if
@@ -90,17 +91,17 @@ def _clean_stale_coverage_files(
     for base in bases:
         try:
             base = base.resolve()
-        except Exception:
+        except Exception as exc:
             # Use as-is if resolution fails
-            pass
+            _dbg(f"Failed to resolve base {base}: {exc}")
         for candidate in _iter_cov_candidates(base):
             try:
                 # Skip the protected target if present in candidates
                 if protected and str(candidate.resolve()) == protected:
                     continue
-            except Exception:
+            except Exception as exc:
                 # If resolve fails, fall through and try to remove
-                pass
+                _dbg(f"Failed to resolve candidate {candidate}: {exc}")
             _remove_path(candidate)
 
 
@@ -110,9 +111,9 @@ def _ensure_unique_coverage_file() -> Path:
     if existing:
         try:
             return Path(existing)
-        except Exception:
+        except Exception as exc:
             # Fall through to create a sane default
-            pass
+            _dbg(f"Invalid COVERAGE_FILE {existing!r}: {exc}")
     unique = (
         Path(tempfile.gettempdir())
         / f".coverage.pytest.{os.getpid()}.{uuid.uuid4().hex}"

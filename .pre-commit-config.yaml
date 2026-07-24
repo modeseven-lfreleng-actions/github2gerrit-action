@@ -3,7 +3,11 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 ci:
-  skip: [pytest, gha-workflow-linter]
+  # pre-commit.ci sandbox prevents network calls; aislop runs engines
+  # that can call the network at scan time, so it cannot run there
+  # either. gha-workflow-linter validates action calls over the
+  # network; pytest runs the full suite.
+  skip: [pytest, gha-workflow-linter, aislop]
   autofix_commit_msg: |
     Chore: pre-commit autofixes
 
@@ -124,6 +128,22 @@ repos:
     rev: 4c3079dcb6e9e3c295f961ce5bd5b8585db698ca  # frozen: v1.2.2
     hooks:
       - id: gha-workflow-linter
+
+  # Catch AI slop developer-side before it reaches a pull request.
+  # Runs the full-repository quality gate, scored against
+  # .aislop/config.yml. A local hook installing the published npm
+  # package: the scanaislop/aislop git repository does not ship the
+  # built dist/, so its bundled pre-commit hook cannot install. Bump
+  # the pinned version here manually when new aislop releases ship.
+  - repo: local
+    hooks:
+      - id: aislop
+        name: aislop
+        entry: aislop ci --human
+        language: node
+        additional_dependencies: ["aislop@0.13.1"]
+        pass_filenames: false
+        always_run: true
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: 1a4bb160cab6417b3045e1b37b6b72449243e658  # frozen: 0.37.4

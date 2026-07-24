@@ -179,6 +179,8 @@ def test_discover_base_path_returns_empty_on_200_ok(
     assert (
         b.web_url("c/project/+/1") == "https://gerrit.example.org/c/project/+/1"
     )
+    # The empty result must be cached so subsequent lookups do not re-probe.
+    assert urls_mod._BASE_PATH_CACHE.get("gerrit.example.org") == ""  # pyright: ignore[reportPrivateUsage]
 
 
 def test_discover_base_path_3xx_location_relative_and_absolute(
@@ -225,6 +227,30 @@ def test_discover_base_path_3xx_location_relative_and_absolute(
     b2 = create_gerrit_url_builder("gerrit.example.org")
     assert b2.base_path == "r"
     assert b2.api_url("changes/") == "https://gerrit.example.org/r/changes/"
+
+
+def test_discover_base_path_relative_location_without_leading_slash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GERRIT_HTTP_BASE_PATH", raising=False)
+
+    # A relative Location header without a leading slash (e.g.
+    # 'r/dashboard/self') must still yield base path 'r'; a naive
+    # host+loc concatenation would fold it into the netloc and lose it.
+    def decide(url: str) -> _FakeResp | BaseException:
+        if url.endswith("/dashboard/self"):
+            return _FakeResp(302, {"Location": "r/dashboard/self"})
+        return _FakeResp(404, {})
+
+    fake_opener = _FakeOpener(decide)
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_urls.urllib.request.build_opener",
+        lambda *_a, **_k: fake_opener,
+        raising=True,
+    )
+    b = create_gerrit_url_builder("gerrit.example.org")
+    assert b.base_path == "r"
+    assert b.web_url("dashboard").startswith("https://gerrit.example.org/r/")
 
 
 def test_discover_base_path_known_endpoint_does_not_become_base(

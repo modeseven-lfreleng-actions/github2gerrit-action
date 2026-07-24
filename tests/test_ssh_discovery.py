@@ -376,3 +376,24 @@ OTHER_KEY = "other_value"
             assert "# Comment" not in result
             assert "ssh-rsa" in result
             assert "ssh-ed25519" in result
+
+
+def test_ensure_keyscan_missing_preserves_actionable_message() -> None:
+    """A missing ssh-keyscan must surface the NOT_FOUND message.
+
+    The internal check catches broad exceptions and re-wraps them as a
+    generic "check failed" error; it must not swallow its own
+    SSHDiscoveryError for the not-found case, which carries actionable
+    guidance.
+    """
+    from github2gerrit.ssh_discovery import _MSG_KEYSCAN_NOT_FOUND
+    from github2gerrit.ssh_discovery import _ensure_keyscan_available
+
+    with (
+        patch("github2gerrit.ssh_discovery.shutil.which", return_value=None),
+        pytest.raises(SSHDiscoveryError) as exc_info,
+    ):
+        _ensure_keyscan_available()
+
+    assert str(exc_info.value) == _MSG_KEYSCAN_NOT_FOUND
+    assert "Failed to check" not in str(exc_info.value)

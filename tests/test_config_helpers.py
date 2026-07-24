@@ -15,6 +15,7 @@ import pytest
 from github2gerrit.config import _coerce_value
 from github2gerrit.config import _expand_env_refs
 from github2gerrit.config import _normalize_bool_like
+from github2gerrit.config import _sanitize_ssh_key_content
 from github2gerrit.config import _select_section
 from github2gerrit.config import _strip_quotes
 from github2gerrit.config import apply_config_to_env
@@ -852,3 +853,24 @@ def test_save_derived_parameters_works_when_dry_run_disabled(
     updated_content = config_file.read_text(encoding="utf-8")
     assert "[onap]" in updated_content
     assert "GERRIT_SSH_USER_G2G" in updated_content
+
+
+def test_sanitize_ssh_key_content_strips_embedded_whitespace() -> None:
+    """Embedded whitespace in base64 body lines must be removed.
+
+    Headers/footers are preserved verbatim; base64 content contains no
+    whitespace, so any embedded spaces/tabs (e.g. from wrapped copy-paste)
+    are stripped to repair the content rather than corrupt it.
+    """
+    lines = [
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        'b3Blb nNzaC1r "ZXkt djE',
+        "AAAA\tBBBB CCCC",
+        "-----END OPENSSH PRIVATE KEY-----",
+    ]
+    result = _sanitize_ssh_key_content(lines)
+    parts = result.split("\\n")
+    assert parts[0] == "-----BEGIN OPENSSH PRIVATE KEY-----"
+    assert parts[1] == "b3BlbnNzaC1rZXktdjE"
+    assert parts[2] == "AAAABBBBCCCC"
+    assert parts[3] == "-----END OPENSSH PRIVATE KEY-----"
