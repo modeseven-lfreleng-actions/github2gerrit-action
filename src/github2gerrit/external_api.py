@@ -137,8 +137,12 @@ def _calculate_backoff_delay(
     return float(delay + jitter)
 
 
-def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
-    """Determine if an exception represents a transient error."""
+def _is_transient_network_error(exc: BaseException) -> bool | None:
+    """Classify common network/HTTP errors.
+
+    Returns ``True``/``False`` when the exception type is conclusive, or
+    ``None`` when the caller should fall through to API-specific checks.
+    """
     # Common network/timeout errors
     if isinstance(
         exc,
@@ -168,73 +172,86 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
         ):
             return True
 
-    # GitHub API specific errors (if PyGithub is available)
-    if api_type == ApiType.GITHUB:
-        try:
-            from .github_api import GithubExceptionType
-            from .github_api import RateLimitExceededExceptionType
-        except ImportError:
-            GithubExceptionType = type(None)  # type: ignore[misc,assignment]
-            RateLimitExceededExceptionType = type(None)  # type: ignore[misc,assignment]
+    return None
 
-        exc_name = exc.__class__.__name__
-        if exc_name in (
-            "RateLimitExceededException",
-            "RateLimitExceededExceptionType",
-        ) or isinstance(exc, RateLimitExceededExceptionType):
+
+def _is_transient_github_error(exc: BaseException) -> bool | None:
+    """Classify GitHub API errors (if PyGithub is available).
+
+    Returns ``None`` when no GitHub-specific determination applies and the
+    caller should fall through to string-based detection.
+    """
+    try:
+        from .github_api import GithubExceptionType
+        from .github_api import RateLimitExceededExceptionType
+    except ImportError:
+        GithubExceptionType = type(None)  # type: ignore[misc,assignment]
+        RateLimitExceededExceptionType = type(None)  # type: ignore[misc,assignment]
+
+    exc_name = exc.__class__.__name__
+    if exc_name in (
+        "RateLimitExceededException",
+        "RateLimitExceededExceptionType",
+    ) or isinstance(exc, RateLimitExceededExceptionType):
+        return True
+    if exc_name in ("GithubException", "GithubExceptionType") or isinstance(
+        exc, GithubExceptionType
+    ):
+        status = getattr(exc, "status", None)
+        if isinstance(status, int) and 500 <= status <= 599:
             return True
-        if exc_name in ("GithubException", "GithubExceptionType") or isinstance(
-            exc, GithubExceptionType
-        ):
-            status = getattr(exc, "status", None)
-            if isinstance(status, int) and 500 <= status <= 599:
-                return True
-            data = getattr(exc, "data", "")
-            if isinstance(data, str | bytes):
-                try:
-                    text = (
-                        data.decode("utf-8")
-                        if isinstance(data, bytes)
-                        else data
-                    )
-                    if "rate limit" in text.lower():
-                        return True
-                except Exception:
-                    # Ignore decode errors when checking for rate limit text
-                    log.debug(
-                        "Failed to decode GitHub API error data for rate "
-                        "limit check"
-                    )
-                    return False
+        data = getattr(exc, "data", "")
+        if isinstance(data, str | bytes):
+            try:
+                text = data.decode("utf-8") if isinstance(data, bytes) else data
+                if "rate limit" in text.lower():
+                    return True
+            except Exception:
+                # Ignore decode errors when checking for rate limit text
+                log.debug(
+                    "Failed to decode GitHub API error data for rate "
+                    "limit check"
+                )
+                return False
 
-    # Gerrit REST specific errors - check for wrapped HTTP errors
-    if api_type == ApiType.GERRIT_REST:
-        if "HTTP 5" in str(exc) or "HTTP 429" in str(exc):
-            return True
-        # Also check for original HTTP errors that caused the GerritRestError
-        if hasattr(exc, "__cause__") and isinstance(
-            exc.__cause__, urllib.error.HTTPError
-        ):
-            status = getattr(exc.__cause__, "code", None)
-            return (
-                (500 <= status <= 599) or (status == 429) if status else False
-            )
+    return None
 
-    # SSH/Git command errors - check stderr for common transient messages
-    if api_type == ApiType.SSH:
-        msg = str(exc).lower()
-        transient_patterns = [
-            "connection timed out",
-            "connection refused",
-            "temporarily unavailable",
-            "network is unreachable",
-            "host key verification failed",  # May be transient during discovery
-            "broken pipe",
-            "connection reset",
-        ]
-        return any(pattern in msg for pattern in transient_patterns)
 
-    # String-based detection for other error types
+def _is_transient_gerrit_error(exc: BaseException) -> bool | None:
+    """Classify Gerrit REST errors, including wrapped HTTP errors.
+
+    Returns ``None`` when no Gerrit-specific determination applies and the
+    caller should fall through to string-based detection.
+    """
+    if "HTTP 5" in str(exc) or "HTTP 429" in str(exc):
+        return True
+    # Also check for original HTTP errors that caused the GerritRestError
+    if hasattr(exc, "__cause__") and isinstance(
+        exc.__cause__, urllib.error.HTTPError
+    ):
+        status = getattr(exc.__cause__, "code", None)
+        return (500 <= status <= 599) or (status == 429) if status else False
+
+    return None
+
+
+def _is_transient_ssh_error(exc: BaseException) -> bool:
+    """Classify SSH/Git command errors by inspecting stderr messages."""
+    msg = str(exc).lower()
+    transient_patterns = [
+        "connection timed out",
+        "connection refused",
+        "temporarily unavailable",
+        "network is unreachable",
+        "host key verification failed",  # May be transient during discovery
+        "broken pipe",
+        "connection reset",
+    ]
+    return any(pattern in msg for pattern in transient_patterns)
+
+
+def _is_transient_by_message(exc: BaseException) -> bool:
+    """String-based transient detection for otherwise unclassified errors."""
     msg = str(exc).lower()
     transient_substrings = [
         "timed out",
@@ -250,6 +267,27 @@ def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
         "rate limit",
     ]
     return any(substring in msg for substring in transient_substrings)
+
+
+def _is_transient_error(exc: BaseException, api_type: ApiType) -> bool:
+    """Determine if an exception represents a transient error."""
+    network = _is_transient_network_error(exc)
+    if network is not None:
+        return network
+
+    if api_type == ApiType.GITHUB:
+        github = _is_transient_github_error(exc)
+        if github is not None:
+            return github
+    elif api_type == ApiType.GERRIT_REST:
+        gerrit = _is_transient_gerrit_error(exc)
+        if gerrit is not None:
+            return gerrit
+    elif api_type == ApiType.SSH:
+        return _is_transient_ssh_error(exc)
+
+    # String-based detection for other error types
+    return _is_transient_by_message(exc)
 
 
 def _update_metrics(
@@ -279,6 +317,94 @@ def _update_metrics(
             metrics.transient_errors += 1
 
 
+# Default retry policies per API type, used when no explicit policy is given.
+_DEFAULT_POLICIES: dict[ApiType, RetryPolicy] = {
+    ApiType.GITHUB: RetryPolicy(max_attempts=5, timeout=10.0),
+    ApiType.GERRIT_REST: RetryPolicy(max_attempts=5, timeout=8.0),
+    ApiType.SSH: RetryPolicy(max_attempts=3, timeout=15.0),
+    ApiType.HTTP_DOWNLOAD: RetryPolicy(max_attempts=3, timeout=30.0),
+}
+
+
+def _resolve_retry_policy(
+    api_type: ApiType, policy: RetryPolicy | None
+) -> RetryPolicy:
+    """Return the explicit policy or the default policy for the API type."""
+    if policy is not None:
+        return policy
+    return _DEFAULT_POLICIES.get(api_type, RetryPolicy())
+
+
+def _retry_after_transient(
+    exc: Exception,
+    context: ApiCallContext,
+    api_type: ApiType,
+    operation: str,
+    policy: RetryPolicy,
+    duration: float,
+) -> bool:
+    """Handle a transient, non-final failure.
+
+    Logs a warning and sleeps for the backoff delay when the failure is
+    retryable, returning ``True`` to signal the caller should retry.
+    Returns ``False`` when the failure is final or non-retryable.
+    """
+    is_transient = _is_transient_error(exc, api_type)
+    is_final_attempt = context.attempt == policy.max_attempts
+    if not (is_transient and not is_final_attempt):
+        return False
+
+    delay = _calculate_backoff_delay(
+        context.attempt,
+        policy.base_delay,
+        policy.max_delay,
+        policy.jitter_factor,
+    )
+    log.warning(
+        "[%s] %s attempt %d/%d failed (%.2fs): %s; retrying in %.2fs",
+        api_type.value,
+        operation,
+        context.attempt,
+        policy.max_attempts,
+        duration,
+        exc,
+        delay,
+    )
+    time.sleep(delay)
+    return True
+
+
+def _log_final_failure(
+    exc: Exception,
+    context: ApiCallContext,
+    api_type: ApiType,
+    operation: str,
+    policy: RetryPolicy,
+    duration: float,
+) -> None:
+    """Log a final (non-retried) API call failure at the right level."""
+    is_final_attempt = context.attempt == policy.max_attempts
+    reason = "final attempt" if is_final_attempt else "non-retryable"
+    failure_msg = (
+        f"[{api_type.value}] {operation} failed ({reason}) "
+        f"after {context.attempt} attempt(s) in {duration:.2f}s: "
+        f"{context.target}"
+    )
+    # Authentication/authorization failures (Gerrit REST 401/403) are
+    # surfaced once, closer to the request, as a concise warning. Avoid
+    # emitting a duplicate error/traceback for them here. Scope this
+    # strictly to Gerrit REST: other API types (e.g. GitHub) may also
+    # expose a ``.status`` attribute, and their auth/permission failures
+    # must retain error-level visibility.
+    is_gerrit_auth_failure = api_type == ApiType.GERRIT_REST and getattr(
+        exc, "status", None
+    ) in (401, 403)
+    if is_gerrit_auth_failure:
+        log.debug(failure_msg)
+    else:
+        log_exception_conditionally(log, failure_msg)
+
+
 def external_api_call(
     api_type: ApiType,
     operation: str,
@@ -303,15 +429,7 @@ def external_api_call(
         def get_pull_request(repo, number):
             return repo.get_pull(number)
     """
-    if policy is None:
-        # Default policies per API type
-        default_policies = {
-            ApiType.GITHUB: RetryPolicy(max_attempts=5, timeout=10.0),
-            ApiType.GERRIT_REST: RetryPolicy(max_attempts=5, timeout=8.0),
-            ApiType.SSH: RetryPolicy(max_attempts=3, timeout=15.0),
-            ApiType.HTTP_DOWNLOAD: RetryPolicy(max_attempts=3, timeout=30.0),
-        }
-        policy = default_policies.get(api_type, RetryPolicy())
+    policy = _resolve_retry_policy(api_type, policy)
 
     def decorator(func: Callable[..., _T]) -> Callable[..., _T]:
         @functools.wraps(func)
@@ -347,55 +465,14 @@ def external_api_call(
                     last_exc = exc
                     duration = time.time() - context.start_time
 
-                    # Determine if this error should be retried
-                    is_transient = _is_transient_error(exc, api_type)
-                    is_final_attempt = attempt == policy.max_attempts
-
-                    if is_transient and not is_final_attempt:
-                        # Retry case
-                        delay = _calculate_backoff_delay(
-                            attempt,
-                            policy.base_delay,
-                            policy.max_delay,
-                            policy.jitter_factor,
-                        )
-                        log.warning(
-                            "[%s] %s attempt %d/%d failed (%.2fs): %s; "
-                            "retrying in %.2fs",
-                            api_type.value,
-                            operation,
-                            attempt,
-                            policy.max_attempts,
-                            duration,
-                            exc,
-                            delay,
-                        )
-                        time.sleep(delay)
+                    if _retry_after_transient(
+                        exc, context, api_type, operation, policy, duration
+                    ):
                         continue
                     # Final failure - log and re-raise
-                    reason = (
-                        "final attempt" if is_final_attempt else "non-retryable"
+                    _log_final_failure(
+                        exc, context, api_type, operation, policy, duration
                     )
-                    failure_msg = (
-                        f"[{api_type.value}] {operation} failed ({reason}) "
-                        f"after {attempt} attempt(s) in {duration:.2f}s: "
-                        f"{target}"
-                    )
-                    # Authentication/authorization failures (Gerrit REST
-                    # 401/403) are surfaced once, closer to the request, as a
-                    # concise warning. Avoid emitting a duplicate error/
-                    # traceback for them here. Scope this strictly to Gerrit
-                    # REST: other API types (e.g. GitHub) may also expose a
-                    # ``.status`` attribute, and their auth/permission
-                    # failures must retain error-level visibility.
-                    is_gerrit_auth_failure = (
-                        api_type == ApiType.GERRIT_REST
-                        and getattr(exc, "status", None) in (401, 403)
-                    )
-                    if is_gerrit_auth_failure:
-                        log.debug(failure_msg)
-                    else:
-                        log_exception_conditionally(log, failure_msg)
                     _update_metrics(api_type, context, success=False, exc=exc)
                     raise
                 else:

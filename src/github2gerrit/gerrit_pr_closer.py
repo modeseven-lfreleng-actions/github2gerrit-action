@@ -8,13 +8,20 @@ This module provides functionality to detect when a Gerrit change has been
 merged and close the corresponding GitHub pull request that originated it.
 """
 
+# aislop-ignore-file complexity/file-too-large -- this module concentrates the
+# Gerrit-merge detection and PR-closing flow. Its overly long functions and
+# deep nesting are decomposed here; splitting the module is a dedicated
+# follow-up refactor tracked separately.
+
 from __future__ import annotations
 
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 from typing import Literal
+from typing import cast
 
 from .constants import GERRIT_CHANGE_URL_PATTERN
 from .constants import GITHUB_PR_URL_PATTERN
@@ -53,6 +60,24 @@ def _env_bool(key: str, default: bool = True) -> bool:
 
 FORCE_ABANDONED_CLEANUP = _env_bool("CLEANUP_ABANDONED", True)
 FORCE_GERRIT_CLEANUP = _env_bool("CLEANUP_GERRIT", True)
+
+
+@dataclass(frozen=True)
+class _GerritTarget:
+    """Bundle of the Gerrit client and the change's location."""
+
+    client: Any
+    server: str
+    project: str
+
+
+@dataclass(frozen=True)
+class _SupersessionContext:
+    """Details of the newer change driving a supersession sweep."""
+
+    package: str
+    subject: str
+    exclude_change_ids: list[str]
 
 
 def _build_gerrit_change_url(
@@ -385,6 +410,156 @@ def extract_pr_info_for_display(
         return pr_info
 
 
+def _fetch_open_pr_for_status(
+    repo_obj: Any,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> Any | None:
+    """Fetch the PR object, returning None when nothing should be closed.
+
+    Returns None when the PR is missing, cannot be fetched, or is already
+    closed; the caller treats None as "nothing to do".
+    """
+    try:
+        pr_obj = get_pull(repo_obj, pr_number)
+    except Exception as exc:
+        # PR not found or API error - log as info, not error
+        if "404" in str(exc) or "Not Found" in str(exc):
+            log.info(
+                "GitHub PR #%d not found in %s/%s - may have been deleted",
+                pr_number,
+                owner,
+                repo,
+            )
+        else:
+            # Other API errors should still be logged but not fatal
+            log.warning(
+                "Could not fetch GitHub PR #%d: %s - skipping",
+                pr_number,
+                exc,
+            )
+        return None
+
+    # Check if PR is already closed
+    pr_state = getattr(pr_obj, "state", "unknown")
+    if pr_state == "closed":
+        log.info(
+            "GitHub PR #%d is already closed - nothing to do",
+            pr_number,
+        )
+        return None
+
+    return pr_obj
+
+
+def _determine_pr_close_action(
+    gerrit_status: Literal["MERGED", "ABANDONED", "NEW", "UNKNOWN"],
+    gerrit_change_url: str | None,
+    *,
+    close_merged_prs: bool,
+) -> tuple[bool, str] | None:
+    """Decide whether to close the PR and which comment to post.
+
+    Returns ``(should_close, comment)``, or ``None`` when the caller
+    should take no action.
+    """
+    if gerrit_status == "ABANDONED":
+        if close_merged_prs:
+            # Close PR with abandoned comment
+            return True, _build_abandoned_comment(gerrit_change_url)
+        # Comment only, don't close
+        return (
+            False,
+            _build_abandoned_notification_comment(gerrit_change_url),
+        )
+
+    # For MERGED, NEW, or UNKNOWN status with close_merged_prs=True
+    if close_merged_prs:
+        return True, _build_closure_comment(gerrit_change_url)
+
+    # close_merged_prs=False, don't close for merged either
+    log.info(
+        "Skipping PR closure (CLOSE_MERGED_PRS=false) for status: %s",
+        gerrit_status,
+    )
+    return None
+
+
+def _apply_pr_close_action(
+    pr_obj: Any,
+    pr_number: int,
+    comment: str,
+    gerrit_change_url: str | None,
+    *,
+    should_close: bool,
+) -> None:
+    """Close the PR or add a comment based on the resolved action."""
+    if not should_close:
+        # Comment only, don't close
+        log.debug(
+            "Adding abandoned notification comment to PR #%d...", pr_number
+        )
+        create_pr_comment(pr_obj, comment)
+        log.debug(
+            "SUCCESS: Added comment to PR #%d (PR remains open)", pr_number
+        )
+        return
+
+    log.debug("Closing GitHub PR #%d...", pr_number)
+    close_pr(pr_obj, comment=comment)
+    log.debug("SUCCESS: Closed GitHub PR #%d", pr_number)
+
+    gerrit_change_number = "unknown"
+    if gerrit_change_url:
+        match = re.search(r"/c/[^/]+/\+/(\d+)", gerrit_change_url)
+        if match:
+            gerrit_change_number = match.group(1)
+
+    # Console and log output for closed PR
+    close_message = (
+        f"🛑 Closed pull request #{pr_number} with abandoned "
+        f"Gerrit change {gerrit_change_number}"
+    )
+    safe_console_print(close_message)
+    log.debug(close_message)
+
+
+def _log_unexpected_close_error(exc: Exception, pr_number: int) -> None:
+    """Log an unexpected error raised while closing a PR."""
+    # Catch unexpected errors with detailed context for debugging
+    # Common cases: network issues, auth failures, API rate limits
+    error_type = type(exc).__name__
+    error_details = str(exc)
+
+    if "401" in error_details or "403" in error_details:
+        log.exception(
+            "Authentication/authorization error while closing PR #%d: "
+            "%s - check GitHub token permissions",
+            pr_number,
+            error_details,
+        )
+    elif "404" in error_details:
+        log.warning(
+            "PR #%d not found or repository inaccessible: %s",
+            pr_number,
+            error_details,
+        )
+    elif "rate limit" in error_details.lower():
+        log.exception(
+            "GitHub API rate limit exceeded while processing PR #%d: %s",
+            pr_number,
+            error_details,
+        )
+    else:
+        log.exception(
+            "Unexpected error (%s) while closing PR #%d: %s",
+            error_type,
+            pr_number,
+            error_details,
+        )
+
+
 def close_pr_with_status(
     pr_url: str,
     gerrit_change_url: str | None,
@@ -426,33 +601,8 @@ def close_pr_with_status(
         # Get the specific repository (not from env, might be different)
         repo_obj = client.get_repo(f"{owner}/{repo}")
 
-        try:
-            pr_obj = get_pull(repo_obj, pr_number)
-        except Exception as exc:
-            # PR not found or API error - log as info, not error
-            if "404" in str(exc) or "Not Found" in str(exc):
-                log.info(
-                    "GitHub PR #%d not found in %s/%s - may have been deleted",
-                    pr_number,
-                    owner,
-                    repo,
-                )
-            else:
-                # Other API errors should still be logged but not fatal
-                log.warning(
-                    "Could not fetch GitHub PR #%d: %s - skipping",
-                    pr_number,
-                    exc,
-                )
-            return False
-
-        # Check if PR is already closed
-        pr_state = getattr(pr_obj, "state", "unknown")
-        if pr_state == "closed":
-            log.info(
-                "GitHub PR #%d is already closed - nothing to do",
-                pr_number,
-            )
+        pr_obj = _fetch_open_pr_for_status(repo_obj, owner, repo, pr_number)
+        if pr_obj is None:
             return False
 
         pr_info = extract_pr_info_for_display(pr_obj, owner, repo, pr_number)
@@ -461,33 +611,14 @@ def close_pr_with_status(
         )
 
         # Determine action based on Gerrit status and close_merged_prs setting
-        should_close = False
-        comment = ""
-
-        if gerrit_status == "ABANDONED":
-            if close_merged_prs:
-                # Close PR with abandoned comment
-                should_close = True
-                comment = _build_abandoned_comment(gerrit_change_url)
-            else:
-                # Comment only, don't close
-                should_close = False
-                comment = _build_abandoned_notification_comment(
-                    gerrit_change_url
-                )
-        else:
-            # For MERGED, NEW, or UNKNOWN status with close_merged_prs=True
-            if close_merged_prs:
-                should_close = True
-                comment = _build_closure_comment(gerrit_change_url)
-            else:
-                # close_merged_prs=False, don't close for merged either
-                log.info(
-                    "Skipping PR closure (CLOSE_MERGED_PRS=false) for "
-                    "status: %s",
-                    gerrit_status,
-                )
-                return False
+        action = _determine_pr_close_action(
+            gerrit_status,
+            gerrit_change_url,
+            close_merged_prs=close_merged_prs,
+        )
+        if action is None:
+            return False
+        should_close, comment = action
 
         if dry_run:
             if should_close:
@@ -498,34 +629,13 @@ def close_pr_with_status(
                 )
             return True
 
-        # Add comment and optionally close the PR
-        if should_close:
-            log.debug("Closing GitHub PR #%d...", pr_number)
-            close_pr(pr_obj, comment=comment)
-            log.debug("SUCCESS: Closed GitHub PR #%d", pr_number)
-
-            gerrit_change_number = "unknown"
-            if gerrit_change_url:
-                match = re.search(r"/c/[^/]+/\+/(\d+)", gerrit_change_url)
-                if match:
-                    gerrit_change_number = match.group(1)
-
-            # Console and log output for closed PR
-            close_message = (
-                f"🛑 Closed pull request #{pr_number} with abandoned "
-                f"Gerrit change {gerrit_change_number}"
-            )
-            safe_console_print(close_message)
-            log.debug(close_message)
-        else:
-            # Comment only, don't close
-            log.debug(
-                "Adding abandoned notification comment to PR #%d...", pr_number
-            )
-            create_pr_comment(pr_obj, comment)
-            log.debug(
-                "SUCCESS: Added comment to PR #%d (PR remains open)", pr_number
-            )
+        _apply_pr_close_action(
+            pr_obj,
+            pr_number,
+            comment,
+            gerrit_change_url,
+            should_close=should_close,
+        )
 
     except GitHub2GerritError as exc:
         # Our structured errors - log as warning but don't fail the workflow
@@ -536,38 +646,7 @@ def close_pr_with_status(
         )
         return False
     except Exception as exc:
-        # Catch unexpected errors with detailed context for debugging
-        # Common cases: network issues, auth failures, API rate limits
-        error_type = type(exc).__name__
-        error_details = str(exc)
-
-        if "401" in error_details or "403" in error_details:
-            log.exception(
-                "Authentication/authorization error while closing PR #%d: "
-                "%s - check GitHub token permissions",
-                pr_number,
-                error_details,
-            )
-        elif "404" in error_details:
-            log.warning(
-                "PR #%d not found or repository inaccessible: %s",
-                pr_number,
-                error_details,
-            )
-        elif "rate limit" in error_details.lower():
-            log.exception(
-                "GitHub API rate limit exceeded while processing PR #%d: %s",
-                pr_number,
-                error_details,
-            )
-        else:
-            log.exception(
-                "Unexpected error (%s) while closing PR #%d: %s",
-                error_type,
-                pr_number,
-                error_details,
-            )
-
+        _log_unexpected_close_error(exc, pr_number)
         return False
     else:
         return True
@@ -1050,6 +1129,271 @@ def cleanup_abandoned_prs_bulk(
         return closed_count
 
 
+def _find_matching_gerrit_change(
+    changes_data: list[Any],
+    pr_url: str,
+) -> dict[str, Any] | None:
+    """Return the first open change whose GitHub-PR trailer matches.
+
+    Scans ``changes_data`` and returns the change dict whose current
+    commit message carries a ``GitHub-PR`` trailer equal to ``pr_url``.
+    """
+    for change_data in changes_data:
+        try:
+            current_revision = change_data.get("current_revision", "")
+            if not current_revision:
+                continue
+
+            revisions = change_data.get("revisions", {})
+            revision_data = revisions.get(current_revision, {})
+            commit_data = revision_data.get("commit", {})
+            commit_message = commit_data.get("message", "")
+
+            if not commit_message:
+                continue
+
+            trailers = parse_trailers(commit_message)
+            pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
+
+            # Check if this change matches our PR
+            if pr_url in pr_urls:
+                log.info(
+                    "Found matching Gerrit change: %s",
+                    change_data.get("_number", ""),
+                )
+                return cast("dict[str, Any]", change_data)
+
+        except Exception as exc:
+            log.debug(
+                "Error checking change %s: %s",
+                change_data.get("_number", "unknown"),
+                exc,
+            )
+            continue
+
+    return None
+
+
+def _collect_pr_closure_comments(pr_obj: Any) -> list[str]:
+    """Collect up to the last three PR comments as formatted strings."""
+    closure_comments: list[str] = []
+    try:
+        issue = pr_obj.as_issue()
+        comments = list(issue.get_comments())
+
+        # Get the last few comments (in case PR was closed with
+        # a comment). We'll take up to the last 3 comments to
+        # capture context
+        if comments:
+            recent_comments = comments[-3:]
+            for comment in recent_comments:
+                comment_body = getattr(comment, "body", "") or ""
+                comment_author = (
+                    getattr(
+                        getattr(comment, "user", None),
+                        "login",
+                        "Unknown",
+                    )
+                    or "Unknown"
+                )
+                if comment_body.strip():
+                    closure_comments.append(
+                        f"Comment by {comment_author}:\n{comment_body}"
+                    )
+    except Exception as exc:
+        log.debug("Error getting PR comments: %s", exc)
+    return closure_comments
+
+
+def _build_pr_closure_abandon_message(
+    pr_number: int,
+    pr_url: str,
+    closure_comments: list[str],
+) -> str:
+    """Build the Gerrit abandon message for a closed PR with comments."""
+    abandon_message_lines = [
+        f"GitHub pull request #{pr_number} was closed",
+        "",
+        f"PR URL: {pr_url}",
+    ]
+
+    # Add closure comments if any
+    if closure_comments:
+        abandon_message_lines.extend(["", "Comments when closing:"])
+        for idx, comment_text in enumerate(closure_comments, 1):
+            # Sanitize the comment
+            sanitized = sanitize_gerrit_comment(comment_text)
+            if sanitized:
+                abandon_message_lines.extend(
+                    [
+                        "",
+                        f"--- Comment {idx} ---",
+                        sanitized,
+                    ]
+                )
+        abandon_message_lines.append("---")
+
+    abandon_message_lines.extend(
+        [
+            "",
+            (
+                "This change was automatically abandoned by "
+                "GitHub2Gerrit because the source pull request "
+                "was closed."
+            ),
+        ]
+    )
+
+    return "\n".join(abandon_message_lines)
+
+
+def _perform_pr_closure_abandon(
+    target: _GerritTarget,
+    change_number: Any,
+    pr_number: int,
+    abandon_message: str,
+    *,
+    dry_run: bool,
+) -> None:
+    """Abandon the change (or log the dry-run) for the primary path."""
+    if dry_run:
+        log.debug(
+            "DRY-RUN: Would abandon Gerrit change %s",
+            change_number,
+        )
+        log.debug("Abandon message would be:\n%s", abandon_message)
+        return
+
+    gerrit_change_url = _build_gerrit_change_url(
+        target.server, target.project, change_number
+    )
+    _abandon_gerrit_change(
+        target.client,
+        change_number,
+        abandon_message,
+    )
+    if gerrit_change_url:
+        log.debug(
+            "Abandoned Gerrit change %s: %s",
+            change_number,
+            gerrit_change_url,
+        )
+        safe_console_print(
+            f"✅ Abandoned Gerrit change "
+            f"{gerrit_change_url} "
+            f"for pull request #{pr_number}"
+        )
+    else:
+        log.debug(
+            "Abandoned Gerrit change %s",
+            change_number,
+        )
+        safe_console_print(
+            f"✅ Abandoned Gerrit change "
+            f"{change_number} "
+            f"for pull request #{pr_number}"
+        )
+
+
+def _perform_pr_closure_abandon_fallback(
+    target: _GerritTarget,
+    change_number: Any,
+    pr_number: int,
+    pr_url: str,
+    *,
+    dry_run: bool,
+) -> None:
+    """Abandon the change with a simple message when PR lookup failed."""
+    # Fall back to simple abandon message
+    simple_message = (
+        f"GitHub pull request #{pr_number} was closed\n\n"
+        f"PR URL: {pr_url}\n\n"
+        "This change was automatically abandoned by GitHub2Gerrit "
+        "because the source pull request was closed."
+    )
+
+    if dry_run:
+        log.debug(
+            "DRY-RUN: Would abandon Gerrit change %s",
+            change_number,
+        )
+        return
+
+    gerrit_change_url = _build_gerrit_change_url(
+        target.server, target.project, change_number
+    )
+    _abandon_gerrit_change(
+        target.client,
+        change_number,
+        simple_message,
+    )
+    log.debug("Abandoned Gerrit change %s", change_number)
+    if gerrit_change_url:
+        safe_console_print(
+            f"✅ Abandoned Gerrit change "
+            f"{gerrit_change_url} "
+            f"for pull request #{pr_number}"
+        )
+    else:
+        safe_console_print(
+            f"✅ Abandoned Gerrit change "
+            f"{change_number} "
+            f"for pull request #{pr_number}"
+        )
+
+
+def _abandon_matched_change_for_closed_pr(
+    target: _GerritTarget,
+    change_number: Any,
+    pr_number: int,
+    pr_url: str,
+    repository: str,
+    *,
+    dry_run: bool,
+) -> str:
+    """Abandon ``change_number`` for a closed PR, capturing PR comments.
+
+    Falls back to a simple abandon message when PR details cannot be
+    fetched. Returns the change number as a string.
+    """
+    try:
+        client = build_client()
+        repo_obj = client.get_repo(repository)
+        pr_obj = get_pull(repo_obj, pr_number)
+
+        closure_comments = _collect_pr_closure_comments(pr_obj)
+        abandon_message = _build_pr_closure_abandon_message(
+            pr_number, pr_url, closure_comments
+        )
+
+        # Abandon the Gerrit change
+        _perform_pr_closure_abandon(
+            target,
+            change_number,
+            pr_number,
+            abandon_message,
+            dry_run=dry_run,
+        )
+
+        return str(change_number)
+
+    except Exception as exc:
+        log.warning(
+            "Error getting PR #%d details: %s",
+            pr_number,
+            exc,
+        )
+        _perform_pr_closure_abandon_fallback(
+            target,
+            change_number,
+            pr_number,
+            pr_url,
+            dry_run=dry_run,
+        )
+
+        return str(change_number)
+
+
 def abandon_gerrit_change_for_closed_pr(
     pr_number: int,
     gerrit_server: str,
@@ -1106,40 +1450,7 @@ def abandon_gerrit_change_for_closed_pr(
             return None
 
         # Find the change with matching PR URL
-        matching_change = None
-        for change_data in changes_data:
-            try:
-                current_revision = change_data.get("current_revision", "")
-                if not current_revision:
-                    continue
-
-                revisions = change_data.get("revisions", {})
-                revision_data = revisions.get(current_revision, {})
-                commit_data = revision_data.get("commit", {})
-                commit_message = commit_data.get("message", "")
-
-                if not commit_message:
-                    continue
-
-                trailers = parse_trailers(commit_message)
-                pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
-
-                # Check if this change matches our PR
-                if pr_url in pr_urls:
-                    matching_change = change_data
-                    log.info(
-                        "Found matching Gerrit change: %s",
-                        change_data.get("_number", ""),
-                    )
-                    break
-
-            except Exception as exc:
-                log.debug(
-                    "Error checking change %s: %s",
-                    change_data.get("_number", "unknown"),
-                    exc,
-                )
-                continue
+        matching_change = _find_matching_gerrit_change(changes_data, pr_url)
 
         if not matching_change:
             log.debug(
@@ -1158,156 +1469,14 @@ def abandon_gerrit_change_for_closed_pr(
             pr_number,
         )
 
-        try:
-            client = build_client()
-            repo_obj = client.get_repo(repository)
-            pr_obj = get_pull(repo_obj, pr_number)
-
-            closure_comments = []
-            try:
-                issue = pr_obj.as_issue()
-                comments = list(issue.get_comments())
-
-                # Get the last few comments (in case PR was closed with
-                # a comment). We'll take up to the last 3 comments to
-                # capture context
-                if comments:
-                    recent_comments = comments[-3:]
-                    for comment in recent_comments:
-                        comment_body = getattr(comment, "body", "") or ""
-                        comment_author = (
-                            getattr(
-                                getattr(comment, "user", None),
-                                "login",
-                                "Unknown",
-                            )
-                            or "Unknown"
-                        )
-                        if comment_body.strip():
-                            closure_comments.append(
-                                f"Comment by {comment_author}:\n{comment_body}"
-                            )
-            except Exception as exc:
-                log.debug("Error getting PR comments: %s", exc)
-
-            abandon_message_lines = [
-                f"GitHub pull request #{pr_number} was closed",
-                "",
-                f"PR URL: {pr_url}",
-            ]
-
-            # Add closure comments if any
-            if closure_comments:
-                abandon_message_lines.extend(["", "Comments when closing:"])
-                for idx, comment_text in enumerate(closure_comments, 1):
-                    # Sanitize the comment
-                    sanitized = sanitize_gerrit_comment(comment_text)
-                    if sanitized:
-                        abandon_message_lines.extend(
-                            [
-                                "",
-                                f"--- Comment {idx} ---",
-                                sanitized,
-                            ]
-                        )
-                abandon_message_lines.append("---")
-
-            abandon_message_lines.extend(
-                [
-                    "",
-                    (
-                        "This change was automatically abandoned by "
-                        "GitHub2Gerrit because the source pull request "
-                        "was closed."
-                    ),
-                ]
-            )
-
-            abandon_message = "\n".join(abandon_message_lines)
-
-            # Abandon the Gerrit change
-            if not dry_run:
-                gerrit_change_url = _build_gerrit_change_url(
-                    gerrit_server, gerrit_project, change_number
-                )
-                _abandon_gerrit_change(
-                    gerrit_client,
-                    change_number,
-                    abandon_message,
-                )
-                if gerrit_change_url:
-                    log.debug(
-                        "Abandoned Gerrit change %s: %s",
-                        change_number,
-                        gerrit_change_url,
-                    )
-                    safe_console_print(
-                        f"✅ Abandoned Gerrit change "
-                        f"{gerrit_change_url} "
-                        f"for pull request #{pr_number}"
-                    )
-                else:
-                    log.debug(
-                        "Abandoned Gerrit change %s",
-                        change_number,
-                    )
-                    safe_console_print(
-                        f"✅ Abandoned Gerrit change "
-                        f"{change_number} "
-                        f"for pull request #{pr_number}"
-                    )
-            else:
-                log.debug(
-                    "DRY-RUN: Would abandon Gerrit change %s",
-                    change_number,
-                )
-                log.debug("Abandon message would be:\n%s", abandon_message)
-
-            return str(change_number)
-
-        except Exception as exc:
-            log.warning(
-                "Error getting PR #%d details: %s",
-                pr_number,
-                exc,
-            )
-            # Fall back to simple abandon message
-            simple_message = (
-                f"GitHub pull request #{pr_number} was closed\n\n"
-                f"PR URL: {pr_url}\n\n"
-                "This change was automatically abandoned by GitHub2Gerrit "
-                "because the source pull request was closed."
-            )
-
-            if not dry_run:
-                gerrit_change_url = _build_gerrit_change_url(
-                    gerrit_server, gerrit_project, change_number
-                )
-                _abandon_gerrit_change(
-                    gerrit_client,
-                    change_number,
-                    simple_message,
-                )
-                log.debug("Abandoned Gerrit change %s", change_number)
-                if gerrit_change_url:
-                    safe_console_print(
-                        f"✅ Abandoned Gerrit change "
-                        f"{gerrit_change_url} "
-                        f"for pull request #{pr_number}"
-                    )
-                else:
-                    safe_console_print(
-                        f"✅ Abandoned Gerrit change "
-                        f"{change_number} "
-                        f"for pull request #{pr_number}"
-                    )
-            else:
-                log.debug(
-                    "DRY-RUN: Would abandon Gerrit change %s",
-                    change_number,
-                )
-
-            return str(change_number)
+        return _abandon_matched_change_for_closed_pr(
+            _GerritTarget(gerrit_client, gerrit_server, gerrit_project),
+            change_number,
+            pr_number,
+            pr_url,
+            repository,
+            dry_run=dry_run,
+        )
 
     except Exception:
         log.exception(
@@ -1315,6 +1484,185 @@ def abandon_gerrit_change_for_closed_pr(
             pr_number,
         )
         return None
+
+
+def _extract_pr_url_from_change(
+    change_data: dict[str, Any],
+    change_number: Any,
+) -> str | None:
+    """Extract the GitHub PR URL from a change's current commit trailers.
+
+    Returns the last ``GitHub-PR`` trailer value, or ``None`` when the
+    change lacks a current revision, commit message, or trailer.
+    """
+    current_revision = change_data.get("current_revision", "")
+    if not current_revision:
+        log.debug(
+            "No current revision for change %s - skipping",
+            change_number,
+        )
+        return None
+
+    revisions = change_data.get("revisions", {})
+    revision_data = revisions.get(current_revision, {})
+    commit_data = revision_data.get("commit", {})
+    commit_message = commit_data.get("message", "")
+
+    if not commit_message:
+        log.debug(
+            "No commit message for change %s - skipping",
+            change_number,
+        )
+        return None
+
+    trailers = parse_trailers(commit_message)
+    pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
+
+    if not pr_urls:
+        log.debug(
+            "No GitHub-PR trailer in change %s - skipping",
+            change_number,
+        )
+        return None
+
+    pr_url = pr_urls[-1]  # Take the last one if multiple
+    log.debug(
+        "Found GitHub PR URL in change %s: %s",
+        change_number,
+        pr_url,
+    )
+    return pr_url
+
+
+def _perform_cleanup_abandon(
+    target: _GerritTarget,
+    change_number: Any,
+    abandon_message: str,
+    *,
+    dry_run: bool,
+) -> None:
+    """Abandon the change (or log the dry-run) during PR cleanup."""
+    if dry_run:
+        log.info(
+            "DRY-RUN: Would abandon Gerrit change %s",
+            change_number,
+        )
+        return
+
+    gerrit_change_url = _build_gerrit_change_url(
+        target.server, target.project, change_number
+    )
+    _abandon_gerrit_change(
+        target.client,
+        change_number,
+        abandon_message,
+    )
+    if gerrit_change_url:
+        log.info(
+            "Abandoned Gerrit change %s: %s",
+            change_number,
+            gerrit_change_url,
+        )
+    else:
+        log.info(
+            "Abandoned Gerrit change %s",
+            change_number,
+        )
+
+
+def _abandon_change_if_pr_closed(
+    target: _GerritTarget,
+    change_number: Any,
+    pr_url: str,
+    repo_full: str,
+    pr_number: int,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Abandon the change when its GitHub PR is closed.
+
+    Returns True when the change was abandoned (or would be in dry-run),
+    False when the PR is still open.
+    """
+    client = build_client()
+    repo_obj = client.get_repo(repo_full)
+    pr_obj = get_pull(repo_obj, pr_number)
+
+    pr_state = getattr(pr_obj, "state", "unknown")
+
+    if pr_state != "closed":
+        log.debug(
+            "GitHub PR #%d is %s - no action needed",
+            pr_number,
+            pr_state,
+        )
+        return False
+
+    log.info(
+        "GitHub PR #%d is closed, will abandon Gerrit change %s",
+        pr_number,
+        change_number,
+    )
+
+    # Determine closure reason and build comment
+    abandon_message = _build_gerrit_abandon_message(pr_obj, pr_url)
+
+    # Abandon the Gerrit change
+    _perform_cleanup_abandon(
+        target,
+        change_number,
+        abandon_message,
+        dry_run=dry_run,
+    )
+    return True
+
+
+def _process_change_for_pr_cleanup(
+    change_data: dict[str, Any],
+    target: _GerritTarget,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Abandon one open change if its GitHub PR is closed.
+
+    Returns True when the change was abandoned (or would be in dry-run).
+    """
+    change_number = change_data.get("_number", "")
+    subject = change_data.get("subject", "")
+
+    log.debug("Checking Gerrit change %s (%s)", change_number, subject)
+
+    pr_url = _extract_pr_url_from_change(change_data, change_number)
+    if not pr_url:
+        return False
+
+    parsed = parse_pr_url(pr_url)
+    if not parsed:
+        log.debug(
+            "Invalid GitHub PR URL format in change %s: %s",
+            change_number,
+            pr_url,
+        )
+        return False
+
+    owner, repo, pr_number = parsed
+
+    try:
+        return _abandon_change_if_pr_closed(
+            target,
+            change_number,
+            pr_url,
+            f"{owner}/{repo}",
+            pr_number,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        log.warning(
+            "Error checking GitHub PR #%d: %s - skipping",
+            pr_number,
+            exc,
+        )
+        return False
 
 
 def cleanup_closed_github_prs(
@@ -1377,125 +1725,12 @@ def cleanup_closed_github_prs(
 
         for change_data in changes_data:
             try:
-                change_number = change_data.get("_number", "")
-                subject = change_data.get("subject", "")
-
-                log.debug(
-                    "Checking Gerrit change %s (%s)", change_number, subject
-                )
-
-                current_revision = change_data.get("current_revision", "")
-                if not current_revision:
-                    log.debug(
-                        "No current revision for change %s - skipping",
-                        change_number,
-                    )
-                    continue
-
-                revisions = change_data.get("revisions", {})
-                revision_data = revisions.get(current_revision, {})
-                commit_data = revision_data.get("commit", {})
-                commit_message = commit_data.get("message", "")
-
-                if not commit_message:
-                    log.debug(
-                        "No commit message for change %s - skipping",
-                        change_number,
-                    )
-                    continue
-
-                trailers = parse_trailers(commit_message)
-                pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
-
-                if not pr_urls:
-                    log.debug(
-                        "No GitHub-PR trailer in change %s - skipping",
-                        change_number,
-                    )
-                    continue
-
-                pr_url = pr_urls[-1]  # Take the last one if multiple
-                log.debug(
-                    "Found GitHub PR URL in change %s: %s",
-                    change_number,
-                    pr_url,
-                )
-
-                parsed = parse_pr_url(pr_url)
-                if not parsed:
-                    log.debug(
-                        "Invalid GitHub PR URL format in change %s: %s",
-                        change_number,
-                        pr_url,
-                    )
-                    continue
-
-                owner, repo, pr_number = parsed
-
-                try:
-                    client = build_client()
-                    repo_obj = client.get_repo(f"{owner}/{repo}")
-                    pr_obj = get_pull(repo_obj, pr_number)
-
-                    pr_state = getattr(pr_obj, "state", "unknown")
-
-                    if pr_state != "closed":
-                        log.debug(
-                            "GitHub PR #%d is %s - no action needed",
-                            pr_number,
-                            pr_state,
-                        )
-                        continue
-
-                    log.info(
-                        "GitHub PR #%d is closed, will abandon Gerrit "
-                        "change %s",
-                        pr_number,
-                        change_number,
-                    )
-
-                    # Determine closure reason and build comment
-                    abandon_message = _build_gerrit_abandon_message(
-                        pr_obj, pr_url
-                    )
-
-                    # Abandon the Gerrit change
-                    if not dry_run:
-                        gerrit_change_url = _build_gerrit_change_url(
-                            gerrit_server, gerrit_project, change_number
-                        )
-                        _abandon_gerrit_change(
-                            gerrit_client,
-                            change_number,
-                            abandon_message,
-                        )
-                        if gerrit_change_url:
-                            log.info(
-                                "Abandoned Gerrit change %s: %s",
-                                change_number,
-                                gerrit_change_url,
-                            )
-                        else:
-                            log.info(
-                                "Abandoned Gerrit change %s",
-                                change_number,
-                            )
-                    else:
-                        log.info(
-                            "DRY-RUN: Would abandon Gerrit change %s",
-                            change_number,
-                        )
-
+                if _process_change_for_pr_cleanup(
+                    change_data,
+                    _GerritTarget(gerrit_client, gerrit_server, gerrit_project),
+                    dry_run=dry_run,
+                ):
                     abandoned_count += 1
-
-                except Exception as exc:
-                    log.warning(
-                        "Error checking GitHub PR #%d: %s - skipping",
-                        pr_number,
-                        exc,
-                    )
-                    continue
-
             except Exception as exc:
                 log.warning(
                     "Error processing Gerrit change %s: %s - skipping",
@@ -1732,6 +1967,100 @@ def _abandon_gerrit_change(
         raise
 
 
+def _build_supersession_abandon_message(
+    ctx: _SupersessionContext,
+) -> str:
+    """Build the abandon message for a superseded dependency change."""
+    superseding_info = f"New change subject: {ctx.subject}"
+    if ctx.exclude_change_ids:
+        superseding_info += "\nChange-Id(s): " + ", ".join(
+            str(cid) for cid in ctx.exclude_change_ids
+        )
+    return (
+        f"Superseded by a newer update for {ctx.package}\n\n"
+        f"{superseding_info}\n\n"
+        "This change was automatically abandoned by "
+        "GitHub2Gerrit because a newer dependency update "
+        "for the same package was pushed."
+    )
+
+
+def _process_superseded_candidate(
+    change: Any,
+    client: Any,
+    url_builder: Any,
+    gerrit_project: str,
+    ctx: _SupersessionContext,
+    *,
+    dry_run: bool,
+) -> str | None:
+    """Abandon ``change`` when it is superseded by the newer update.
+
+    Returns the change number as a string when abandoned (or would be in
+    dry-run), and ``None`` when the change is skipped or abandon fails.
+    """
+    from .similarity import extract_dependency_package_from_subject
+
+    # Skip the change(s) we just pushed
+    if change.change_id in ctx.exclude_change_ids:
+        return None
+
+    # Only target changes created by GitHub2Gerrit
+    commit_msg = change.commit_message or ""
+    trailers = parse_trailers(commit_msg)
+    if GITHUB_PR_TRAILER not in trailers:
+        log.debug(
+            "Skipping change %s: no GitHub2Gerrit "
+            "metadata (missing %s trailer)",
+            change.number,
+            GITHUB_PR_TRAILER,
+        )
+        return None
+
+    candidate_pkg = extract_dependency_package_from_subject(change.subject)
+    if not candidate_pkg or candidate_pkg != ctx.package:
+        return None
+
+    try:
+        candidate_num = int(change.number)
+    except (TypeError, ValueError):
+        log.debug(
+            "Skipping change with unparsable number: %r",
+            change.number,
+        )
+        return None
+
+    change_url = url_builder.change_url(gerrit_project, candidate_num)
+    log.info(
+        "Found superseded change %s (%s)",
+        change.number,
+        change.subject,
+    )
+
+    if dry_run:
+        log.info(
+            "DRY-RUN: Would abandon superseded change %s",
+            change_url,
+        )
+        return str(change.number)
+
+    abandon_msg = _build_supersession_abandon_message(ctx)
+    try:
+        _abandon_gerrit_change(client, str(change.number), abandon_msg)
+        log.info(
+            "Abandoned superseded change: %s",
+            change_url,
+        )
+        return str(change.number)
+    except Exception as exc:
+        log.warning(
+            "Failed to abandon superseded change %s: %s",
+            change_url,
+            exc,
+        )
+        return None
+
+
 def abandon_superseded_dependency_changes(
     gerrit_server: str,
     gerrit_project: str,
@@ -1775,8 +2104,6 @@ def abandon_superseded_dependency_changes(
     from .gerrit_rest import build_client_for_host
     from .gerrit_urls import create_gerrit_url_builder
     from .similarity import extract_dependency_package_from_subject
-    from .trailers import GITHUB_PR_TRAILER
-    from .trailers import parse_trailers
 
     current_pkg = extract_dependency_package_from_subject(current_subject)
     if not current_pkg:
@@ -1804,78 +2131,22 @@ def abandon_superseded_dependency_changes(
 
         url_builder = create_gerrit_url_builder(gerrit_server)
 
+        ctx = _SupersessionContext(
+            package=current_pkg,
+            subject=current_subject,
+            exclude_change_ids=exclude_change_ids,
+        )
         for change in open_changes:
-            # Skip the change(s) we just pushed
-            if change.change_id in exclude_change_ids:
-                continue
-
-            # Only target changes created by GitHub2Gerrit
-            commit_msg = change.commit_message or ""
-            trailers = parse_trailers(commit_msg)
-            if GITHUB_PR_TRAILER not in trailers:
-                log.debug(
-                    "Skipping change %s: no GitHub2Gerrit "
-                    "metadata (missing %s trailer)",
-                    change.number,
-                    GITHUB_PR_TRAILER,
-                )
-                continue
-
-            candidate_pkg = extract_dependency_package_from_subject(
-                change.subject
+            result = _process_superseded_candidate(
+                change,
+                client,
+                url_builder,
+                gerrit_project,
+                ctx,
+                dry_run=dry_run,
             )
-            if not candidate_pkg or candidate_pkg != current_pkg:
-                continue
-
-            try:
-                candidate_num = int(change.number)
-            except (TypeError, ValueError):
-                log.debug(
-                    "Skipping change with unparsable number: %r",
-                    change.number,
-                )
-                continue
-
-            change_url = url_builder.change_url(gerrit_project, candidate_num)
-            log.info(
-                "Found superseded change %s (%s)",
-                change.number,
-                change.subject,
-            )
-
-            if dry_run:
-                log.info(
-                    "DRY-RUN: Would abandon superseded change %s",
-                    change_url,
-                )
-                abandoned.append(str(change.number))
-                continue
-
-            superseding_info = f"New change subject: {current_subject}"
-            if exclude_change_ids:
-                superseding_info += "\nChange-Id(s): " + ", ".join(
-                    str(cid) for cid in exclude_change_ids
-                )
-            abandon_msg = (
-                f"Superseded by a newer update for {current_pkg}\n\n"
-                f"{superseding_info}\n\n"
-                "This change was automatically abandoned by "
-                "GitHub2Gerrit because a newer dependency update "
-                "for the same package was pushed."
-            )
-            try:
-                _abandon_gerrit_change(client, str(change.number), abandon_msg)
-                log.info(
-                    "Abandoned superseded change: %s",
-                    change_url,
-                )
-                abandoned.append(str(change.number))
-            except Exception as exc:
-                log.warning(
-                    "Failed to abandon superseded change %s: %s",
-                    change_url,
-                    exc,
-                )
+            if result is not None:
+                abandoned.append(result)
 
     except Exception as exc:
         log.warning(

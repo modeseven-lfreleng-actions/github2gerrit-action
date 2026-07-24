@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
+# aislop-ignore-file complexity/file-too-large -- cli.py hosts the Typer CLI
+# surface and its orchestration helpers. Its overly long functions and deep
+# nesting are decomposed here; splitting the module is a dedicated follow-up
+# refactor tracked separately.
+
 from __future__ import annotations
 
 import json
@@ -10,12 +15,15 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
 from typing import cast
@@ -554,6 +562,336 @@ def _save_derived_parameters_after_success(data: Inputs) -> None:
         )
 
 
+def _maybe_exit_for_version_or_disabled(version_flag: bool) -> None:
+    """Handle the --version flag and the G2G_DISABLED short-circuit."""
+    if version_flag:
+        try:
+            app_version = get_version("github2gerrit")
+            typer.echo(f"github2gerrit version {app_version}")
+        except Exception:
+            typer.echo("Version information not available")
+        sys.exit(int(ExitCode.SUCCESS))
+
+    # Check if GitHub2Gerrit is disabled via environment variable
+    if env_bool("G2G_DISABLED"):
+        typer.echo(
+            "\U0001f6d1 GitHub2Gerrit is disabled by check of "
+            "G2G_DISABLED variable"
+        )
+        sys.exit(int(ExitCode.SUCCESS))
+
+
+def _resolve_bool_override(
+    ctx: typer.Context, param_name: str, env_var: str, current: bool
+) -> bool:
+    """Return *current* if the CLI flag was explicit, else parse env.
+
+    This ensures that string "false" from GitHub Actions is handled
+    correctly (Typer/Click treats any non-empty string as truthy). The
+    env-var override is only applied when the parameter was NOT explicitly
+    provided on the command line, so CLI flags always take precedence.
+    """
+    source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
+    if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue, reportUnnecessaryComparison]
+        return current
+    env_val = os.getenv(env_var)
+    if env_val is not None:
+        return parse_bool_env(env_val)
+    return current
+
+
+def _apply_bool_env_overrides(
+    ctx: typer.Context, options: dict[str, bool]
+) -> None:
+    """Resolve boolean CLI/env overrides and normalise them into env.
+
+    ``options`` maps each snake_case parameter name to the value Typer
+    parsed. Each parameter's environment variable is the upper-case form
+    of its name (e.g. ``dry_run`` -> ``DRY_RUN``).
+    """
+    for param_name, current in options.items():
+        env_var = param_name.upper()
+        resolved = _resolve_bool_override(ctx, param_name, env_var, current)
+        os.environ[env_var] = "true" if resolved else "false"
+
+
+def _apply_netrc_options(
+    no_netrc: bool,
+    netrc_file: Path | None,
+    netrc_optional: bool,
+    gerrit_server: str,
+) -> None:
+    """Store netrc options in env and load credentials when enabled."""
+    os.environ["G2G_NO_NETRC"] = "true" if no_netrc else "false"
+    if netrc_file:
+        os.environ["G2G_NETRC_FILE"] = str(netrc_file)
+    os.environ["G2G_NETRC_OPTIONAL"] = "true" if netrc_optional else "false"
+
+    if no_netrc:
+        return
+    gerrit_host = gerrit_server or os.getenv("GERRIT_SERVER", "")
+    if not gerrit_host:
+        return
+    try:
+        netrc_creds = get_credentials_for_host(
+            host=gerrit_host,
+            netrc_file=netrc_file,
+            use_netrc=True,
+            netrc_optional=netrc_optional,
+        )
+        if netrc_creds:
+            # Set HTTP credentials from netrc if not already set
+            if not os.getenv("GERRIT_HTTP_USER"):
+                os.environ["GERRIT_HTTP_USER"] = netrc_creds.login
+            if not os.getenv("GERRIT_HTTP_PASSWORD"):
+                os.environ["GERRIT_HTTP_PASSWORD"] = netrc_creds.password
+            log.debug(
+                "Loaded Gerrit HTTP credentials for %s from .netrc",
+                gerrit_host,
+            )
+    except FileNotFoundError:
+        if not netrc_optional:
+            safe_typer_echo("❌ No .netrc file found and --netrc-required set")
+            sys.exit(int(ExitCode.CONFIGURATION_ERROR))
+    except NetrcParseError as e:
+        safe_typer_echo(f"❌ Failed to parse .netrc file: {e}")
+        sys.exit(int(ExitCode.CONFIGURATION_ERROR))
+
+
+def _configure_logging_and_progress(verbose: bool, show_progress: bool) -> None:
+    """Configure logging verbosity and progress-related environment."""
+    if verbose:
+        os.environ["G2G_LOG_LEVEL"] = "DEBUG"
+        _reconfigure_logging()
+
+    setup_rich_aware_logging()
+
+    if _is_github_actions_context():
+        try:
+            app_version = get_version("github2gerrit")
+            log.debug("github2gerrit version %s", app_version)
+        except Exception as exc:
+            log.warning("Version information not available: %s", exc)
+
+    # Show initial progress if Rich is available and progress is enabled
+    if show_progress and not RICH_AVAILABLE:
+        safe_console_print(
+            "📋 Rich formatting not available - progress will be shown as "
+            "simple text..."
+        )
+
+    # Store progress flag in environment for use by processing functions
+    os.environ["G2G_SHOW_PROGRESS"] = "true" if show_progress else "false"
+
+
+def _export_general_options(
+    fetch_depth: int,
+    organization: str | None,
+    reviewers_email: str,
+    normalise_commit: bool,
+    allow_ghe_urls: bool,
+) -> None:
+    """Normalise general scalar CLI options into the process environment."""
+    os.environ["FETCH_DEPTH"] = str(fetch_depth)
+    resolved_org = _resolve_org(organization)
+    if resolved_org:
+        os.environ["ORGANIZATION"] = resolved_org
+    if reviewers_email:
+        os.environ["REVIEWERS_EMAIL"] = reviewers_email
+    os.environ["NORMALISE_COMMIT"] = "true" if normalise_commit else "false"
+    os.environ["ALLOW_GHE_URLS"] = "true" if allow_ghe_urls else "false"
+
+
+def _export_gerrit_ssh_options(
+    gerrit_known_hosts: str,
+    gerrit_ssh_privkey_g2g: str,
+    gerrit_ssh_user_g2g: str,
+    gerrit_ssh_user_g2g_email: str,
+) -> None:
+    """Export Gerrit SSH-related CLI options into the environment."""
+    if gerrit_known_hosts:
+        os.environ["GERRIT_KNOWN_HOSTS"] = gerrit_known_hosts
+    if gerrit_ssh_privkey_g2g:
+        os.environ["GERRIT_SSH_PRIVKEY_G2G"] = gerrit_ssh_privkey_g2g
+    if gerrit_ssh_user_g2g:
+        os.environ["GERRIT_SSH_USER_G2G"] = gerrit_ssh_user_g2g
+    if gerrit_ssh_user_g2g_email:
+        os.environ["GERRIT_SSH_USER_G2G_EMAIL"] = gerrit_ssh_user_g2g_email
+
+
+def _export_gerrit_server_options(
+    gerrit_server: str, gerrit_server_port: int, gerrit_project: str
+) -> None:
+    """Export Gerrit server-location CLI options into the environment."""
+    if gerrit_server:
+        os.environ["GERRIT_SERVER"] = gerrit_server
+    if gerrit_server_port:
+        os.environ["GERRIT_SERVER_PORT"] = str(gerrit_server_port)
+    if gerrit_project:
+        os.environ["GERRIT_PROJECT"] = gerrit_project
+
+
+def _export_issue_and_commit_options(
+    issue_id: str,
+    issue_id_lookup_json: str,
+    github_actor: str,
+    commit_rules_json: str,
+) -> None:
+    """Resolve the Issue-ID and export commit-message related options."""
+    # Handle Issue-ID lookup from JSON if provided
+    resolved_issue_id = issue_id
+    if not resolved_issue_id and issue_id_lookup_json:
+        resolved_issue_id = _resolve_issue_id_from_json(
+            issue_id_lookup_json, github_actor
+        )
+    if resolved_issue_id:
+        os.environ["ISSUE_ID"] = resolved_issue_id
+
+    # Always set COMMIT_RULES_JSON so passing an empty string via CLI
+    # clears any pre-existing env var rather than leaving stale rules.
+    os.environ["COMMIT_RULES_JSON"] = commit_rules_json or ""
+
+
+def _export_flag_options(
+    close_merged_prs: bool,
+    force: bool,
+    duplicate_types: str,
+    reuse_strategy: str,
+) -> None:
+    """Export closure/duplicate related CLI options into the environment."""
+    os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"
+    os.environ["FORCE"] = "true" if force else "false"
+    os.environ["DUPLICATE_TYPES"] = duplicate_types
+    if reuse_strategy:
+        os.environ["REUSE_STRATEGY"] = reuse_strategy
+
+
+def _apply_similarity_options(
+    similarity_subject: float, similarity_update_factor: float
+) -> None:
+    """Validate similarity thresholds and normalise them into env."""
+    if not (0.0 <= similarity_subject <= 1.0):
+        msg = (
+            f"similarity_subject must be between 0.0 and 1.0, "
+            f"got {similarity_subject}"
+        )
+        raise typer.BadParameter(msg)
+    if not (0.0 <= similarity_update_factor <= 1.0):
+        msg = (
+            f"similarity_update_factor must be between 0.0 and 1.0, "
+            f"got {similarity_update_factor}"
+        )
+        raise typer.BadParameter(msg)
+
+    os.environ["SIMILARITY_SUBJECT"] = str(similarity_subject)
+    os.environ["SIMILARITY_UPDATE_FACTOR"] = str(similarity_update_factor)
+
+
+def _apply_target_url_to_env(target_url: str | None) -> None:
+    """Parse a target URL argument and export the derived env vars."""
+    if not target_url:
+        return
+
+    parsed = _parse_target_url(target_url)
+
+    if isinstance(parsed, GerritChangeTarget):
+        # Gerrit change URL - respect user's close_merged_prs flag
+        log.debug("Parsed Gerrit change URL: %s", parsed.change_url)
+        # Note: CLOSE_MERGED_PRS was already set based on user flag
+        # earlier. We respect that setting instead of forcing it to true:
+        #   - true (default): Close the GitHub PR
+        #   - false: Add comment to PR but leave it open
+        os.environ["G2G_GERRIT_CHANGE_URL"] = parsed.change_url
+        log.debug(
+            "Gerrit change URL mode with CLOSE_MERGED_PRS=%s",
+            os.environ.get("CLOSE_MERGED_PRS", "true"),
+        )
+        url_type = "gerrit_change"
+    elif isinstance(parsed, GitHubPRTarget):
+        # GitHub PR URL
+        log.debug(
+            "Parsed GitHub PR URL: owner=%s, repo=%s, pr_number=%s",
+            parsed.owner,
+            parsed.repo,
+            parsed.pr_number,
+        )
+        if parsed.owner:
+            os.environ["ORGANIZATION"] = parsed.owner
+            log.debug("Set ORGANIZATION=%s", parsed.owner)
+        if parsed.owner and parsed.repo:
+            github_repo = f"{parsed.owner}/{parsed.repo}"
+            os.environ["GITHUB_REPOSITORY"] = github_repo
+            log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
+        if parsed.pr_number:
+            os.environ["PR_NUMBER"] = str(parsed.pr_number)
+            os.environ["SYNC_ALL_OPEN_PRS"] = "false"
+            log.debug("Set PR_NUMBER=%s", parsed.pr_number)
+        else:
+            os.environ["SYNC_ALL_OPEN_PRS"] = "true"
+            log.debug("Set SYNC_ALL_OPEN_PRS=true")
+        url_type = "github_pr"
+    else:  # GitHubRepoTarget
+        # GitHub repo URL (no PR)
+        log.debug(
+            "Parsed GitHub repo URL: owner=%s, repo=%s",
+            parsed.owner,
+            parsed.repo,
+        )
+        if parsed.owner:
+            os.environ["ORGANIZATION"] = parsed.owner
+            log.debug("Set ORGANIZATION=%s", parsed.owner)
+        if parsed.owner and parsed.repo:
+            github_repo = f"{parsed.owner}/{parsed.repo}"
+            os.environ["GITHUB_REPOSITORY"] = github_repo
+            log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
+        os.environ["SYNC_ALL_OPEN_PRS"] = "true"
+        log.debug("Set SYNC_ALL_OPEN_PRS=true")
+        url_type = "github_repo"
+
+    # Store the target URL in env for downstream use
+    # Note: This stores the actual URL string (e.g., "https://github.com/...")
+    # All downstream code uses boolean checks (truthy/falsy), so this works
+    # correctly and provides better debugging/logging than storing "1"
+    os.environ["G2G_TARGET_URL"] = target_url
+    os.environ["G2G_TARGET_URL_TYPE"] = url_type
+
+
+def _log_startup_environment() -> None:
+    """Emit a debug snapshot of key environment variables at startup."""
+    log.debug("CLI startup environment check:")
+    for key in ["DRY_RUN", "CI_TESTING", "GERRIT_SERVER", "GERRIT_PROJECT"]:
+        value = os.environ.get(key, "NOT_SET")
+        log.debug("  %s = %s", key, value)
+
+
+def _run_processing() -> None:
+    """Delegate to the common processing path with structured handling."""
+    try:
+        _process()
+    except GitHub2GerritError as exc:
+        # Our structured errors handle display and exit themselves
+        exc.display_and_exit()
+    except (KeyboardInterrupt, SystemExit, typer.Exit):
+        # Don't catch system interrupts or exits
+        raise
+    except (OrchestratorError, DuplicateChangeError, ConfigurationError) as exc:
+        # Convert known errors to centralized error handling
+        if isinstance(exc, OrchestratorError):
+            converted_error = convert_orchestrator_error(exc)
+        elif isinstance(exc, DuplicateChangeError):
+            converted_error = convert_duplicate_error(exc)
+        else:  # ConfigurationError
+            converted_error = convert_configuration_error(exc)
+        converted_error.display_and_exit()
+    except Exception as exc:
+        log.debug("main(): _process failed: %s", exc)
+        exit_with_error(
+            ExitCode.GENERAL_ERROR,
+            message="❌ Operation failed; check logs for details",
+            exception=exc,
+        )
+
+
 @typed_app_command()
 def main(
     ctx: typer.Context,
@@ -840,310 +1178,56 @@ def main(
     - No arguments: environment variables determine behaviour (CI/CD mode)
     """
 
-    if version_flag:
-        try:
-            app_version = get_version("github2gerrit")
-            typer.echo(f"github2gerrit version {app_version}")
-        except Exception:
-            typer.echo("Version information not available")
-        sys.exit(int(ExitCode.SUCCESS))
+    _maybe_exit_for_version_or_disabled(version_flag)
 
-    # Check if GitHub2Gerrit is disabled via environment variable
-    if env_bool("G2G_DISABLED"):
-        typer.echo(
-            "\U0001f6d1 GitHub2Gerrit is disabled by check of "
-            "G2G_DISABLED variable"
-        )
-        sys.exit(int(ExitCode.SUCCESS))
-
-    # Override boolean parameters with properly parsed environment variables.
-    # This ensures that string "false" from GitHub Actions is handled
-    # correctly (Typer/Click treats any non-empty string as truthy).
-    #
-    # We only apply the env-var override when the parameter was NOT
-    # explicitly provided on the command line, so that CLI flags always
-    # take precedence over environment variables.
-    def _env_bool_override(
-        param_name: str, env_var: str, current: bool
-    ) -> bool:
-        """Return *current* if the CLI flag was explicit, else parse env."""
-        source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
-        if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue, reportUnnecessaryComparison]
-            return current
-        env_val = os.getenv(env_var)
-        if env_val is not None:
-            return parse_bool_env(env_val)
-        return current
-
-    submit_single_commits = _env_bool_override(
-        "submit_single_commits", "SUBMIT_SINGLE_COMMITS", submit_single_commits
-    )
-    use_pr_as_commit = _env_bool_override(
-        "use_pr_as_commit", "USE_PR_AS_COMMIT", use_pr_as_commit
-    )
-    preserve_github_prs = _env_bool_override(
-        "preserve_github_prs", "PRESERVE_GITHUB_PRS", preserve_github_prs
-    )
-    dry_run = _env_bool_override("dry_run", "DRY_RUN", dry_run)
-    allow_duplicates = _env_bool_override(
-        "allow_duplicates", "ALLOW_DUPLICATES", allow_duplicates
-    )
-    ci_testing = _env_bool_override("ci_testing", "CI_TESTING", ci_testing)
-    similarity_files = _env_bool_override(
-        "similarity_files", "SIMILARITY_FILES", similarity_files
-    )
-    allow_orphan_changes = _env_bool_override(
-        "allow_orphan_changes", "ALLOW_ORPHAN_CHANGES", allow_orphan_changes
-    )
-    persist_single_mapping_comment = _env_bool_override(
-        "persist_single_mapping_comment",
-        "PERSIST_SINGLE_MAPPING_COMMENT",
-        persist_single_mapping_comment,
-    )
-    log_reconcile_json = _env_bool_override(
-        "log_reconcile_json", "LOG_RECONCILE_JSON", log_reconcile_json
-    )
-    create_missing = _env_bool_override(
-        "create_missing", "CREATE_MISSING", create_missing
-    )
-    automation_only = _env_bool_override(
-        "automation_only", "AUTOMATION_ONLY", automation_only
+    _apply_bool_env_overrides(
+        ctx,
+        {
+            "submit_single_commits": submit_single_commits,
+            "use_pr_as_commit": use_pr_as_commit,
+            "preserve_github_prs": preserve_github_prs,
+            "dry_run": dry_run,
+            "allow_duplicates": allow_duplicates,
+            "ci_testing": ci_testing,
+            "similarity_files": similarity_files,
+            "allow_orphan_changes": allow_orphan_changes,
+            "persist_single_mapping_comment": persist_single_mapping_comment,
+            "log_reconcile_json": log_reconcile_json,
+            "create_missing": create_missing,
+            "automation_only": automation_only,
+        },
     )
 
-    # Store netrc options in environment for use by processing functions
-    os.environ["G2G_NO_NETRC"] = "true" if no_netrc else "false"
-    if netrc_file:
-        os.environ["G2G_NETRC_FILE"] = str(netrc_file)
-    os.environ["G2G_NETRC_OPTIONAL"] = "true" if netrc_optional else "false"
+    _apply_netrc_options(no_netrc, netrc_file, netrc_optional, gerrit_server)
+    _configure_logging_and_progress(verbose, show_progress)
 
-    # Handle netrc credential loading if enabled
-    if not no_netrc:
-        gerrit_host = gerrit_server or os.getenv("GERRIT_SERVER", "")
-        if gerrit_host:
-            try:
-                netrc_creds = get_credentials_for_host(
-                    host=gerrit_host,
-                    netrc_file=netrc_file,
-                    use_netrc=True,
-                    netrc_optional=netrc_optional,
-                )
-                if netrc_creds:
-                    # Set HTTP credentials from netrc if not already set
-                    if not os.getenv("GERRIT_HTTP_USER"):
-                        os.environ["GERRIT_HTTP_USER"] = netrc_creds.login
-                    if not os.getenv("GERRIT_HTTP_PASSWORD"):
-                        os.environ["GERRIT_HTTP_PASSWORD"] = (
-                            netrc_creds.password
-                        )
-                    log.debug(
-                        "Loaded Gerrit HTTP credentials for %s from .netrc",
-                        gerrit_host,
-                    )
-            except FileNotFoundError:
-                if not netrc_optional:
-                    safe_typer_echo(
-                        "❌ No .netrc file found and --netrc-required set"
-                    )
-                    sys.exit(int(ExitCode.CONFIGURATION_ERROR))
-            except NetrcParseError as e:
-                safe_typer_echo(f"❌ Failed to parse .netrc file: {e}")
-                sys.exit(int(ExitCode.CONFIGURATION_ERROR))
-
-    if verbose:
-        os.environ["G2G_LOG_LEVEL"] = "DEBUG"
-        _reconfigure_logging()
-
-    setup_rich_aware_logging()
-
-    if _is_github_actions_context():
-        try:
-            app_version = get_version("github2gerrit")
-            log.debug("github2gerrit version %s", app_version)
-        except Exception as exc:
-            log.warning("Version information not available: %s", exc)
-
-    # Show initial progress if Rich is available and progress is enabled
-    if show_progress and not RICH_AVAILABLE:
-        safe_console_print(
-            "📋 Rich formatting not available - progress will be shown as "
-            "simple text..."
-        )
-
-    # Store progress flag in environment for use by processing functions
-    os.environ["G2G_SHOW_PROGRESS"] = "true" if show_progress else "false"
-    # Normalize CLI options into environment for unified processing.
-    # Explicitly set all boolean flags to ensure consistent behavior
-    os.environ["SUBMIT_SINGLE_COMMITS"] = (
-        "true" if submit_single_commits else "false"
+    _export_general_options(
+        fetch_depth,
+        organization,
+        reviewers_email,
+        normalise_commit,
+        allow_ghe_urls,
     )
-    os.environ["USE_PR_AS_COMMIT"] = "true" if use_pr_as_commit else "false"
-    os.environ["FETCH_DEPTH"] = str(fetch_depth)
-    if gerrit_known_hosts:
-        os.environ["GERRIT_KNOWN_HOSTS"] = gerrit_known_hosts
-    if gerrit_ssh_privkey_g2g:
-        os.environ["GERRIT_SSH_PRIVKEY_G2G"] = gerrit_ssh_privkey_g2g
-    if gerrit_ssh_user_g2g:
-        os.environ["GERRIT_SSH_USER_G2G"] = gerrit_ssh_user_g2g
-    if gerrit_ssh_user_g2g_email:
-        os.environ["GERRIT_SSH_USER_G2G_EMAIL"] = gerrit_ssh_user_g2g_email
-    resolved_org = _resolve_org(organization)
-    if resolved_org:
-        os.environ["ORGANIZATION"] = resolved_org
-    if reviewers_email:
-        os.environ["REVIEWERS_EMAIL"] = reviewers_email
-    os.environ["PRESERVE_GITHUB_PRS"] = (
-        "true" if preserve_github_prs else "false"
+    _export_gerrit_ssh_options(
+        gerrit_known_hosts,
+        gerrit_ssh_privkey_g2g,
+        gerrit_ssh_user_g2g,
+        gerrit_ssh_user_g2g_email,
     )
-    os.environ["DRY_RUN"] = "true" if dry_run else "false"
-    os.environ["NORMALISE_COMMIT"] = "true" if normalise_commit else "false"
-    os.environ["ALLOW_GHE_URLS"] = "true" if allow_ghe_urls else "false"
-    if gerrit_server:
-        os.environ["GERRIT_SERVER"] = gerrit_server
-    if gerrit_server_port:
-        os.environ["GERRIT_SERVER_PORT"] = str(gerrit_server_port)
-    if gerrit_project:
-        os.environ["GERRIT_PROJECT"] = gerrit_project
-
-    # Handle Issue-ID lookup from JSON if provided
-    resolved_issue_id = issue_id
-    if not resolved_issue_id and issue_id_lookup_json:
-        resolved_issue_id = _resolve_issue_id_from_json(
-            issue_id_lookup_json, github_actor
-        )
-
-    if resolved_issue_id:
-        os.environ["ISSUE_ID"] = resolved_issue_id
-    # Always set COMMIT_RULES_JSON so passing an empty string via CLI
-    # clears any pre-existing env var rather than leaving stale rules.
-    os.environ["COMMIT_RULES_JSON"] = commit_rules_json or ""
-    os.environ["ALLOW_DUPLICATES"] = "true" if allow_duplicates else "false"
-    os.environ["CI_TESTING"] = "true" if ci_testing else "false"
-    os.environ["CLOSE_MERGED_PRS"] = "true" if close_merged_prs else "false"
-    os.environ["FORCE"] = "true" if force else "false"
-    os.environ["DUPLICATE_TYPES"] = duplicate_types
-    if reuse_strategy:
-        os.environ["REUSE_STRATEGY"] = reuse_strategy
-
-    if not (0.0 <= similarity_subject <= 1.0):
-        msg = (
-            f"similarity_subject must be between 0.0 and 1.0, "
-            f"got {similarity_subject}"
-        )
-        raise typer.BadParameter(msg)
-    if not (0.0 <= similarity_update_factor <= 1.0):
-        msg = (
-            f"similarity_update_factor must be between 0.0 and 1.0, "
-            f"got {similarity_update_factor}"
-        )
-        raise typer.BadParameter(msg)
-
-    os.environ["SIMILARITY_SUBJECT"] = str(similarity_subject)
-    os.environ["SIMILARITY_UPDATE_FACTOR"] = str(similarity_update_factor)
-    os.environ["SIMILARITY_FILES"] = "true" if similarity_files else "false"
-    os.environ["ALLOW_ORPHAN_CHANGES"] = (
-        "true" if allow_orphan_changes else "false"
+    _export_gerrit_server_options(
+        gerrit_server, gerrit_server_port, gerrit_project
     )
-    os.environ["PERSIST_SINGLE_MAPPING_COMMENT"] = (
-        "true" if persist_single_mapping_comment else "false"
+    _export_issue_and_commit_options(
+        issue_id, issue_id_lookup_json, github_actor, commit_rules_json
     )
-    os.environ["LOG_RECONCILE_JSON"] = "true" if log_reconcile_json else "false"
-    os.environ["CREATE_MISSING"] = "true" if create_missing else "false"
-    os.environ["AUTOMATION_ONLY"] = "true" if automation_only else "false"
-    # URL mode handling
-    if target_url:
-        parsed = _parse_target_url(target_url)
+    _export_flag_options(
+        close_merged_prs, force, duplicate_types, reuse_strategy
+    )
 
-        if isinstance(parsed, GerritChangeTarget):
-            # Gerrit change URL - respect user's close_merged_prs flag
-            log.debug("Parsed Gerrit change URL: %s", parsed.change_url)
-            # Note: CLOSE_MERGED_PRS was already set based on user flag
-            # earlier. We respect that setting instead of forcing it to true:
-            #   - true (default): Close the GitHub PR
-            #   - false: Add comment to PR but leave it open
-            os.environ["G2G_GERRIT_CHANGE_URL"] = parsed.change_url
-            log.debug(
-                "Gerrit change URL mode with CLOSE_MERGED_PRS=%s",
-                os.environ.get("CLOSE_MERGED_PRS", "true"),
-            )
-            url_type = "gerrit_change"
-        elif isinstance(parsed, GitHubPRTarget):
-            # GitHub PR URL
-            log.debug(
-                "Parsed GitHub PR URL: owner=%s, repo=%s, pr_number=%s",
-                parsed.owner,
-                parsed.repo,
-                parsed.pr_number,
-            )
-            if parsed.owner:
-                os.environ["ORGANIZATION"] = parsed.owner
-                log.debug("Set ORGANIZATION=%s", parsed.owner)
-            if parsed.owner and parsed.repo:
-                github_repo = f"{parsed.owner}/{parsed.repo}"
-                os.environ["GITHUB_REPOSITORY"] = github_repo
-                log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
-            if parsed.pr_number:
-                os.environ["PR_NUMBER"] = str(parsed.pr_number)
-                os.environ["SYNC_ALL_OPEN_PRS"] = "false"
-                log.debug("Set PR_NUMBER=%s", parsed.pr_number)
-            else:
-                os.environ["SYNC_ALL_OPEN_PRS"] = "true"
-                log.debug("Set SYNC_ALL_OPEN_PRS=true")
-            url_type = "github_pr"
-        else:  # GitHubRepoTarget
-            # GitHub repo URL (no PR)
-            log.debug(
-                "Parsed GitHub repo URL: owner=%s, repo=%s",
-                parsed.owner,
-                parsed.repo,
-            )
-            if parsed.owner:
-                os.environ["ORGANIZATION"] = parsed.owner
-                log.debug("Set ORGANIZATION=%s", parsed.owner)
-            if parsed.owner and parsed.repo:
-                github_repo = f"{parsed.owner}/{parsed.repo}"
-                os.environ["GITHUB_REPOSITORY"] = github_repo
-                log.debug("Set GITHUB_REPOSITORY=%s", github_repo)
-            os.environ["SYNC_ALL_OPEN_PRS"] = "true"
-            log.debug("Set SYNC_ALL_OPEN_PRS=true")
-            url_type = "github_repo"
-
-        # Store the target URL in env for downstream use
-        # Note: This stores the actual URL string (e.g., "https://github.com/...")
-        # All downstream code uses boolean checks (truthy/falsy), so this works
-        # correctly and provides better debugging/logging than storing "1"
-        os.environ["G2G_TARGET_URL"] = target_url
-        os.environ["G2G_TARGET_URL_TYPE"] = url_type
-    # Debug: Show environment at CLI startup
-    log.debug("CLI startup environment check:")
-    for key in ["DRY_RUN", "CI_TESTING", "GERRIT_SERVER", "GERRIT_PROJECT"]:
-        value = os.environ.get(key, "NOT_SET")
-        log.debug("  %s = %s", key, value)
-
-    # Delegate to common processing path
-    try:
-        _process()
-    except GitHub2GerritError as exc:
-        # Our structured errors handle display and exit themselves
-        exc.display_and_exit()
-    except (KeyboardInterrupt, SystemExit, typer.Exit):
-        # Don't catch system interrupts or exits
-        raise
-    except (OrchestratorError, DuplicateChangeError, ConfigurationError) as exc:
-        # Convert known errors to centralized error handling
-        if isinstance(exc, OrchestratorError):
-            converted_error = convert_orchestrator_error(exc)
-        elif isinstance(exc, DuplicateChangeError):
-            converted_error = convert_duplicate_error(exc)
-        else:  # ConfigurationError
-            converted_error = convert_configuration_error(exc)
-        converted_error.display_and_exit()
-    except Exception as exc:
-        log.debug("main(): _process failed: %s", exc)
-        exit_with_error(
-            ExitCode.GENERAL_ERROR,
-            message="❌ Operation failed; check logs for details",
-            exception=exc,
-        )
+    _apply_similarity_options(similarity_subject, similarity_update_factor)
+    _apply_target_url_to_env(target_url)
+    _log_startup_environment()
+    _run_processing()
 
 
 def _setup_logging() -> logging.Logger:
@@ -1167,6 +1251,80 @@ def _reconfigure_logging() -> None:
 
 
 log = _setup_logging()
+
+
+def _convert_and_raise_structured_error(exc: Exception) -> NoReturn:
+    """Convert a known structured error and re-raise it.
+
+    Maps OrchestratorError, DuplicateChangeError and ConfigurationError to
+    their centralized equivalents before re-raising, preserving the
+    original exception as the cause.
+    """
+    if isinstance(exc, OrchestratorError):
+        converted_error = convert_orchestrator_error(exc)
+    elif isinstance(exc, DuplicateChangeError):
+        converted_error = convert_duplicate_error(exc)
+    else:  # ConfigurationError
+        converted_error = convert_configuration_error(exc)
+    raise converted_error from exc
+
+
+def _record_change_tracker_result(
+    progress_tracker: Any, result: SubmissionResult
+) -> None:
+    """Update the progress tracker based on submitted vs updated changes."""
+    if not (progress_tracker and result.change_urls):
+        return
+    if any("new" in url.lower() for url in result.change_urls):
+        progress_tracker.change_submitted()
+    else:
+        progress_tracker.change_updated()
+
+
+def _run_gerrit_cleanup_tasks(
+    data: Inputs,
+    gh: GitHubContext,
+    *,
+    no_gerrit: bool,
+    gerrit_cleanup_info_log: bool = False,
+) -> None:
+    """Run abandoned-PR and Gerrit cleanup sweeps when enabled.
+
+    Both sweeps are skipped when ``no_gerrit`` is set (there is no Gerrit
+    server to query). ``gerrit_cleanup_info_log`` selects the log level of
+    the Gerrit-cleanup banner (info vs debug) to preserve the original
+    per-call-site logging.
+    """
+    if FORCE_ABANDONED_CLEANUP and not no_gerrit:
+        try:
+            log.debug("Running abandoned PR cleanup...")
+            if gh.repository and "/" in gh.repository:
+                owner, repo = gh.repository.split("/", 1)
+                cleanup_abandoned_prs_bulk(
+                    owner=owner,
+                    repo=repo,
+                    dry_run=data.dry_run,
+                    progress_tracker=None,
+                    close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
+                )
+        except Exception as exc:
+            log.warning("Abandoned PR cleanup failed: %s", exc)
+
+    if FORCE_GERRIT_CLEANUP and not no_gerrit:
+        try:
+            if gerrit_cleanup_info_log:
+                log.info("Running Gerrit cleanup for closed GitHub PRs...")
+            else:
+                log.debug("Running Gerrit cleanup for closed GitHub PRs...")
+            if data.gerrit_server and data.gerrit_project:
+                cleanup_closed_github_prs(
+                    gerrit_server=data.gerrit_server,
+                    gerrit_project=data.gerrit_project,
+                    dry_run=data.dry_run,
+                    progress_tracker=None,
+                )
+        except Exception as exc:
+            log.warning("Gerrit cleanup failed: %s", exc)
 
 
 def _build_inputs_from_env() -> Inputs:
@@ -1212,145 +1370,57 @@ def _build_inputs_from_env() -> Inputs:
     )
 
 
-def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
-    show_progress = env_bool("G2G_SHOW_PROGRESS", True)
-    target = gh.repository
+_BulkPrResult = tuple[str, SubmissionResult | None, Exception | None]
 
-    progress_tracker: G2GProgressTracker | DummyProgressTracker
+
+@dataclass
+class _BulkAggregate:
+    """Mutable accumulator for bulk multi-PR processing results."""
+
+    all_urls: list[str] = field(default_factory=list)
+    all_nums: list[str] = field(default_factory=list)
+    all_shas: list[str] = field(default_factory=list)
+    processed_count: int = 0
+    succeeded_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+
+
+def _build_bulk_progress_tracker(
+    show_progress: bool, target: str
+) -> G2GProgressTracker | DummyProgressTracker:
     if show_progress:
-        progress_tracker = G2GProgressTracker(target)
-        progress_tracker.start()
-        progress_tracker.update_operation("🔍 Examining pull requests")
-    else:
-        progress_tracker = DummyProgressTracker("GitHub to Gerrit", target)
+        tracker = G2GProgressTracker(target)
+        tracker.start()
+        tracker.update_operation("🔍 Examining pull requests")
+        return tracker
+    return DummyProgressTracker("GitHub to Gerrit", target)
 
-    client = build_client()
-    repo = get_repo_from_env(client)
 
-    all_urls: list[str] = []
-    all_nums: list[str] = []
-    all_shas: list[str] = []
+def _finish_bulk_no_prs(
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> bool:
+    """Emit empty outputs when there are no open PRs to process."""
+    log.debug("No open PRs found; skipping processing")
+    progress_tracker.update_operation("⏩ No pull requests to process")
+    progress_tracker.stop()
 
-    prs_list = list(iter_open_pulls(repo))
-    log.debug("Found %d open PRs to process", len(prs_list))
-
-    # Early exit if no PRs to process
-    if len(prs_list) == 0:
-        log.debug("No open PRs found; skipping processing")
-        progress_tracker.update_operation("⏩ No pull requests to process")
-        progress_tracker.stop()
-
-        # Still emit outputs (empty values)
-        append_github_output(
-            {
-                "gerrit_change_request_url": "",
-                "gerrit_change_request_num": "",
-                "gerrit_commit_sha": "",
-            }
-        )
-        return True  # Success (no failures because no work)
-
-    progress_tracker.update_operation(
-        f"🔨 Processing {len(prs_list)} open pull requests..."
+    # Still emit outputs (empty values)
+    append_github_output(
+        {
+            "gerrit_change_request_url": "",
+            "gerrit_change_request_num": "",
+            "gerrit_commit_sha": "",
+        }
     )
+    return True  # Success (no failures because no work)
 
-    # Result tracking for summary
-    processed_count = 0
-    succeeded_count = 0
-    skipped_count = 0
-    failed_count = 0
 
-    # Use bounded parallel processing with shared clients
-    max_workers = min(
-        4, len(prs_list)
-    )  # Cap at 4 workers (no need for max(1, ...) since we exit early for 0)
-
-    def process_single_pr(
-        pr_data: tuple[Any, models.GitHubContext],
-    ) -> tuple[str, SubmissionResult | None, Exception | None]:
-        """Process a single PR and return (status, result, exception)."""
-        pr, per_ctx = pr_data
-        pr_number = int(getattr(pr, "number", 0) or 0)
-
-        if pr_number <= 0:
-            return "invalid", None, None
-
-        log.debug("Starting processing of PR #%d", pr_number)
-        log.debug(
-            "Processing PR #%d in multi-PR mode with event_name=%s, "
-            "event_action=%s",
-            pr_number,
-            gh.event_name,
-            gh.event_action,
-        )
-
-        progress_tracker.update_operation(f"Processing PR #{pr_number}...")
-        progress_tracker.pr_processed()
-
-        # Check if automation_only is enabled and reject non-automation PRs
-        try:
-            _check_automation_only(pr, per_ctx, progress_tracker)
-        except SystemExit:
-            # PR was rejected and closed, skip processing
-            log.debug("PR #%d rejected by automation_only check", pr_number)
-            return "skipped", None, None
-
-        try:
-            if data.duplicates_filter:
-                os.environ["DUPLICATE_TYPES"] = data.duplicates_filter
-            # Generate expected GitHub hash for trailer-aware duplicate
-            # detection
-            expected_github_hash = (
-                DuplicateDetector._generate_github_change_hash(per_ctx)
-            )
-            check_for_duplicates(
-                per_ctx,
-                allow_duplicates=data.allow_duplicates,
-                expected_github_hash=expected_github_hash,
-            )
-        except DuplicateChangeError as exc:
-            progress_tracker.duplicate_skipped()
-            log_exception_conditionally(log, "Skipping PR #%d", pr_number)
-            log.warning(
-                "Skipping PR #%d due to duplicate detection: %s. Use "
-                "--allow-duplicates to override this check.",
-                pr_number,
-                exc,
-            )
-            return "skipped", None, exc
-
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                workspace = Path(temp_dir)
-                orch = Orchestrator(workspace=workspace)
-                result_multi = orch.execute(inputs=data, gh=per_ctx)
-                if progress_tracker and result_multi.change_urls:
-                    if any(
-                        "new" in url.lower() for url in result_multi.change_urls
-                    ):
-                        progress_tracker.change_submitted()
-                    else:
-                        progress_tracker.change_updated()
-                return "success", result_multi, None
-        except GitHub2GerritError:
-            # Let our structured errors propagate to top level
-            raise
-        except (OrchestratorError, ConfigurationError) as exc:
-            # Convert and propagate structured errors
-            if isinstance(exc, OrchestratorError):
-                converted_error = convert_orchestrator_error(exc)
-            else:  # ConfigurationError
-                converted_error = convert_configuration_error(exc)
-            raise converted_error from exc
-        except Exception as exc:
-            progress_tracker.add_error(f"PR #{pr_number} processing failed")
-            log_exception_conditionally(
-                log, "Failed to process PR #%d", pr_number
-            )
-            return "failed", None, exc
-
-    # Prepare PR processing tasks
-    pr_tasks = []
+def _build_bulk_pr_tasks(
+    gh: GitHubContext, prs_list: list[Any]
+) -> list[tuple[Any, models.GitHubContext]]:
+    """Build per-PR contexts for each valid open pull request."""
+    pr_tasks: list[tuple[Any, models.GitHubContext]] = []
     for pr in prs_list:
         pr_number = int(getattr(pr, "number", 0) or 0)
         if pr_number <= 0:
@@ -1370,7 +1440,190 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
             pr_number=pr_number,
         )
         pr_tasks.append((pr, per_ctx))
+    return pr_tasks
 
+
+def _check_bulk_pr_duplicates(
+    data: Inputs,
+    per_ctx: models.GitHubContext,
+    pr_number: int,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> _BulkPrResult | None:
+    """Return a skip result if the PR is a duplicate, else None."""
+    try:
+        if data.duplicates_filter:
+            os.environ["DUPLICATE_TYPES"] = data.duplicates_filter
+        # Generate expected GitHub hash for trailer-aware duplicate
+        # detection
+        expected_github_hash = DuplicateDetector._generate_github_change_hash(
+            per_ctx
+        )
+        check_for_duplicates(
+            per_ctx,
+            allow_duplicates=data.allow_duplicates,
+            expected_github_hash=expected_github_hash,
+        )
+    except DuplicateChangeError as exc:
+        progress_tracker.duplicate_skipped()
+        log_exception_conditionally(log, "Skipping PR #%d", pr_number)
+        log.warning(
+            "Skipping PR #%d due to duplicate detection: %s. Use "
+            "--allow-duplicates to override this check.",
+            pr_number,
+            exc,
+        )
+        return "skipped", None, exc
+    return None
+
+
+def _submit_bulk_pr(
+    data: Inputs,
+    per_ctx: models.GitHubContext,
+    pr_number: int,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> _BulkPrResult:
+    """Run the orchestrator for a single PR in multi-PR mode."""
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            orch = Orchestrator(workspace=workspace)
+            result_multi = orch.execute(inputs=data, gh=per_ctx)
+            _record_change_tracker_result(progress_tracker, result_multi)
+            return "success", result_multi, None
+    except GitHub2GerritError:
+        # Let our structured errors propagate to top level
+        raise
+    except (OrchestratorError, ConfigurationError) as exc:
+        # Convert and propagate structured errors
+        _convert_and_raise_structured_error(exc)
+    except Exception as exc:
+        progress_tracker.add_error(f"PR #{pr_number} processing failed")
+        log_exception_conditionally(log, "Failed to process PR #%d", pr_number)
+        return "failed", None, exc
+
+
+def _process_bulk_pr(
+    pr_data: tuple[Any, models.GitHubContext],
+    data: Inputs,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> _BulkPrResult:
+    """Process a single PR and return (status, result, exception)."""
+    pr, per_ctx = pr_data
+    pr_number = int(getattr(pr, "number", 0) or 0)
+
+    if pr_number <= 0:
+        return "invalid", None, None
+
+    log.debug("Starting processing of PR #%d", pr_number)
+    log.debug(
+        "Processing PR #%d in multi-PR mode with event_name=%s, "
+        "event_action=%s",
+        pr_number,
+        gh.event_name,
+        gh.event_action,
+    )
+
+    progress_tracker.update_operation(f"Processing PR #{pr_number}...")
+    progress_tracker.pr_processed()
+
+    # Check if automation_only is enabled and reject non-automation PRs
+    try:
+        _check_automation_only(pr, per_ctx, progress_tracker)
+    except SystemExit:
+        # PR was rejected and closed, skip processing
+        log.debug("PR #%d rejected by automation_only check", pr_number)
+        return "skipped", None, None
+
+    skip_result = _check_bulk_pr_duplicates(
+        data, per_ctx, pr_number, progress_tracker
+    )
+    if skip_result is not None:
+        return skip_result
+
+    return _submit_bulk_pr(data, per_ctx, pr_number, progress_tracker)
+
+
+def _record_bulk_success(
+    agg: _BulkAggregate, pr_number: int | None, result_multi: SubmissionResult
+) -> None:
+    """Aggregate URLs, numbers and SHAs from a successful PR result."""
+    agg.succeeded_count += 1
+    if result_multi.change_urls:
+        agg.all_urls.extend(result_multi.change_urls)
+        for url in result_multi.change_urls:
+            log.info("Gerrit change URL: %s", url)
+            log.info(
+                "PR #%d created Gerrit change: %s",
+                pr_number,
+                url,
+            )
+    if result_multi.change_numbers:
+        agg.all_nums.extend(result_multi.change_numbers)
+        log.info(
+            "PR #%d change numbers: %s",
+            pr_number,
+            result_multi.change_numbers,
+        )
+    if result_multi.commit_shas:
+        agg.all_shas.extend(result_multi.commit_shas)
+
+
+def _collect_bulk_future_result(
+    agg: _BulkAggregate,
+    future: Future[_BulkPrResult],
+    pr_number: int | None,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> None:
+    """Fold one completed PR future into the aggregate counters."""
+    try:
+        status, result_multi, exc = future.result()
+
+        if status == "success" and result_multi:
+            _record_bulk_success(agg, pr_number, result_multi)
+        elif status == "skipped":
+            agg.skipped_count += 1
+        elif status == "failed":
+            agg.failed_count += 1
+            safe_typer_echo(
+                f"Failed to process PR #{pr_number}: {exc}",
+                progress_tracker=progress_tracker,
+                err=True,
+            )
+            log.info("Continuing to next PR despite failure")
+        else:
+            agg.failed_count += 1
+
+    except GitHub2GerritError:
+        # Let our structured errors propagate to top level
+        raise
+    except (
+        OrchestratorError,
+        DuplicateChangeError,
+        ConfigurationError,
+    ) as exc:
+        # Convert and propagate structured errors
+        _convert_and_raise_structured_error(exc)
+    except Exception as exc:
+        agg.failed_count += 1
+        log_exception_conditionally(log, "Failed to process PR #%d", pr_number)
+        safe_typer_echo(
+            f"Failed to process PR #{pr_number}: {exc}",
+            progress_tracker=progress_tracker,
+            err=True,
+        )
+        log.info("Continuing to next PR despite failure")
+
+
+def _run_bulk_pr_tasks(
+    data: Inputs,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+    pr_tasks: list[tuple[Any, models.GitHubContext]],
+    max_workers: int,
+) -> _BulkAggregate:
+    """Run PR tasks with bounded parallelism and aggregate results."""
+    agg = _BulkAggregate()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         log.debug(
             "Processing %d PRs with %d parallel workers",
@@ -1380,7 +1633,9 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
 
         # Submit all tasks
         future_to_pr = {
-            executor.submit(process_single_pr, pr_task): pr_task[1].pr_number
+            executor.submit(
+                _process_bulk_pr, pr_task, data, gh, progress_tracker
+            ): pr_task[1].pr_number
             for pr_task in pr_tasks
             if pr_task[1].pr_number is not None
         }
@@ -1388,93 +1643,70 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
         # Collect results as they complete
         for future in as_completed(future_to_pr):
             pr_number = future_to_pr[future]
-            processed_count += 1
+            agg.processed_count += 1
+            _collect_bulk_future_result(
+                agg, future, pr_number, progress_tracker
+            )
+    return agg
 
-            try:
-                status, result_multi, exc = future.result()
 
-                if status == "success" and result_multi:
-                    succeeded_count += 1
-                    if result_multi.change_urls:
-                        all_urls.extend(result_multi.change_urls)
-                        for url in result_multi.change_urls:
-                            log.info("Gerrit change URL: %s", url)
-                            log.info(
-                                "PR #%d created Gerrit change: %s",
-                                pr_number,
-                                url,
-                            )
-                    if result_multi.change_numbers:
-                        all_nums.extend(result_multi.change_numbers)
-                        log.info(
-                            "PR #%d change numbers: %s",
-                            pr_number,
-                            result_multi.change_numbers,
-                        )
-                    if result_multi.commit_shas:
-                        all_shas.extend(result_multi.commit_shas)
-                elif status == "skipped":
-                    skipped_count += 1
-                elif status == "failed":
-                    failed_count += 1
-                    safe_typer_echo(
-                        f"Failed to process PR #{pr_number}: {exc}",
-                        progress_tracker=progress_tracker,
-                        err=True,
-                    )
-                    log.info("Continuing to next PR despite failure")
-                else:
-                    failed_count += 1
-
-            except GitHub2GerritError as exc:
-                # Let our structured errors propagate to top level
-                raise
-            except (
-                OrchestratorError,
-                DuplicateChangeError,
-                ConfigurationError,
-            ) as exc:
-                # Convert and propagate structured errors
-                if isinstance(exc, OrchestratorError):
-                    converted_error = convert_orchestrator_error(exc)
-                elif isinstance(exc, DuplicateChangeError):
-                    converted_error = convert_duplicate_error(exc)
-                else:  # ConfigurationError
-                    converted_error = convert_configuration_error(exc)
-                raise converted_error from exc
-            except Exception as exc:
-                failed_count += 1
-                log_exception_conditionally(
-                    log, "Failed to process PR #%d", pr_number
-                )
-                safe_typer_echo(
-                    f"Failed to process PR #{pr_number}: {exc}",
-                    progress_tracker=progress_tracker,
-                    err=True,
-                )
-                log.info("Continuing to next PR despite failure")
-
-    # Aggregate results and provide summary
-    if all_urls:
-        os.environ["GERRIT_CHANGE_REQUEST_URL"] = "\n".join(all_urls)
-    if all_nums:
-        os.environ["GERRIT_CHANGE_REQUEST_NUM"] = "\n".join(all_nums)
-    if all_shas:
-        os.environ["GERRIT_COMMIT_SHA"] = "\n".join(all_shas)
+def _emit_bulk_outputs(agg: _BulkAggregate) -> None:
+    """Write aggregated bulk results to the environment and GITHUB_OUTPUT."""
+    if agg.all_urls:
+        os.environ["GERRIT_CHANGE_REQUEST_URL"] = "\n".join(agg.all_urls)
+    if agg.all_nums:
+        os.environ["GERRIT_CHANGE_REQUEST_NUM"] = "\n".join(agg.all_nums)
+    if agg.all_shas:
+        os.environ["GERRIT_COMMIT_SHA"] = "\n".join(agg.all_shas)
 
     append_github_output(
         {
-            "gerrit_change_request_url": "\n".join(all_urls)
-            if all_urls
+            "gerrit_change_request_url": "\n".join(agg.all_urls)
+            if agg.all_urls
             else "",
-            "gerrit_change_request_num": "\n".join(all_nums)
-            if all_nums
+            "gerrit_change_request_num": "\n".join(agg.all_nums)
+            if agg.all_nums
             else "",
-            "gerrit_commit_sha": "\n".join(all_shas) if all_shas else "",
+            "gerrit_commit_sha": "\n".join(agg.all_shas)
+            if agg.all_shas
+            else "",
         }
     )
 
-    if failed_count == 0:
+
+def _print_bulk_console_summary(
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+    agg: _BulkAggregate,
+) -> None:
+    """Print the Rich console summary after bulk processing."""
+    summary = progress_tracker.get_summary()
+    safe_console_print(
+        f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
+    )
+    safe_console_print(f"📊 PRs processed: {agg.processed_count}")
+    safe_console_print(f"✅ Succeeded: {agg.succeeded_count}")
+    safe_console_print(f"⏭️  Skipped: {agg.skipped_count}")
+    if agg.failed_count > 0:
+        safe_console_print(f"❌ Failed: {agg.failed_count}")
+    safe_console_print(f"🔗 Gerrit changes created: {len(agg.all_urls)}")
+
+    # Final completion message
+    if agg.failed_count == 0:
+        safe_console_print("\nProcessing completed ✅", style="green")
+    else:
+        safe_console_print(
+            f"\nProcessing completed with {agg.failed_count} failure(s) ⚠️",
+            style="yellow",
+        )
+
+
+def _finish_bulk_progress(
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+    agg: _BulkAggregate,
+    show_progress: bool,
+) -> None:
+    """Stop the progress tracker and show the completion summary."""
+    if agg.failed_count == 0:
         progress_tracker.update_operation("Processing completed ✅")
     else:
         progress_tracker.add_error("Some PRs failed processing")
@@ -1483,38 +1715,323 @@ def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
 
     # Show summary after progress tracker is stopped
     if show_progress and RICH_AVAILABLE:
-        summary = progress_tracker.get_summary()
-        safe_console_print(
-            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
-        )
-        safe_console_print(f"📊 PRs processed: {processed_count}")
-        safe_console_print(f"✅ Succeeded: {succeeded_count}")
-        safe_console_print(f"⏭️  Skipped: {skipped_count}")
-        if failed_count > 0:
-            safe_console_print(f"❌ Failed: {failed_count}")
-        safe_console_print(f"🔗 Gerrit changes created: {len(all_urls)}")
+        _print_bulk_console_summary(progress_tracker, agg)
 
-        # Final completion message
-        if failed_count == 0:
-            safe_console_print("\nProcessing completed ✅", style="green")
-        else:
-            safe_console_print(
-                f"\nProcessing completed with {failed_count} failure(s) ⚠️",
-                style="yellow",
-            )
 
-    # Summary block
+def _log_bulk_summary(agg: _BulkAggregate) -> None:
+    """Emit the debug-level bulk processing summary block."""
     log.debug("=" * 60)
     log.debug("PROCESSING SUMMARY:")
-    log.debug("  Total PRs processed: %d", processed_count)
-    log.debug("  Succeeded: %d", succeeded_count)
-    log.debug("  Skipped (duplicates): %d", skipped_count)
-    log.debug("  Failed: %d", failed_count)
-    log.debug("  Gerrit changes created: %d", len(all_urls))
+    log.debug("  Total PRs processed: %d", agg.processed_count)
+    log.debug("  Succeeded: %d", agg.succeeded_count)
+    log.debug("  Skipped (duplicates): %d", agg.skipped_count)
+    log.debug("  Failed: %d", agg.failed_count)
+    log.debug("  Gerrit changes created: %d", len(agg.all_urls))
     log.debug("=" * 60)
 
+
+def _process_bulk(data: Inputs, gh: GitHubContext) -> bool:
+    show_progress = env_bool("G2G_SHOW_PROGRESS", True)
+    target = gh.repository
+
+    progress_tracker = _build_bulk_progress_tracker(show_progress, target)
+
+    client = build_client()
+    repo = get_repo_from_env(client)
+
+    prs_list = list(iter_open_pulls(repo))
+    log.debug("Found %d open PRs to process", len(prs_list))
+
+    # Early exit if no PRs to process
+    if len(prs_list) == 0:
+        return _finish_bulk_no_prs(progress_tracker)
+
+    progress_tracker.update_operation(
+        f"🔨 Processing {len(prs_list)} open pull requests..."
+    )
+
+    # Use bounded parallel processing with shared clients
+    max_workers = min(
+        4, len(prs_list)
+    )  # Cap at 4 workers (no need for max(1, ...) since we exit early for 0)
+
+    pr_tasks = _build_bulk_pr_tasks(gh, prs_list)
+    agg = _run_bulk_pr_tasks(data, gh, progress_tracker, pr_tasks, max_workers)
+
+    _emit_bulk_outputs(agg)
+    _finish_bulk_progress(progress_tracker, agg, show_progress)
+    _log_bulk_summary(agg)
+
     # Return True if no failures occurred
-    return failed_count == 0
+    return agg.failed_count == 0
+
+
+def _prepare_single_checkout(
+    orch: Orchestrator,
+    workspace: Path,
+    data: Inputs,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Prepare the local workspace checkout for single-PR processing."""
+    try:
+        if progress_tracker:
+            progress_tracker.update_operation("📂 Preparing local checkout")
+        log.debug(
+            "Preparing workspace checkout in temporary directory: %s",
+            workspace,
+        )
+        log.debug("Repository URL: %s", gh.repository)
+        log.debug("Fetch depth: %s", data.fetch_depth)
+
+        try:
+            log.debug("About to call _prepare_workspace_checkout")
+            orch._prepare_workspace_checkout(inputs=data, gh=gh)
+            log.debug("Workspace checkout completed successfully")
+        except Exception:
+            log.exception("Workspace checkout failed")
+            log.debug("Full checkout exception details:", exc_info=True)
+            raise
+    except Exception as exc:
+        log.debug("Local checkout preparation failed: %s", exc)
+        if progress_tracker:
+            progress_tracker.add_error("Checkout preparation failed")
+
+
+def _log_single_pre_submit(
+    data: Inputs,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Emit SSH and commit-info progress updates before submission."""
+    if progress_tracker:
+        progress_tracker.update_operation("🔐 Configuring SSH authentication")
+
+    log.debug("Configuring SSH authentication for Gerrit access")
+    log.debug(
+        "Gerrit server: %s:%s", data.gerrit_server, data.gerrit_server_port
+    )
+
+    if progress_tracker:
+        progress_tracker.update_operation("🔍 Extracting commit information")
+
+    log.debug("Extracting commit information from PR")
+    log.debug("PR commits range: base_sha..head_sha (not available)")
+
+
+def _execute_single_orchestrator(
+    orch: Orchestrator, data: Inputs, gh: GitHubContext
+) -> SubmissionResult:
+    """Execute the orchestrator with the current operation mode."""
+    try:
+        # Pass operation mode to orchestrator
+        operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+        result = orch.execute(inputs=data, gh=gh, operation_mode=operation_mode)
+        log.debug("orch.execute() completed successfully")
+    except Exception as exc:
+        # Log error at debug level only - error_codes will handle
+        # user display
+        log.debug("Exception during orch.execute(): %s", exc)
+        raise
+    return result
+
+
+def _emit_single_outputs(result: SubmissionResult) -> None:
+    """Write single-PR results to the environment and GITHUB_OUTPUT."""
+    if result.change_urls:
+        os.environ["GERRIT_CHANGE_REQUEST_URL"] = "\n".join(result.change_urls)
+        # Log Gerrit change URL(s) for debugging
+        for url in result.change_urls:
+            log.debug("Gerrit change URL: %s", url)
+    if result.change_numbers:
+        os.environ["GERRIT_CHANGE_REQUEST_NUM"] = "\n".join(
+            result.change_numbers
+        )
+    if result.commit_shas:
+        os.environ["GERRIT_COMMIT_SHA"] = "\n".join(result.commit_shas)
+
+    # Also write outputs to GITHUB_OUTPUT if available
+    append_github_output(
+        {
+            "gerrit_change_request_url": "\n".join(result.change_urls)
+            if result.change_urls
+            else "",
+            "gerrit_change_request_num": "\n".join(result.change_numbers)
+            if result.change_numbers
+            else "",
+            "gerrit_commit_sha": "\n".join(result.commit_shas)
+            if result.commit_shas
+            else "",
+        }
+    )
+
+
+def _report_missing_update_change(
+    exc: OrchestratorError,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Show guidance when an UPDATE targets a non-existent Gerrit change."""
+    error_msg = str(exc)
+    if (
+        "no existing change found" in error_msg.lower()
+        or "UPDATE operation requires" in error_msg
+    ):
+        safe_console_print(
+            "❌ UPDATE FAILED: Cannot update non-existent Gerrit change",
+            style="red",
+            progress_tracker=progress_tracker,
+        )
+        safe_console_print(
+            f"💡 PR #{gh.pr_number} has not been previously "
+            f"processed by GitHub2Gerrit.",
+            style="yellow",
+            progress_tracker=progress_tracker,
+        )
+        safe_console_print(
+            "   To create a new change, set CREATE_MISSING=true "
+            "or add a '@github2gerrit create missing change' "
+            "comment on the PR.",
+            style="yellow",
+            progress_tracker=progress_tracker,
+        )
+        if progress_tracker:
+            progress_tracker.add_error("No existing change found for UPDATE")
+
+
+def _handle_single_structured_error(
+    exc: OrchestratorError | DuplicateChangeError | ConfigurationError,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> NoReturn:
+    """Convert a structured error, adding UPDATE-specific guidance first."""
+    # Enhanced error handling for UPDATE operations
+    operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+
+    if operation_mode == "update" and isinstance(exc, OrchestratorError):
+        _report_missing_update_change(exc, gh, progress_tracker)
+
+    # Convert and propagate structured errors
+    _convert_and_raise_structured_error(exc)
+
+
+def _report_verbose_command_error(
+    exc: CommandError,
+    basic_error: str,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Show detailed git stdout/stderr for a CommandError in verbose mode."""
+    detailed_msg = basic_error
+    if exc.stdout and exc.stdout.strip():
+        detailed_msg += f"\nGit stdout: {exc.stdout.strip()}"
+    if exc.stderr and exc.stderr.strip():
+        detailed_msg += f"\nGit stderr: {exc.stderr.strip()}"
+
+    # Show debugging suggestion for merge failures
+    if "merge --squash" in " ".join(exc.cmd or []):
+        detailed_msg += (
+            "\n💡 For local debugging: run 'git status' and "
+            "check for merge conflicts or uncommitted changes"
+        )
+
+    safe_console_print(f"❌ {detailed_msg}", style="red")
+    if progress_tracker:
+        progress_tracker.add_error(basic_error)
+        if exc.stderr and exc.stderr.strip():
+            progress_tracker.add_error(f"Details: {exc.stderr.strip()}")
+
+
+def _report_single_command_error(
+    exc: CommandError,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Render a CommandError with git command details."""
+    # Always show the basic error message
+    cmd_str = " ".join(exc.cmd) if exc.cmd else "unknown command"
+    basic_error = f"Git command failed: {cmd_str}"
+    if exc.returncode is not None:
+        basic_error += f" (exit code: {exc.returncode})"
+
+    # In verbose mode, show detailed stdout/stderr
+    if is_verbose_mode():
+        _report_verbose_command_error(exc, basic_error, progress_tracker)
+    else:
+        # In non-verbose mode, show basic error with hint to enable
+        # verbose
+        hint_msg = (
+            basic_error + "\n💡 Run with VERBOSE=true for detailed git output"
+        )
+        safe_console_print(f"❌ {hint_msg}", style="red")
+        if progress_tracker:
+            progress_tracker.add_error(basic_error)
+
+
+def _report_single_execution_error(
+    exc: Exception,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> None:
+    """Report a non-structured execution failure for single-PR processing."""
+    # Enhanced error handling for CommandError to show git command
+    # details
+    if isinstance(exc, CommandError):
+        _report_single_command_error(exc, progress_tracker)
+    else:
+        # For other exceptions, use original handling
+        error_msg = str(exc)
+        if progress_tracker:
+            progress_tracker.add_error(f"Execution failed: {error_msg}")
+        else:
+            safe_console_print(f"❌ Error: {error_msg}", style="red")
+
+    log.debug("Execution failed; continuing to write outputs: %s", exc)
+
+    # In verbose mode, also log the full exception with traceback
+    if is_verbose_mode():
+        log.exception("Full exception details:")
+
+
+def _run_single_submission(
+    orch: Orchestrator,
+    data: Inputs,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker | None,
+) -> tuple[bool, SubmissionResult]:
+    """Execute the Gerrit submission pipeline for a single PR."""
+    pipeline_success = False
+    try:
+        if progress_tracker:
+            progress_tracker.update_operation("⏩ Submitting to Gerrit")
+        log.debug("Starting Gerrit submission process")
+        log.debug("Dry run mode: %s", data.dry_run)
+        log.debug("About to call orch.execute() - where issues often occur")
+
+        result = _execute_single_orchestrator(orch, data, gh)
+
+        pipeline_success = True
+        log.debug("Gerrit submission completed successfully")
+
+        # Save derived parameters to config after successful submission
+        _save_derived_parameters_after_success(data)
+
+        if result.change_urls:
+            log.debug("Generated change URLs: %s", result.change_urls)
+        if progress_tracker:
+            progress_tracker.pr_processed()
+        _record_change_tracker_result(progress_tracker, result)
+    except GitHub2GerritError:
+        # Let our structured errors propagate to top level
+        raise
+    except (
+        OrchestratorError,
+        DuplicateChangeError,
+        ConfigurationError,
+    ) as exc:
+        _handle_single_structured_error(exc, gh, progress_tracker)
+    except Exception as exc:
+        _report_single_execution_error(exc, progress_tracker)
+        result = SubmissionResult(
+            change_urls=[], change_numbers=[], commit_shas=[]
+        )
+    return pipeline_success, result
 
 
 def _process_single(
@@ -1524,225 +2041,13 @@ def _process_single(
 ) -> tuple[bool, SubmissionResult]:
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
-
         orch = Orchestrator(workspace=workspace)
-
-        try:
-            if progress_tracker:
-                progress_tracker.update_operation("📂 Preparing local checkout")
-            log.debug(
-                "Preparing workspace checkout in temporary directory: %s",
-                workspace,
-            )
-            log.debug("Repository URL: %s", gh.repository)
-            log.debug("Fetch depth: %s", data.fetch_depth)
-
-            try:
-                log.debug("About to call _prepare_workspace_checkout")
-                orch._prepare_workspace_checkout(inputs=data, gh=gh)
-                log.debug("Workspace checkout completed successfully")
-            except Exception:
-                log.exception("Workspace checkout failed")
-                log.debug("Full checkout exception details:", exc_info=True)
-                raise
-        except Exception as exc:
-            log.debug("Local checkout preparation failed: %s", exc)
-            if progress_tracker:
-                progress_tracker.add_error("Checkout preparation failed")
-
-        if progress_tracker:
-            progress_tracker.update_operation(
-                "🔐 Configuring SSH authentication"
-            )
-
-        log.debug("Configuring SSH authentication for Gerrit access")
-        log.debug(
-            "Gerrit server: %s:%s", data.gerrit_server, data.gerrit_server_port
+        _prepare_single_checkout(orch, workspace, data, gh, progress_tracker)
+        _log_single_pre_submit(data, progress_tracker)
+        pipeline_success, result = _run_single_submission(
+            orch, data, gh, progress_tracker
         )
-
-        if progress_tracker:
-            progress_tracker.update_operation(
-                "🔍 Extracting commit information"
-            )
-
-        log.debug("Extracting commit information from PR")
-        log.debug("PR commits range: base_sha..head_sha (not available)")
-
-        pipeline_success = False
-        try:
-            if progress_tracker:
-                progress_tracker.update_operation("⏩ Submitting to Gerrit")
-            log.debug("Starting Gerrit submission process")
-            log.debug("Dry run mode: %s", data.dry_run)
-            log.debug("About to call orch.execute() - where issues often occur")
-
-            try:
-                # Pass operation mode to orchestrator
-                operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
-                result = orch.execute(
-                    inputs=data, gh=gh, operation_mode=operation_mode
-                )
-                log.debug("orch.execute() completed successfully")
-            except Exception as exc:
-                # Log error at debug level only - error_codes will handle
-                # user display
-                log.debug("Exception during orch.execute(): %s", exc)
-                raise
-
-            pipeline_success = True
-            log.debug("Gerrit submission completed successfully")
-
-            # Save derived parameters to config after successful submission
-            _save_derived_parameters_after_success(data)
-
-            if result.change_urls:
-                log.debug("Generated change URLs: %s", result.change_urls)
-            if progress_tracker:
-                progress_tracker.pr_processed()
-            if progress_tracker and result.change_urls:
-                if any("new" in url.lower() for url in result.change_urls):
-                    progress_tracker.change_submitted()
-                else:
-                    progress_tracker.change_updated()
-        except GitHub2GerritError:
-            # Let our structured errors propagate to top level
-            raise
-        except (
-            OrchestratorError,
-            DuplicateChangeError,
-            ConfigurationError,
-        ) as exc:
-            # Enhanced error handling for UPDATE operations
-            operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
-
-            if operation_mode == "update" and isinstance(
-                exc, OrchestratorError
-            ):
-                error_msg = str(exc)
-                if (
-                    "no existing change found" in error_msg.lower()
-                    or "UPDATE operation requires" in error_msg
-                ):
-                    safe_console_print(
-                        "❌ UPDATE FAILED: Cannot update non-existent "
-                        "Gerrit change",
-                        style="red",
-                        progress_tracker=progress_tracker,
-                    )
-                    safe_console_print(
-                        f"💡 PR #{gh.pr_number} has not been previously "
-                        f"processed by GitHub2Gerrit.",
-                        style="yellow",
-                        progress_tracker=progress_tracker,
-                    )
-                    safe_console_print(
-                        "   To create a new change, set CREATE_MISSING=true "
-                        "or add a '@github2gerrit create missing change' "
-                        "comment on the PR.",
-                        style="yellow",
-                        progress_tracker=progress_tracker,
-                    )
-                    if progress_tracker:
-                        progress_tracker.add_error(
-                            "No existing change found for UPDATE"
-                        )
-
-            # Convert and propagate structured errors
-            if isinstance(exc, OrchestratorError):
-                converted_error = convert_orchestrator_error(exc)
-            elif isinstance(exc, DuplicateChangeError):
-                converted_error = convert_duplicate_error(exc)
-            else:  # ConfigurationError
-                converted_error = convert_configuration_error(exc)
-            raise converted_error from exc
-        except Exception as exc:
-            # Enhanced error handling for CommandError to show git command
-            # details
-            if isinstance(exc, CommandError):
-                # Always show the basic error message
-                cmd_str = " ".join(exc.cmd) if exc.cmd else "unknown command"
-                basic_error = f"Git command failed: {cmd_str}"
-                if exc.returncode is not None:
-                    basic_error += f" (exit code: {exc.returncode})"
-
-                # In verbose mode, show detailed stdout/stderr
-                if is_verbose_mode():
-                    detailed_msg = basic_error
-                    if exc.stdout and exc.stdout.strip():
-                        detailed_msg += f"\nGit stdout: {exc.stdout.strip()}"
-                    if exc.stderr and exc.stderr.strip():
-                        detailed_msg += f"\nGit stderr: {exc.stderr.strip()}"
-
-                    # Show debugging suggestion for merge failures
-                    if "merge --squash" in " ".join(exc.cmd or []):
-                        detailed_msg += (
-                            "\n💡 For local debugging: run 'git status' and "
-                            "check for merge conflicts or uncommitted changes"
-                        )
-
-                    safe_console_print(f"❌ {detailed_msg}", style="red")
-                    if progress_tracker:
-                        progress_tracker.add_error(basic_error)
-                        if exc.stderr and exc.stderr.strip():
-                            progress_tracker.add_error(
-                                f"Details: {exc.stderr.strip()}"
-                            )
-                else:
-                    # In non-verbose mode, show basic error with hint to enable
-                    # verbose
-                    hint_msg = (
-                        basic_error
-                        + "\n💡 Run with VERBOSE=true for detailed git output"
-                    )
-                    safe_console_print(f"❌ {hint_msg}", style="red")
-                    if progress_tracker:
-                        progress_tracker.add_error(basic_error)
-            else:
-                # For other exceptions, use original handling
-                error_msg = str(exc)
-                if progress_tracker:
-                    progress_tracker.add_error(f"Execution failed: {error_msg}")
-                else:
-                    safe_console_print(f"❌ Error: {error_msg}", style="red")
-
-            log.debug("Execution failed; continuing to write outputs: %s", exc)
-
-            # In verbose mode, also log the full exception with traceback
-            if is_verbose_mode():
-                log.exception("Full exception details:")
-
-            result = SubmissionResult(
-                change_urls=[], change_numbers=[], commit_shas=[]
-            )
-        if result.change_urls:
-            os.environ["GERRIT_CHANGE_REQUEST_URL"] = "\n".join(
-                result.change_urls
-            )
-            # Log Gerrit change URL(s) for debugging
-            for url in result.change_urls:
-                log.debug("Gerrit change URL: %s", url)
-        if result.change_numbers:
-            os.environ["GERRIT_CHANGE_REQUEST_NUM"] = "\n".join(
-                result.change_numbers
-            )
-        if result.commit_shas:
-            os.environ["GERRIT_COMMIT_SHA"] = "\n".join(result.commit_shas)
-
-        # Also write outputs to GITHUB_OUTPUT if available
-        append_github_output(
-            {
-                "gerrit_change_request_url": "\n".join(result.change_urls)
-                if result.change_urls
-                else "",
-                "gerrit_change_request_num": "\n".join(result.change_numbers)
-                if result.change_numbers
-                else "",
-                "gerrit_commit_sha": "\n".join(result.commit_shas)
-                if result.commit_shas
-                else "",
-            }
-        )
-
+        _emit_single_outputs(result)
         return pipeline_success, result
 
 
@@ -2114,9 +2419,8 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
         log.info("PR closure reconciliation completed with warnings")
 
 
-def _process() -> None:
-    data = _load_effective_inputs()
-
+def _validate_inputs_or_raise(data: Inputs) -> None:
+    """Validate inputs, converting configuration errors for propagation."""
     try:
         _validate_inputs(data)
     except ConfigurationError as exc:
@@ -2124,29 +2428,23 @@ def _process() -> None:
         converted_error = convert_configuration_error(exc)
         raise converted_error from exc
 
-    gh = _read_github_context()
 
-    # G2G_NO_GERRIT reuses the existing DRY_RUN +
-    # G2G_DRYRUN_DISABLE_NETWORK code paths so that all tool logic runs
-    # but Gerrit network operations are no-ops. Cleanup tasks
-    # (abandoned-PR / Gerrit-change sweeps) are also suppressed because
-    # they would hit a non-existent server.
-    no_gerrit = env_bool("G2G_NO_GERRIT", False)
+def _apply_no_gerrit_overrides(data: Inputs, *, no_gerrit: bool) -> Inputs:
+    """Force DRY_RUN when G2G_NO_GERRIT is set and rebuild inputs."""
+    if not no_gerrit:
+        return data
+    log.info(
+        "🧪 G2G_NO_GERRIT enabled: forcing DRY_RUN=true and "
+        "G2G_DRYRUN_DISABLE_NETWORK=true"
+    )
+    os.environ["DRY_RUN"] = "true"
+    os.environ["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
+    # Rebuild inputs so the rest of the pipeline sees dry_run=True
+    return _load_effective_inputs()
 
-    if no_gerrit:
-        log.info(
-            "🧪 G2G_NO_GERRIT enabled: forcing DRY_RUN=true and "
-            "G2G_DRYRUN_DISABLE_NETWORK=true"
-        )
-        os.environ["DRY_RUN"] = "true"
-        os.environ["G2G_DRYRUN_DISABLE_NETWORK"] = "true"
-        # Rebuild inputs so the rest of the pipeline sees dry_run=True
-        data = _load_effective_inputs()
 
-    # Display config AFTER G2G_NO_GERRIT evaluation so the table
-    # reflects the actual runtime values (e.g. DRY_RUN forced true).
-    _display_effective_config(data, gh)
-
+def _log_configured_gerrit_server(data: Inputs) -> None:
+    """Log the configured Gerrit server (DNS validation deferred)."""
     # Log configured Gerrit server if present.  DNS validation is
     # handled by Orchestrator._resolve_gerrit_info() which covers
     # both explicit GERRIT_SERVER and .gitreview-derived hosts in
@@ -2159,158 +2457,152 @@ def _process() -> None:
             gerrit_host.strip(),
         )
 
-    # Detect PR operation mode for routing
-    operation_mode = gh.get_operation_mode()
-    if operation_mode != models.PROperationMode.UNKNOWN:
-        log.debug("🔍 Detected PR operation mode: %s", operation_mode.value)
-        if operation_mode == models.PROperationMode.UPDATE:
-            log.debug(
-                "📝 PR update (synchronize) event - will update existing "
-                "Gerrit change"
-            )
-        elif operation_mode == models.PROperationMode.CREATE:
-            log.debug(
-                "🆕 New PR (opened) event - will create new Gerrit change"
-            )
-        elif operation_mode == models.PROperationMode.EDIT:
-            log.debug("✏️  PR edit event - will sync metadata to Gerrit change")
-        elif operation_mode == models.PROperationMode.CLOSE:
-            pr_num = gh.pr_number or "unknown"
-            if no_gerrit:
-                log.debug(
-                    "🚪 Pull request #%s closed; Gerrit cleanup skipped "
-                    "(G2G_NO_GERRIT)",
-                    pr_num,
-                )
-                safe_console_print(
-                    f"🚪 Pull request #{pr_num} closed; "
-                    "Gerrit cleanup skipped (G2G_NO_GERRIT)"
-                )
-            else:
-                log.debug(
-                    "🚪 Pull request #%s closed; performing Gerrit cleanup",
-                    pr_num,
-                )
-                safe_console_print(
-                    f"🚪 Pull request #{pr_num} closed; "
-                    "performing Gerrit cleanup"
-                )
 
-            # Debug log prerequisites for abandoning Gerrit change
+def _log_abandoned_change_url(
+    data: Inputs, gh: GitHubContext, change_number: str
+) -> None:
+    """Log the abandoned Gerrit change URL, falling back to its number."""
+    try:
+        from .gerrit_urls import create_gerrit_url_builder
+
+        _url_builder = create_gerrit_url_builder(data.gerrit_server)
+        gerrit_change_url = _url_builder.change_url(
+            data.gerrit_project,
+            int(change_number),
+        )
+        log.debug(
+            "Successfully abandoned Gerrit change %s for pull request #%s",
+            gerrit_change_url,
+            gh.pr_number,
+        )
+    except Exception:
+        log.debug(
+            "Successfully abandoned Gerrit change %s for pull request #%s",
+            change_number,
+            gh.pr_number,
+        )
+
+
+def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
+    """Abandon the Gerrit change associated with a closed pull request."""
+    if gh.pr_number is None:
+        return
+    try:
+        log.debug(
+            "Checking for Gerrit change to abandon for PR #%s",
+            gh.pr_number,
+        )
+        change_number = abandon_gerrit_change_for_closed_pr(
+            pr_number=gh.pr_number,
+            gerrit_server=data.gerrit_server,
+            gerrit_project=data.gerrit_project,
+            repository=gh.repository,
+            dry_run=data.dry_run,
+            progress_tracker=None,
+        )
+        if change_number:
+            _log_abandoned_change_url(data, gh, change_number)
+            # Console output already done by
+            # abandon_gerrit_change_for_closed_pr
+        else:
             log.debug(
-                "Cleanup prerequisites - PR: %s, Server: %s, "
-                "Project: %s, Repo: %s",
+                "No open Gerrit change found for pull request #%s",
                 gh.pr_number,
-                data.gerrit_server,
-                data.gerrit_project,
-                gh.repository,
             )
+    except Exception as exc:
+        log.warning(
+            "Failed to abandon Gerrit change for PR #%s: %s",
+            gh.pr_number,
+            exc,
+        )
 
-            # First, abandon the specific Gerrit change for this closed PR
-            # Skip in G2G_NO_GERRIT: no Gerrit server to query
-            if (
-                not no_gerrit
-                and gh.pr_number
-                and data.gerrit_server
-                and data.gerrit_project
-                and gh.repository
-            ):
-                try:
-                    log.debug(
-                        "Checking for Gerrit change to abandon for PR #%s",
-                        gh.pr_number,
-                    )
-                    change_number = abandon_gerrit_change_for_closed_pr(
-                        pr_number=gh.pr_number,
-                        gerrit_server=data.gerrit_server,
-                        gerrit_project=data.gerrit_project,
-                        repository=gh.repository,
-                        dry_run=data.dry_run,
-                        progress_tracker=None,
-                    )
-                    if change_number:
-                        try:
-                            from .gerrit_urls import create_gerrit_url_builder
 
-                            _url_builder = create_gerrit_url_builder(
-                                data.gerrit_server
-                            )
-                            gerrit_change_url = _url_builder.change_url(
-                                data.gerrit_project,
-                                int(change_number),
-                            )
-                            log.debug(
-                                "Successfully abandoned Gerrit "
-                                "change %s for pull request #%s",
-                                gerrit_change_url,
-                                gh.pr_number,
-                            )
-                        except Exception:
-                            log.debug(
-                                "Successfully abandoned Gerrit "
-                                "change %s for pull request #%s",
-                                change_number,
-                                gh.pr_number,
-                            )
-                        # Console output already done by
-                        # abandon_gerrit_change_for_closed_pr
-                    else:
-                        log.debug(
-                            "No open Gerrit change found for pull request #%s",
-                            gh.pr_number,
-                        )
-                except Exception as exc:
-                    log.warning(
-                        "Failed to abandon Gerrit change for PR #%s: %s",
-                        gh.pr_number,
-                        exc,
-                    )
+def _handle_pr_closed(
+    data: Inputs, gh: GitHubContext, *, no_gerrit: bool
+) -> None:
+    """Perform Gerrit cleanup for a closed pull request."""
+    pr_num = gh.pr_number or "unknown"
+    if no_gerrit:
+        log.debug(
+            "🚪 Pull request #%s closed; Gerrit cleanup skipped "
+            "(G2G_NO_GERRIT)",
+            pr_num,
+        )
+        safe_console_print(
+            f"🚪 Pull request #{pr_num} closed; "
+            "Gerrit cleanup skipped (G2G_NO_GERRIT)"
+        )
+    else:
+        log.debug(
+            "🚪 Pull request #%s closed; performing Gerrit cleanup",
+            pr_num,
+        )
+        safe_console_print(
+            f"🚪 Pull request #{pr_num} closed; performing Gerrit cleanup"
+        )
 
-            # Run abandoned PR cleanup if enabled
-            # Skip in G2G_NO_GERRIT: no Gerrit server to query
-            if FORCE_ABANDONED_CLEANUP and not no_gerrit:
-                try:
-                    log.debug("Running abandoned PR cleanup...")
-                    if gh.repository and "/" in gh.repository:
-                        owner, repo = gh.repository.split("/", 1)
-                        cleanup_abandoned_prs_bulk(
-                            owner=owner,
-                            repo=repo,
-                            dry_run=data.dry_run,
-                            progress_tracker=None,
-                            close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
-                        )
-                except Exception as exc:
-                    log.warning("Abandoned PR cleanup failed: %s", exc)
+    # Debug log prerequisites for abandoning Gerrit change
+    log.debug(
+        "Cleanup prerequisites - PR: %s, Server: %s, Project: %s, Repo: %s",
+        gh.pr_number,
+        data.gerrit_server,
+        data.gerrit_project,
+        gh.repository,
+    )
 
-            # Run Gerrit cleanup if enabled
-            # Skip in G2G_NO_GERRIT: no Gerrit server to query
-            if FORCE_GERRIT_CLEANUP and not no_gerrit:
-                try:
-                    log.debug("Running Gerrit cleanup for closed GitHub PRs...")
-                    if data.gerrit_server and data.gerrit_project:
-                        cleanup_closed_github_prs(
-                            gerrit_server=data.gerrit_server,
-                            gerrit_project=data.gerrit_project,
-                            dry_run=data.dry_run,
-                            progress_tracker=None,
-                        )
-                except Exception as exc:
-                    log.warning("Gerrit cleanup failed: %s", exc)
+    # First, abandon the specific Gerrit change for this closed PR
+    # Skip in G2G_NO_GERRIT: no Gerrit server to query
+    if (
+        not no_gerrit
+        and gh.pr_number
+        and data.gerrit_server
+        and data.gerrit_project
+        and gh.repository
+    ):
+        _abandon_change_for_closed_pr(data, gh)
 
-            log.debug(
-                "Cleanup operations completed for closed PR #%s",
-                gh.pr_number or "unknown",
-            )
-            return
+    _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
 
-    # Close merged/abandoned PRs: handle Gerrit events closing GitHub PRs
-    # This runs in three scenarios:
-    # 1. Push events (when Gerrit syncs back to GitHub)
-    #    with CLOSE_MERGED_PRS enabled
-    # 2. Direct Gerrit change URL provided in CLI
-    # 3. Gerrit event dispatched via workflow_dispatch (GERRIT_CHANGE_URL set)
+    log.debug(
+        "Cleanup operations completed for closed PR #%s",
+        gh.pr_number or "unknown",
+    )
 
+
+def _handle_pr_operation_mode(
+    data: Inputs,
+    gh: GitHubContext,
+    operation_mode: models.PROperationMode,
+    *,
+    no_gerrit: bool,
+) -> bool:
+    """Log the PR operation mode; handle CLOSE. Return True if fully done."""
+    if operation_mode == models.PROperationMode.UNKNOWN:
+        return False
+
+    log.debug("🔍 Detected PR operation mode: %s", operation_mode.value)
+    if operation_mode == models.PROperationMode.UPDATE:
+        log.debug(
+            "📝 PR update (synchronize) event - will update existing "
+            "Gerrit change"
+        )
+    elif operation_mode == models.PROperationMode.CREATE:
+        log.debug("🆕 New PR (opened) event - will create new Gerrit change")
+    elif operation_mode == models.PROperationMode.EDIT:
+        log.debug("✏️  PR edit event - will sync metadata to Gerrit change")
+    elif operation_mode == models.PROperationMode.CLOSE:
+        _handle_pr_closed(data, gh, no_gerrit=no_gerrit)
+        return True
+    return False
+
+
+def _handle_gerrit_change_events(
+    data: Inputs, gh: GitHubContext, *, no_gerrit: bool
+) -> bool:
+    """Process Gerrit change events and push cleanup.
+
+    Return True when processing is complete and the caller should stop.
+    """
     gerrit_event_change_url = os.getenv("GERRIT_CHANGE_URL")
     gerrit_event_type = os.getenv("GERRIT_EVENT_TYPE")
 
@@ -2353,155 +2645,201 @@ def _process() -> None:
 
     # Run cleanup tasks for Gerrit events and legacy G2G_GERRIT_CHANGE_URL
     if gerrit_event_change_url or gerrit_change_url:
-        # Run abandoned PR cleanup if enabled
-        # Skip in G2G_NO_GERRIT: no Gerrit server to query
-        if FORCE_ABANDONED_CLEANUP and not no_gerrit:
-            try:
-                log.debug("Running abandoned PR cleanup...")
-                if gh.repository and "/" in gh.repository:
-                    owner, repo = gh.repository.split("/", 1)
-                    cleanup_abandoned_prs_bulk(
-                        owner=owner,
-                        repo=repo,
-                        dry_run=data.dry_run,
-                        progress_tracker=None,
-                        close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
-                    )
-            except Exception as exc:
-                log.warning("Abandoned PR cleanup failed: %s", exc)
-
-        # Run Gerrit cleanup if enabled
-        # Skip in G2G_NO_GERRIT: no Gerrit server to query
-        if FORCE_GERRIT_CLEANUP and not no_gerrit:
-            try:
-                log.debug("Running Gerrit cleanup for closed GitHub PRs...")
-                if data.gerrit_server and data.gerrit_project:
-                    cleanup_closed_github_prs(
-                        gerrit_server=data.gerrit_server,
-                        gerrit_project=data.gerrit_project,
-                        dry_run=data.dry_run,
-                        progress_tracker=None,
-                    )
-            except Exception as exc:
-                log.warning("Gerrit cleanup failed: %s", exc)
-
+        _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
         # Exit successfully after cleanup
-        return
-    elif gh.event_name == "push" and env_bool("CLOSE_MERGED_PRS", True):
+        return True
+    if gh.event_name == "push" and env_bool("CLOSE_MERGED_PRS", True):
         log.info("🔄 Detected push event with CLOSE_MERGED_PRS enabled")
         log.info("Processing merged Gerrit changes to close GitHub PRs")
         _process_close_merged_prs(data, gh)
-
-        # Run abandoned PR cleanup if enabled
-        # Skip in G2G_NO_GERRIT: no Gerrit server to query
-        if FORCE_ABANDONED_CLEANUP and not no_gerrit:
-            try:
-                log.debug("Running abandoned PR cleanup...")
-                if gh.repository and "/" in gh.repository:
-                    owner, repo = gh.repository.split("/", 1)
-                    cleanup_abandoned_prs_bulk(
-                        owner=owner,
-                        repo=repo,
-                        dry_run=data.dry_run,
-                        progress_tracker=None,
-                        close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
-                    )
-            except Exception as exc:
-                log.warning("Abandoned PR cleanup failed: %s", exc)
-
-        # Run Gerrit cleanup if enabled
-        # Skip in G2G_NO_GERRIT: no Gerrit server to query
-        if FORCE_GERRIT_CLEANUP and not no_gerrit:
-            try:
-                log.info("Running Gerrit cleanup for closed GitHub PRs...")
-                if data.gerrit_server and data.gerrit_project:
-                    cleanup_closed_github_prs(
-                        gerrit_server=data.gerrit_server,
-                        gerrit_project=data.gerrit_project,
-                        dry_run=data.dry_run,
-                        progress_tracker=None,
-                    )
-            except Exception as exc:
-                log.warning("Gerrit cleanup failed: %s", exc)
-
-        return
-
-    # Test mode: short-circuit after validation
-    if env_bool("G2G_TEST_MODE", False):
-        log.debug("Validation complete. Ready to execute submission pipeline.")
-        safe_typer_echo(
-            "Validation complete. Ready to execute submission pipeline."
+        _run_gerrit_cleanup_tasks(
+            data, gh, no_gerrit=no_gerrit, gerrit_cleanup_info_log=True
         )
-        return
+        return True
+    return False
 
-    # Bulk mode for URL/workflow_dispatch
+
+def _handle_bulk_mode(
+    data: Inputs, gh: GitHubContext, *, no_gerrit: bool
+) -> bool:
+    """Run bulk mode for URL/workflow_dispatch. Return True if handled."""
     sync_all = env_bool("SYNC_ALL_OPEN_PRS", False)
     # When a target URL was provided via CLI, G2G_TARGET_URL is set
     # to the actual URL string (truthy check works for non-empty strings)
-    if sync_all and (
-        gh.event_name == "workflow_dispatch" or os.getenv("G2G_TARGET_URL")
+    if not (
+        sync_all
+        and (
+            gh.event_name == "workflow_dispatch" or os.getenv("G2G_TARGET_URL")
+        )
     ):
-        bulk_success = _process_bulk(data, gh)
+        return False
 
-        try:
-            log_api_metrics_summary()
-        except Exception as exc:
-            log.debug("Failed to log API metrics summary: %s", exc)
+    bulk_success = _process_bulk(data, gh)
 
-        # Final success/failure message for processing
-        # Note: Success message already shown in _process_bulk summary
-        # Only log to debug here for consistency
-        if bulk_success:
-            log.debug("Processing completed ✅")
+    try:
+        log_api_metrics_summary()
+    except Exception as exc:
+        log.debug("Failed to log API metrics summary: %s", exc)
 
-            # Run abandoned PR cleanup if enabled
-            # Skip in G2G_NO_GERRIT: no Gerrit server to query
-            if FORCE_ABANDONED_CLEANUP and not no_gerrit:
-                try:
-                    log.debug("Running abandoned PR cleanup...")
-                    if gh.repository and "/" in gh.repository:
-                        owner, repo = gh.repository.split("/", 1)
-                        cleanup_abandoned_prs_bulk(
-                            owner=owner,
-                            repo=repo,
-                            dry_run=data.dry_run,
-                            progress_tracker=None,
-                            close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
-                        )
-                except Exception as exc:
-                    log.warning("Abandoned PR cleanup failed: %s", exc)
+    # Final success/failure message for processing
+    # Note: Success message already shown in _process_bulk summary
+    # Only log to debug here for consistency
+    if bulk_success:
+        log.debug("Processing completed ✅")
+        _run_gerrit_cleanup_tasks(
+            data, gh, no_gerrit=no_gerrit, gerrit_cleanup_info_log=True
+        )
+    else:
+        # exit_with_error already displays the message via
+        # safe_console_print
+        log.error(
+            "Processing failed, exit status %d ❌",
+            ExitCode.GENERAL_ERROR.value,
+        )
+        exit_with_error(
+            ExitCode.GENERAL_ERROR,
+            message=(
+                f"Processing failed, exit status "
+                f"{ExitCode.GENERAL_ERROR.value} ❌"
+            ),
+        )
 
-            # Run Gerrit cleanup if enabled
-            # Skip in G2G_NO_GERRIT: no Gerrit server to query
-            if FORCE_GERRIT_CLEANUP and not no_gerrit:
-                try:
-                    log.info("Running Gerrit cleanup for closed GitHub PRs...")
-                    if data.gerrit_server and data.gerrit_project:
-                        cleanup_closed_github_prs(
-                            gerrit_server=data.gerrit_server,
-                            gerrit_project=data.gerrit_project,
-                            dry_run=data.dry_run,
-                            progress_tracker=None,
-                        )
-                except Exception as exc:
-                    log.warning("Gerrit cleanup failed: %s", exc)
-        else:
-            # exit_with_error already displays the message via
-            # safe_console_print
-            log.error(
-                "Processing failed, exit status %d ❌",
-                ExitCode.GENERAL_ERROR.value,
-            )
-            exit_with_error(
-                ExitCode.GENERAL_ERROR,
-                message=(
-                    f"Processing failed, exit status "
-                    f"{ExitCode.GENERAL_ERROR.value} ❌"
-                ),
-            )
+    return True
 
+
+def _handle_single_pr_duplicate_error(
+    exc: DuplicateChangeError,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> NoReturn:
+    """Report a detected duplicate Gerrit change and exit."""
+    if progress_tracker:
+        progress_tracker.add_error("Duplicate change detected")
+        progress_tracker.stop()
+
+    # Display clear Rich console output for duplicate detection
+    if exc.urls:
+        urls_display = ", ".join(exc.urls)
+        safe_console_print(
+            f"❌ Duplicate Gerrit change blocked submission: {urls_display}",
+            style="red",
+            progress_tracker=progress_tracker,
+        )
+    else:
+        safe_console_print(
+            "❌ Duplicate Gerrit change blocked submission",
+            style="red",
+            progress_tracker=progress_tracker,
+        )
+
+    safe_console_print(
+        "💡 Use --allow-duplicates to override this check.",
+        style="yellow",
+        progress_tracker=progress_tracker,
+    )
+    exit_for_duplicate_error(
+        message=(
+            "❌ Duplicate change detected; use --allow-duplicates to override"
+        ),
+        details=str(exc),
+        exception=exc,
+    )
+
+
+def _check_single_pr_duplicates(
+    data: Inputs,
+    gh: GitHubContext,
+    operation_mode: models.PROperationMode,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> None:
+    """Check for duplicate Gerrit changes before single-PR submission."""
+    # For UPDATE operations, skip duplicate check - we EXPECT a change
+    if operation_mode == models.PROperationMode.UPDATE:
+        log.debug(
+            "⏩ Skipping duplicate check for UPDATE operation "
+            "(change expected to exist)"
+        )
         return
+    try:
+        if data.duplicates_filter:
+            os.environ["DUPLICATE_TYPES"] = data.duplicates_filter
+        # Generate expected GitHub hash for trailer-aware duplicate
+        # detection
+        expected_github_hash = DuplicateDetector._generate_github_change_hash(
+            gh
+        )
 
+        # Only check for duplicates if not allowed
+        if not data.allow_duplicates:
+            if progress_tracker:
+                progress_tracker.update_operation("+ Checking for duplicates")
+            log.debug(
+                "Starting duplicate detection for PR #%s in %s",
+                gh.pr_number,
+                gh.repository,
+            )
+            log.debug(
+                "Expected GitHub hash for duplicate detection: %s",
+                expected_github_hash,
+            )
+            check_for_duplicates(
+                gh,
+                allow_duplicates=data.allow_duplicates,
+                expected_github_hash=expected_github_hash,
+            )
+            log.debug("Duplicate check completed successfully")
+            if progress_tracker:
+                progress_tracker.update_operation(
+                    "✅ Duplicate check completed"
+                )
+        else:
+            log.debug(
+                "Skipping duplicate check for PR #%s (allow_duplicates=True)",
+                gh.pr_number,
+            )
+    except DuplicateChangeError as exc:
+        _handle_single_pr_duplicate_error(exc, progress_tracker)
+
+
+def _print_single_pr_summary(
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+    pipeline_success: bool,
+    result: SubmissionResult,
+) -> None:
+    """Print the Rich console summary after single-PR processing."""
+    summary = progress_tracker.get_summary() if progress_tracker else {}
+    safe_console_print("")
+    safe_console_print(
+        "✅ Operation completed!"
+        if pipeline_success
+        else "❌ Operation failed!",
+        style="green" if pipeline_success else "red",
+    )
+    safe_console_print(
+        f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
+    )
+    if summary.get("prs_processed", 0) > 0:
+        safe_console_print(f"📊 PRs processed: {summary['prs_processed']}")
+    if summary.get("changes_submitted", 0) > 0:
+        safe_console_print(
+            f"🔄 Changes submitted: {summary['changes_submitted']}"
+        )
+    if summary.get("changes_updated", 0) > 0:
+        safe_console_print(f"📝 Changes updated: {summary['changes_updated']}")
+
+    # Show Gerrit change URL(s) in final summary
+    if pipeline_success and result.change_urls:
+        for url in result.change_urls:
+            safe_console_print(f"🔗 Gerrit change: {url}", style="green")
+
+
+def _handle_single_pr(
+    data: Inputs,
+    gh: GitHubContext,
+    operation_mode: models.PROperationMode,
+    *,
+    no_gerrit: bool,
+) -> None:
+    """Execute the single-PR submission pipeline."""
     if not gh.pr_number:
         log.error(
             "PR_NUMBER is empty. This tool requires a valid pull request "
@@ -2521,8 +2859,6 @@ def _process() -> None:
 
     # Store operation mode in environment for downstream use
     os.environ["G2G_OPERATION_MODE"] = operation_mode.value
-
-    # Test mode handled earlier
 
     # Execute single-PR submission
     # Initialize progress tracker
@@ -2549,88 +2885,8 @@ def _process() -> None:
         _extract_and_display_pr_info(gh, data, progress_tracker)
 
     # Check for duplicates in single-PR mode (before workspace setup)
-    # For UPDATE operations, skip duplicate check - we EXPECT a change to exist
     if gh.pr_number and not env_bool("SYNC_ALL_OPEN_PRS", False):
-        if operation_mode == models.PROperationMode.UPDATE:
-            log.debug(
-                "⏩ Skipping duplicate check for UPDATE operation "
-                "(change expected to exist)"
-            )
-        else:
-            try:
-                if data.duplicates_filter:
-                    os.environ["DUPLICATE_TYPES"] = data.duplicates_filter
-                # Generate expected GitHub hash for trailer-aware duplicate
-                # detection
-                expected_github_hash = (
-                    DuplicateDetector._generate_github_change_hash(gh)
-                )
-
-                # Only check for duplicates if not allowed
-                if not data.allow_duplicates:
-                    if progress_tracker:
-                        progress_tracker.update_operation(
-                            "+ Checking for duplicates"
-                        )
-                    log.debug(
-                        "Starting duplicate detection for PR #%s in %s",
-                        gh.pr_number,
-                        gh.repository,
-                    )
-                    log.debug(
-                        "Expected GitHub hash for duplicate detection: %s",
-                        expected_github_hash,
-                    )
-                    check_for_duplicates(
-                        gh,
-                        allow_duplicates=data.allow_duplicates,
-                        expected_github_hash=expected_github_hash,
-                    )
-                    log.debug("Duplicate check completed successfully")
-                    if progress_tracker:
-                        progress_tracker.update_operation(
-                            "✅ Duplicate check completed"
-                        )
-                else:
-                    log.debug(
-                        "Skipping duplicate check for PR #%s "
-                        "(allow_duplicates=True)",
-                        gh.pr_number,
-                    )
-            except DuplicateChangeError as exc:
-                if progress_tracker:
-                    progress_tracker.add_error("Duplicate change detected")
-                    progress_tracker.stop()
-
-                # Display clear Rich console output for duplicate detection
-                if exc.urls:
-                    urls_display = ", ".join(exc.urls)
-                    safe_console_print(
-                        f"❌ Duplicate Gerrit change blocked submission: "
-                        f"{urls_display}",
-                        style="red",
-                        progress_tracker=progress_tracker,
-                    )
-                else:
-                    safe_console_print(
-                        "❌ Duplicate Gerrit change blocked submission",
-                        style="red",
-                        progress_tracker=progress_tracker,
-                    )
-
-                safe_console_print(
-                    "💡 Use --allow-duplicates to override this check.",
-                    style="yellow",
-                    progress_tracker=progress_tracker,
-                )
-                exit_for_duplicate_error(
-                    message=(
-                        "❌ Duplicate change detected; use "
-                        "--allow-duplicates to override"
-                    ),
-                    details=str(exc),
-                    exception=exc,
-                )
+        _check_single_pr_duplicates(data, gh, operation_mode, progress_tracker)
 
     progress_tracker.update_operation("🤝 Processing pull request")
 
@@ -2640,40 +2896,10 @@ def _process() -> None:
     log.debug("Target Gerrit project: %s", data.gerrit_project)
     pipeline_success, result = _process_single(data, gh, progress_tracker)
 
-    # Run abandoned PR cleanup if enabled and pipeline was successful
+    # Run abandoned-PR and Gerrit cleanup if the pipeline was successful
     # Skip in G2G_NO_GERRIT: no Gerrit server to query
-    if pipeline_success and FORCE_ABANDONED_CLEANUP and not no_gerrit:
-        try:
-            log.debug("Running abandoned PR cleanup...")
-            # Extract owner and repo from gh.repository (format: "owner/repo")
-            if gh.repository and "/" in gh.repository:
-                owner, repo = gh.repository.split("/", 1)
-                cleanup_abandoned_prs_bulk(
-                    owner=owner,
-                    repo=repo,
-                    dry_run=data.dry_run,
-                    progress_tracker=None,
-                    close_merged_prs=env_bool("CLOSE_MERGED_PRS", True),
-                )
-        except Exception as exc:
-            # Don't fail the whole pipeline if cleanup fails
-            log.warning("Abandoned PR cleanup failed: %s", exc)
-
-    # Run Gerrit cleanup if enabled and pipeline was successful
-    # Skip in G2G_NO_GERRIT: no Gerrit server to query
-    if pipeline_success and FORCE_GERRIT_CLEANUP and not no_gerrit:
-        try:
-            log.debug("Running Gerrit cleanup for closed GitHub PRs...")
-            if data.gerrit_server and data.gerrit_project:
-                cleanup_closed_github_prs(
-                    gerrit_server=data.gerrit_server,
-                    gerrit_project=data.gerrit_project,
-                    dry_run=data.dry_run,
-                    progress_tracker=None,
-                )
-        except Exception as exc:
-            # Don't fail the whole pipeline if cleanup fails
-            log.warning("Gerrit cleanup failed: %s", exc)
+    if pipeline_success:
+        _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
 
     try:
         log_api_metrics_summary()
@@ -2686,32 +2912,7 @@ def _process() -> None:
 
     # Show summary after progress tracker is stopped
     if show_progress and RICH_AVAILABLE:
-        summary = progress_tracker.get_summary() if progress_tracker else {}
-        safe_console_print("")
-        safe_console_print(
-            "✅ Operation completed!"
-            if pipeline_success
-            else "❌ Operation failed!",
-            style="green" if pipeline_success else "red",
-        )
-        safe_console_print(
-            f"⏳ Total time: {summary.get('elapsed_time', 'unknown')}"
-        )
-        if summary.get("prs_processed", 0) > 0:
-            safe_console_print(f"📊 PRs processed: {summary['prs_processed']}")
-        if summary.get("changes_submitted", 0) > 0:
-            safe_console_print(
-                f"🔄 Changes submitted: {summary['changes_submitted']}"
-            )
-        if summary.get("changes_updated", 0) > 0:
-            safe_console_print(
-                f"📝 Changes updated: {summary['changes_updated']}"
-            )
-
-        # Show Gerrit change URL(s) in final summary
-        if pipeline_success and result.change_urls:
-            for url in result.change_urls:
-                safe_console_print(f"🔗 Gerrit change: {url}", style="green")
+        _print_single_pr_summary(progress_tracker, pipeline_success, result)
 
     # Final success/failure message after all cleanup
     if pipeline_success:
@@ -2724,6 +2925,47 @@ def _process() -> None:
         )
 
     return
+
+
+def _process() -> None:
+    data = _load_effective_inputs()
+    _validate_inputs_or_raise(data)
+    gh = _read_github_context()
+
+    # G2G_NO_GERRIT reuses the existing DRY_RUN +
+    # G2G_DRYRUN_DISABLE_NETWORK code paths so that all tool logic runs
+    # but Gerrit network operations are no-ops. Cleanup tasks
+    # (abandoned-PR / Gerrit-change sweeps) are also suppressed because
+    # they would hit a non-existent server.
+    no_gerrit = env_bool("G2G_NO_GERRIT", False)
+    data = _apply_no_gerrit_overrides(data, no_gerrit=no_gerrit)
+
+    # Display config AFTER G2G_NO_GERRIT evaluation so the table
+    # reflects the actual runtime values (e.g. DRY_RUN forced true).
+    _display_effective_config(data, gh)
+
+    _log_configured_gerrit_server(data)
+
+    # Detect PR operation mode for routing
+    operation_mode = gh.get_operation_mode()
+    if _handle_pr_operation_mode(data, gh, operation_mode, no_gerrit=no_gerrit):
+        return
+
+    if _handle_gerrit_change_events(data, gh, no_gerrit=no_gerrit):
+        return
+
+    # Test mode: short-circuit after validation
+    if env_bool("G2G_TEST_MODE", False):
+        log.debug("Validation complete. Ready to execute submission pipeline.")
+        safe_typer_echo(
+            "Validation complete. Ready to execute submission pipeline."
+        )
+        return
+
+    if _handle_bulk_mode(data, gh, no_gerrit=no_gerrit):
+        return
+
+    _handle_single_pr(data, gh, operation_mode, no_gerrit=no_gerrit)
 
 
 def _mask_secret(value: str, keep: int = 4) -> str:
@@ -2937,6 +3179,171 @@ def _get_ssh_agent_status() -> str:
         return "❎ Unavailable, Unused"
 
 
+@dataclass(frozen=True)
+class _ConfigDisplay:
+    """Precomputed values for rendering the effective-config table."""
+
+    mode_label: str
+    mode_description: str
+    no_gerrit_enabled: bool
+    is_closing_pr_mode: bool
+    known_hosts_status: str
+    privkey_status: str
+    github_token_status: str
+    ssh_agent_status: str
+    cleanup_abandoned: bool
+    cleanup_gerrit: bool
+
+
+def _compute_config_mode_description(
+    github_mode: bool,
+    gh: GitHubContext,
+    target_url_type: str,
+    *,
+    is_closing_pr_mode: bool,
+) -> str:
+    """Derive the human-readable mode description for the config table."""
+    if is_closing_pr_mode:
+        return "✅ Closing GitHub pull request"
+    if target_url_type == "github_pr" or gh.pr_number:
+        return "✅ Gerrit change from pull request"
+    if target_url_type == "github_repo":
+        return "✅ Gerrit changes from repository"
+    if github_mode:
+        return "✅ GitHub Actions mode"
+    return "✅ CLI mode"
+
+
+def _compute_config_credential_statuses(
+    data: Inputs, *, github_mode: bool
+) -> tuple[str, str, str]:
+    """Return known-hosts, private-key and token status indicators."""
+    # Avoid displaying sensitive values - use context-appropriate indicators
+    # For known hosts: ❎ in local mode (normal), ❌ in CI mode (error)
+    if data.gerrit_known_hosts:
+        known_hosts_status = "✅"
+    else:
+        known_hosts_status = "❌" if github_mode else "❎"
+
+    # For SSH private key: ❎ in local mode (normal), ❌ in CI mode (error)
+    if data.gerrit_ssh_privkey_g2g:
+        privkey_status = "✅"
+    else:
+        privkey_status = "❌" if github_mode else "❎"
+
+    # For GitHub token: ❎ in local mode (optional), ❌ in CI mode (required)
+    if data.github_token:
+        github_token_status = "✅"  # noqa: S105
+    else:
+        github_token_status = "❌" if github_mode else "❎"
+    return known_hosts_status, privkey_status, github_token_status
+
+
+def _add_closing_pr_config(
+    config_info: dict[str, str], data: Inputs, ctx: _ConfigDisplay
+) -> None:
+    """Populate the minimal config shown while closing a pull request."""
+    # In PR closing mode, only show minimal relevant config
+    if data.dry_run:
+        config_info["DRY_RUN"] = str(data.dry_run)
+
+    # Show organization if set (helps identify which GitHub org to query)
+    if data.organization:
+        config_info["ORGANIZATION"] = data.organization
+
+    # Show GitHub token status (required for closing PRs)
+    config_info["GITHUB_TOKEN"] = ctx.github_token_status
+
+
+def _add_full_config(
+    config_info: dict[str, str], data: Inputs, ctx: _ConfigDisplay
+) -> None:
+    """Populate the full config shown in Gerrit change creation mode."""
+    # In Gerrit change creation mode, show full config
+    # Only show non-default boolean values
+    if data.submit_single_commits:
+        config_info["SUBMIT_SINGLE_COMMITS"] = str(data.submit_single_commits)
+    if data.use_pr_as_commit:
+        config_info["USE_PR_AS_COMMIT"] = str(data.use_pr_as_commit)
+    if data.dry_run:
+        config_info["DRY_RUN"] = str(data.dry_run)
+
+    # Only show non-default fetch depth
+    if data.fetch_depth != 10:
+        config_info["FETCH_DEPTH"] = str(data.fetch_depth)
+
+    # SSH user and email first
+    if data.gerrit_ssh_user_g2g:
+        config_info["GERRIT_SSH_USER_G2G"] = data.gerrit_ssh_user_g2g
+    if data.gerrit_ssh_user_g2g_email:
+        config_info["GERRIT_SSH_USER_G2G_EMAIL"] = (
+            data.gerrit_ssh_user_g2g_email
+        )
+    if data.organization:
+        config_info["ORGANIZATION"] = data.organization
+    if data.reviewers_email:
+        config_info["REVIEWERS_EMAIL"] = data.reviewers_email
+
+    # Only show non-default boolean values
+    if data.preserve_github_prs:
+        config_info["PRESERVE_GITHUB_PRS"] = str(data.preserve_github_prs)
+    if data.ci_testing:
+        config_info["CI_TESTING"] = str(data.ci_testing)
+
+    # Show Issue ID if provided
+    if data.issue_id:
+        config_info["ISSUE_ID"] = data.issue_id
+    else:
+        config_info["ISSUE_ID"] = "❎ Not provided"
+
+    # Show Gerrit settings if they have values
+    if data.gerrit_server:
+        config_info["GERRIT_SERVER"] = data.gerrit_server
+    # Only show non-default port (29418 is default)
+    if data.gerrit_server_port and data.gerrit_server_port != 29418:
+        config_info["GERRIT_SERVER_PORT"] = str(data.gerrit_server_port)
+    if data.gerrit_project:
+        config_info["GERRIT_PROJECT"] = data.gerrit_project
+
+    # Move credentials to bottom of table
+    # Always show known hosts status
+    if data.gerrit_known_hosts or not data.gerrit_known_hosts:
+        config_info["GERRIT_KNOWN_HOSTS"] = ctx.known_hosts_status
+    config_info["GERRIT_SSH_PRIVKEY_G2G"] = ctx.privkey_status
+    config_info["GITHUB_TOKEN"] = ctx.github_token_status
+    config_info["SSH_AGENT"] = ctx.ssh_agent_status
+
+    # Show cleanup abandoned status if enabled
+    if ctx.cleanup_abandoned:
+        config_info["CLEANUP_ABANDONED"] = "✅"
+
+    # Show Gerrit cleanup status if enabled
+    if ctx.cleanup_gerrit:
+        config_info["CLEANUP_GERRIT"] = "✅"
+
+
+def _build_config_info(data: Inputs, ctx: _ConfigDisplay) -> dict[str, str]:
+    """Build the ordered configuration mapping for display."""
+    # Build configuration data, filtering out empty/default values
+    # Order items logically: Mode first, then behavioral settings,
+    # then credentials
+    config_info: dict[str, str] = {}
+
+    # Mode first - always show
+    config_info[ctx.mode_label] = ctx.mode_description
+
+    # Show G2G_NO_GERRIT regardless of operation mode so logs always
+    # indicate when the run is using test infrastructure.
+    if ctx.no_gerrit_enabled:
+        config_info["G2G_NO_GERRIT"] = "🧪"
+
+    if ctx.is_closing_pr_mode:
+        _add_closing_pr_config(config_info, data, ctx)
+    else:
+        _add_full_config(config_info, data, ctx)
+    return config_info
+
+
 def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     """Display effective configuration in a formatted table."""
     # Use env_bool for consistent boolean parsing across the codebase
@@ -2963,125 +3370,31 @@ def _display_effective_config(data: Inputs, gh: GitHubContext) -> None:
     # Check if Gerrit cleanup is enabled
     cleanup_gerrit = FORCE_GERRIT_CLEANUP or env_bool("CLEANUP_GERRIT", False)
 
-    if is_closing_pr_mode:
-        mode_description = "✅ Closing GitHub pull request"
-    elif target_url_type == "github_pr" or gh.pr_number:
-        mode_description = "✅ Gerrit change from pull request"
-    elif target_url_type == "github_repo":
-        mode_description = "✅ Gerrit changes from repository"
-    elif github_mode:
-        mode_description = "✅ GitHub Actions mode"
-    else:
-        mode_description = "✅ CLI mode"
+    mode_description = _compute_config_mode_description(
+        github_mode,
+        gh,
+        target_url_type,
+        is_closing_pr_mode=is_closing_pr_mode,
+    )
 
-    # Avoid displaying sensitive values - use context-appropriate indicators
-    # For known hosts: ❎ in local mode (normal), ❌ in CI mode (error)
-    if data.gerrit_known_hosts:
-        known_hosts_status = "✅"
-    else:
-        known_hosts_status = "❌" if github_mode else "❎"
-
-    # For SSH private key: ❎ in local mode (normal), ❌ in CI mode (error)
-    if data.gerrit_ssh_privkey_g2g:
-        privkey_status = "✅"
-    else:
-        privkey_status = "❌" if github_mode else "❎"
-
-    # For GitHub token: ❎ in local mode (optional), ❌ in CI mode (required)
-    if data.github_token:
-        github_token_status = "✅"  # noqa: S105
-    else:
-        github_token_status = "❌" if github_mode else "❎"
+    known_hosts_status, privkey_status, github_token_status = (
+        _compute_config_credential_statuses(data, github_mode=github_mode)
+    )
     ssh_agent_status = _get_ssh_agent_status()
 
-    # Build configuration data, filtering out empty/default values
-    # Order items logically: Mode first, then behavioral settings,
-    # then credentials
-    config_info = {}
-
-    # Mode first - always show
-    config_info[mode_label] = mode_description
-
-    # Show G2G_NO_GERRIT regardless of operation mode so logs always
-    # indicate when the run is using test infrastructure.
-    if no_gerrit_enabled:
-        config_info["G2G_NO_GERRIT"] = "🧪"
-
-    if is_closing_pr_mode:
-        # In PR closing mode, only show minimal relevant config
-        if data.dry_run:
-            config_info["DRY_RUN"] = str(data.dry_run)
-
-        # Show organization if set (helps identify which GitHub org to query)
-        if data.organization:
-            config_info["ORGANIZATION"] = data.organization
-
-        # Show GitHub token status (required for closing PRs)
-        config_info["GITHUB_TOKEN"] = github_token_status
-    else:
-        # In Gerrit change creation mode, show full config
-        # Only show non-default boolean values
-        if data.submit_single_commits:
-            config_info["SUBMIT_SINGLE_COMMITS"] = str(
-                data.submit_single_commits
-            )
-        if data.use_pr_as_commit:
-            config_info["USE_PR_AS_COMMIT"] = str(data.use_pr_as_commit)
-        if data.dry_run:
-            config_info["DRY_RUN"] = str(data.dry_run)
-
-        # Only show non-default fetch depth
-        if data.fetch_depth != 10:
-            config_info["FETCH_DEPTH"] = str(data.fetch_depth)
-
-        # SSH user and email first
-        if data.gerrit_ssh_user_g2g:
-            config_info["GERRIT_SSH_USER_G2G"] = data.gerrit_ssh_user_g2g
-        if data.gerrit_ssh_user_g2g_email:
-            config_info["GERRIT_SSH_USER_G2G_EMAIL"] = (
-                data.gerrit_ssh_user_g2g_email
-            )
-        if data.organization:
-            config_info["ORGANIZATION"] = data.organization
-        if data.reviewers_email:
-            config_info["REVIEWERS_EMAIL"] = data.reviewers_email
-
-        # Only show non-default boolean values
-        if data.preserve_github_prs:
-            config_info["PRESERVE_GITHUB_PRS"] = str(data.preserve_github_prs)
-        if data.ci_testing:
-            config_info["CI_TESTING"] = str(data.ci_testing)
-
-        # Show Issue ID if provided
-        if data.issue_id:
-            config_info["ISSUE_ID"] = data.issue_id
-        else:
-            config_info["ISSUE_ID"] = "❎ Not provided"
-
-        # Show Gerrit settings if they have values
-        if data.gerrit_server:
-            config_info["GERRIT_SERVER"] = data.gerrit_server
-        # Only show non-default port (29418 is default)
-        if data.gerrit_server_port and data.gerrit_server_port != 29418:
-            config_info["GERRIT_SERVER_PORT"] = str(data.gerrit_server_port)
-        if data.gerrit_project:
-            config_info["GERRIT_PROJECT"] = data.gerrit_project
-
-        # Move credentials to bottom of table
-        # Always show known hosts status
-        if data.gerrit_known_hosts or not data.gerrit_known_hosts:
-            config_info["GERRIT_KNOWN_HOSTS"] = known_hosts_status
-        config_info["GERRIT_SSH_PRIVKEY_G2G"] = privkey_status
-        config_info["GITHUB_TOKEN"] = github_token_status
-        config_info["SSH_AGENT"] = ssh_agent_status
-
-        # Show cleanup abandoned status if enabled
-        if cleanup_abandoned:
-            config_info["CLEANUP_ABANDONED"] = "✅"
-
-        # Show Gerrit cleanup status if enabled
-        if cleanup_gerrit:
-            config_info["CLEANUP_GERRIT"] = "✅"
+    ctx = _ConfigDisplay(
+        mode_label=mode_label,
+        mode_description=mode_description,
+        no_gerrit_enabled=no_gerrit_enabled,
+        is_closing_pr_mode=is_closing_pr_mode,
+        known_hosts_status=known_hosts_status,
+        privkey_status=privkey_status,
+        github_token_status=github_token_status,
+        ssh_agent_status=ssh_agent_status,
+        cleanup_abandoned=cleanup_abandoned,
+        cleanup_gerrit=cleanup_gerrit,
+    )
+    config_info = _build_config_info(data, ctx)
 
     # Display the configuration table
     display_pr_info(config_info, "GitHub2Gerrit Configuration")

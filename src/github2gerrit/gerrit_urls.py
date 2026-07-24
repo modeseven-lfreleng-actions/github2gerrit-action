@@ -8,6 +8,11 @@ consistent handling of GERRIT_HTTP_BASE_PATH and eliminating the need
 for manual URL construction throughout the codebase.
 """
 
+# aislop-ignore-file hardcoded-url -- this module's sole purpose is to build
+# Gerrit URLs from a runtime-configured host; the "https://" literals are URL
+# schemes in f-strings (f"https://{host}..."), not hardcoded environment
+# endpoints.
+
 from __future__ import annotations
 
 import logging
@@ -22,6 +27,22 @@ from urllib.parse import urljoin
 log = logging.getLogger(__name__)
 
 _BASE_PATH_CACHE: dict[str, str] = {}
+
+# Path segments that are Gerrit endpoints rather than an HTTP base path.
+_KNOWN_GERRIT_ENDPOINTS = {
+    "changes",
+    "accounts",
+    "dashboard",
+    "c",
+    "q",
+    "admin",
+    "login",
+    "settings",
+    "plugins",
+    "Documentation",
+}
+
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -51,6 +72,80 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return fp
 
 
+def _location_to_path(host: str, loc: str) -> str:
+    """Normalize a redirect Location header value to an absolute path."""
+    parsed = urllib.parse.urlparse(loc)
+    if parsed.scheme or parsed.netloc:
+        return parsed.path
+    return urllib.parse.urlparse(f"https://{host}{loc}").path
+
+
+def _base_path_from_segments(path: str) -> str:
+    """Infer the candidate base path from the first non-endpoint segment."""
+    segs = [s for s in path.split("/") if s]
+    if segs and segs[0] not in _KNOWN_GERRIT_ENDPOINTS:
+        return segs[0]
+    return ""
+
+
+def _infer_and_cache_base_path(host: str, loc: str) -> str:
+    """Derive, cache and log the base path from a redirect Location."""
+    path = _location_to_path(host, loc)
+    base = _base_path_from_segments(path)
+    _BASE_PATH_CACHE[host] = base
+    log.debug("Gerrit base path: '%s'", base)
+    return base
+
+
+def _probe_base_path(
+    opener: urllib.request.OpenerDirector,
+    host: str,
+    url: str,
+    probe: str,
+    timeout: float,
+) -> str | None:
+    """Probe a single URL for base path discovery.
+
+    Returns the discovered base path (which may be an empty string), or
+    ``None`` when the caller should continue with the next probe.
+    """
+    try:
+        resp = opener.open(url, timeout=timeout)
+        code = getattr(resp, "getcode", lambda: None)() or getattr(
+            resp, "status", 0
+        )
+    except urllib.error.HTTPError as e:
+        # HTTPError doubles as the response; capture Location for redirects
+        code = e.code
+        loc = e.headers.get("Location") or e.headers.get("location") or ""
+        if code in _REDIRECT_CODES and loc:
+            return _infer_and_cache_base_path(host, loc)
+        # Non-redirect error; try next probe
+        return None
+    except Exception as exc:
+        log.debug(
+            "Gerrit base path probe failed for %s%s: %s",
+            host,
+            probe,
+            exc,
+        )
+        return None
+    else:
+        # If we reached the page without redirects
+        if code == 200:
+            log.debug("Gerrit base path: ''")
+            return ""
+        # Handle 3xx responses when redirects are disabled
+        # (no-redirect opener)
+        if code in _REDIRECT_CODES:
+            headers = getattr(resp, "headers", {}) or {}
+            loc = headers.get("Location") or headers.get("location") or ""
+            if loc:
+                return _infer_and_cache_base_path(host, loc)
+        # If we get any other non-redirect response, try next probe
+        return None
+
+
 def _discover_base_path_for_host(host: str, timeout: float = 5.0) -> str:
     """
     Discover Gerrit HTTP base path for the given host by probing redirects.
@@ -71,18 +166,6 @@ def _discover_base_path_for_host(host: str, timeout: float = 5.0) -> str:
         opener = urllib.request.build_opener(_NoRedirect)
         opener.addheaders = [("User-Agent", "github2gerrit/urls-discovery")]
         probes = ["/dashboard/self", "/"]
-        known_endpoints = {
-            "changes",
-            "accounts",
-            "dashboard",
-            "c",
-            "q",
-            "admin",
-            "login",
-            "settings",
-            "plugins",
-            "Documentation",
-        }
 
         for scheme in ("https", "http"):
             for probe in probes:
@@ -91,85 +174,9 @@ def _discover_base_path_for_host(host: str, timeout: float = 5.0) -> str:
                 if parsed_url.scheme not in ("https", "http"):
                     log.debug("Skipping non-HTTP(S) probe URL: %s", url)
                     continue
-                try:
-                    resp = opener.open(url, timeout=timeout)
-                    code = getattr(resp, "getcode", lambda: None)() or getattr(
-                        resp, "status", 0
-                    )
-                    # If we reached the page without redirects
-                    if code == 200:
-                        log.debug("Gerrit base path: ''")
-                        return ""
-                    # Handle 3xx responses when redirects are disabled
-                    # (no-redirect opener)
-                    if code in (301, 302, 303, 307, 308):
-                        headers = getattr(resp, "headers", {}) or {}
-                        loc = (
-                            headers.get("Location")
-                            or headers.get("location")
-                            or ""
-                        )
-                        if loc:
-                            # Normalize to absolute path
-                            parsed = urllib.parse.urlparse(loc)
-                            path = (
-                                parsed.path
-                                if parsed.scheme or parsed.netloc
-                                else urllib.parse.urlparse(
-                                    f"https://{host}{loc}"
-                                ).path
-                            )
-                            # Determine candidate base path
-                            segs = [s for s in path.split("/") if s]
-                            base = ""
-                            if segs:
-                                first = segs[0]
-                                if first not in known_endpoints:
-                                    base = first
-                            _BASE_PATH_CACHE[host] = base
-                            log.debug("Gerrit base path: '%s'", base)
-                            return base
-                    # If we get any other non-redirect response, try next probe
-                    continue
-                except urllib.error.HTTPError as e:
-                    # HTTPError doubles as the response; capture Location for
-                    # redirects
-                    code = e.code
-                    loc = (
-                        e.headers.get("Location")
-                        or e.headers.get("location")
-                        or ""
-                    )
-                    if code in (301, 302, 303, 307, 308) and loc:
-                        # Normalize to absolute path
-                        parsed = urllib.parse.urlparse(loc)
-                        path = (
-                            parsed.path
-                            if parsed.scheme or parsed.netloc
-                            else urllib.parse.urlparse(
-                                f"https://{host}{loc}"
-                            ).path
-                        )
-                        # Determine candidate base path
-                        segs = [s for s in path.split("/") if s]
-                        base = ""
-                        if segs:
-                            first = segs[0]
-                            if first not in known_endpoints:
-                                base = first
-                        _BASE_PATH_CACHE[host] = base
-                        log.debug("Gerrit base path: '%s'", base)
-                        return base
-                    # Non-redirect error; try next probe
-                    continue
-                except Exception as exc:
-                    log.debug(
-                        "Gerrit base path probe failed for %s%s: %s",
-                        host,
-                        probe,
-                        exc,
-                    )
-                    continue
+                result = _probe_base_path(opener, host, url, probe, timeout)
+                if result is not None:
+                    return result
 
     except Exception as exc:
         log.debug("Gerrit base path discovery error for %s: %s", host, exc)

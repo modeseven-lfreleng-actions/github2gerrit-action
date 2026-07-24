@@ -16,10 +16,12 @@ import os
 import shutil
 import socket
 from pathlib import Path
+from typing import NoReturn
 
 from .external_api import ApiType
 from .external_api import external_api_call
 from .gitutils import CommandError
+from .gitutils import CommandResult
 from .gitutils import run_cmd
 
 
@@ -79,6 +81,108 @@ def is_host_reachable(hostname: str, port: int, timeout: int = 5) -> bool:
         return False
 
 
+def _ensure_keyscan_available() -> None:
+    """Verify that ssh-keyscan is available on PATH."""
+    try:
+        keyscan_path = shutil.which("ssh-keyscan")
+        if not keyscan_path:
+            log.error("❌ ssh-keyscan not found in PATH")
+            _raise_keyscan_not_found()
+        log.debug("✅ Found ssh-keyscan at: %s", keyscan_path)
+    except Exception as exc:
+        log.exception("❌ Failed to check for ssh-keyscan")
+        raise SSHDiscoveryError(
+            _MSG_KEYSCAN_CHECK_FAILED.format(error=exc)
+        ) from exc
+
+
+def _check_host_reachable(hostname: str, port: int) -> None:
+    """Raise SSHDiscoveryError if the host is not reachable."""
+    log.debug("🔍 Testing connectivity to %s:%d...", hostname, port)
+    if not is_host_reachable(hostname, port, timeout=5):
+        log.error("❌ Host %s:%d is not reachable", hostname, port)
+        raise SSHDiscoveryError(
+            _MSG_HOST_UNREACHABLE.format(hostname=hostname, port=port)
+        )
+    log.debug("✅ Host %s:%d is reachable", hostname, port)
+
+
+def _extract_valid_host_keys(
+    result: CommandResult,
+    cmd: list[str],
+    hostname: str,
+    port: int,
+) -> str:
+    """Validate ssh-keyscan output and return the discovered keys."""
+    if not result.stdout or not result.stdout.strip():
+        log.error("❌ ssh-keyscan returned no output for %s:%d", hostname, port)
+        log.error("Command: %s", " ".join(cmd))
+        log.error("Stderr: %s", result.stderr if result.stderr else "(none)")
+        raise SSHDiscoveryError(
+            _MSG_NO_KEYS_FOUND.format(hostname=hostname, port=port)
+        )
+
+    valid_lines = []
+    for line in result.stdout.strip().split("\n"):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        # Basic validation: should have hostname, key type, and key
+        parts = stripped_line.split()
+        if len(parts) >= 3:
+            valid_lines.append(stripped_line)
+
+    if not valid_lines:
+        log.error(
+            "❌ No valid SSH host keys found in output for %s:%d",
+            hostname,
+            port,
+        )
+        log.error("Raw output was: %s", result.stdout)
+        raise SSHDiscoveryError(
+            _MSG_NO_VALID_KEYS.format(hostname=hostname, port=port)
+        )
+
+    discovered_keys = "\n".join(valid_lines)
+    log.debug(
+        "✅ Successfully discovered %d SSH host key(s) for %s:%d",
+        len(valid_lines),
+        hostname,
+        port,
+    )
+    log.debug("📋 Discovered keys:\n%s", discovered_keys)
+    return discovered_keys
+
+
+def _raise_keyscan_command_error(
+    exc: CommandError,
+    cmd: list[str],
+    hostname: str,
+    port: int,
+) -> NoReturn:
+    """Translate a ssh-keyscan CommandError into SSHDiscoveryError."""
+    log.exception("❌ ssh-keyscan command failed for %s:%d", hostname, port)
+    log.debug("Return code: %d", exc.returncode)
+    stdout_msg = exc.stdout if exc.stdout else "(empty)"
+    stderr_msg = exc.stderr if exc.stderr else "(empty)"
+    log.debug("Stdout: %s", stdout_msg)
+    log.debug("Stderr: %s", stderr_msg)
+    log.debug("Command: %s", " ".join(cmd))
+
+    if exc.returncode == 1:
+        # ssh-keyscan returns 1 when it can't connect
+        error_msg = exc.stderr or exc.stdout or "Connection failed"
+        raise SSHDiscoveryError(
+            _MSG_CONNECTION_FAILED.format(
+                hostname=hostname, port=port, error=error_msg
+            )
+        ) from exc
+    error_msg = exc.stderr or exc.stdout or "Unknown error"
+    raise SSHDiscoveryError(
+        _MSG_KEYSCAN_FAILED.format(returncode=exc.returncode, error=error_msg)
+    ) from exc
+
+
 @external_api_call(ApiType.SSH, "fetch_ssh_host_keys")
 def fetch_ssh_host_keys(
     hostname: str, port: int = 22, timeout: int = 10
@@ -99,18 +203,7 @@ def fetch_ssh_host_keys(
     """
     log.debug("🔍 Starting SSH host key discovery for %s:%d", hostname, port)
 
-    # Check if ssh-keyscan is available
-    try:
-        keyscan_path = shutil.which("ssh-keyscan")
-        if not keyscan_path:
-            log.error("❌ ssh-keyscan not found in PATH")
-            _raise_keyscan_not_found()
-        log.debug("✅ Found ssh-keyscan at: %s", keyscan_path)
-    except Exception as exc:
-        log.exception("❌ Failed to check for ssh-keyscan")
-        raise SSHDiscoveryError(
-            _MSG_KEYSCAN_CHECK_FAILED.format(error=exc)
-        ) from exc
+    _ensure_keyscan_available()
 
     log.debug(
         "🔍 Fetching SSH host keys for %s:%d (timeout: %ds)",
@@ -120,13 +213,7 @@ def fetch_ssh_host_keys(
     )
 
     # First check if the host is reachable
-    log.debug("🔍 Testing connectivity to %s:%d...", hostname, port)
-    if not is_host_reachable(hostname, port, timeout=5):
-        log.error("❌ Host %s:%d is not reachable", hostname, port)
-        raise SSHDiscoveryError(
-            _MSG_HOST_UNREACHABLE.format(hostname=hostname, port=port)
-        )
-    log.debug("✅ Host %s:%d is reachable", hostname, port)
+    _check_host_reachable(hostname, port)
 
     # Use ssh-keyscan to fetch all available key types
     cmd = [
@@ -153,75 +240,9 @@ def fetch_ssh_host_keys(
             result.stderr if result.stderr else "(empty)",
         )
 
-        if not result.stdout or not result.stdout.strip():
-            log.error(
-                "❌ ssh-keyscan returned no output for %s:%d", hostname, port
-            )
-            log.error("Command: %s", " ".join(cmd))
-            log.error(
-                "Stderr: %s", result.stderr if result.stderr else "(none)"
-            )
-            raise SSHDiscoveryError(  # noqa: TRY301
-                _MSG_NO_KEYS_FOUND.format(hostname=hostname, port=port)
-            )
-
-        lines = result.stdout.strip().split("\n")
-        valid_lines = []
-
-        for line in lines:
-            stripped_line = line.strip()
-            if not stripped_line or stripped_line.startswith("#"):
-                continue
-
-            # Basic validation: should have hostname, key type, and key
-            parts = stripped_line.split()
-            if len(parts) >= 3:
-                valid_lines.append(stripped_line)
-
-        if not valid_lines:
-            log.error(
-                "❌ No valid SSH host keys found in output for %s:%d",
-                hostname,
-                port,
-            )
-            log.error("Raw output was: %s", result.stdout)
-            raise SSHDiscoveryError(  # noqa: TRY301
-                _MSG_NO_VALID_KEYS.format(hostname=hostname, port=port)
-            )
-
-        discovered_keys = "\n".join(valid_lines)
-        log.debug(
-            "✅ Successfully discovered %d SSH host key(s) for %s:%d",
-            len(valid_lines),
-            hostname,
-            port,
-        )
-        log.debug("📋 Discovered keys:\n%s", discovered_keys)
-
+        discovered_keys = _extract_valid_host_keys(result, cmd, hostname, port)
     except CommandError as exc:
-        log.exception("❌ ssh-keyscan command failed for %s:%d", hostname, port)
-        log.debug("Return code: %d", exc.returncode)
-        stdout_msg = exc.stdout if exc.stdout else "(empty)"
-        stderr_msg = exc.stderr if exc.stderr else "(empty)"
-        log.debug("Stdout: %s", stdout_msg)
-        log.debug("Stderr: %s", stderr_msg)
-        log.debug("Command: %s", " ".join(cmd))
-
-        if exc.returncode == 1:
-            # ssh-keyscan returns 1 when it can't connect
-            error_msg = exc.stderr or exc.stdout or "Connection failed"
-            raise SSHDiscoveryError(
-                _MSG_CONNECTION_FAILED.format(
-                    hostname=hostname, port=port, error=error_msg
-                )
-            ) from exc
-        else:
-            error_msg = exc.stderr or exc.stdout or "Unknown error"
-            raise SSHDiscoveryError(
-                _MSG_KEYSCAN_FAILED.format(
-                    returncode=exc.returncode, error=error_msg
-                )
-            ) from exc
+        _raise_keyscan_command_error(exc, cmd, hostname, port)
     except Exception as exc:
         raise SSHDiscoveryError(
             _MSG_UNEXPECTED_ERROR.format(
@@ -293,6 +314,89 @@ def discover_and_save_host_keys(
     return host_keys
 
 
+def _rewrite_known_hosts_lines(
+    existing_content: str,
+    organization: str,
+    host_keys: str,
+) -> tuple[list[str], bool, bool]:
+    """Rewrite config lines, replacing GERRIT_KNOWN_HOSTS in-place.
+
+    Returns the rewritten lines plus flags indicating whether the org
+    section was found and whether GERRIT_KNOWN_HOSTS was updated.
+    """
+    lines = existing_content.split("\n")
+    new_lines: list[str] = []
+    in_org_section = False
+    org_section_found = False
+    gerrit_known_hosts_updated = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section_name = stripped[1:-1].strip().lower()
+            in_org_section = section_name == organization.lower()
+            if in_org_section:
+                org_section_found = True
+
+        # If we're in the org section and find GERRIT_KNOWN_HOSTS, replace
+        elif in_org_section and "=" in line:
+            key = line.split("=", 1)[0].strip().upper()
+            if key == "GERRIT_KNOWN_HOSTS":
+                # Replace with new host keys (properly escaped for INI)
+                escaped_keys = host_keys.replace("\n", "\\n")
+                new_lines.append(f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
+                gerrit_known_hosts_updated = True
+                continue
+
+        new_lines.append(line)
+
+    return new_lines, org_section_found, gerrit_known_hosts_updated
+
+
+def _append_org_section(
+    new_lines: list[str],
+    organization: str,
+    host_keys: str,
+) -> None:
+    """Append a new organization section with GERRIT_KNOWN_HOSTS."""
+    if new_lines and new_lines[-1].strip():
+        new_lines.append("")  # Add blank line before new section
+    new_lines.append(f"[{organization}]")
+    escaped_keys = host_keys.replace("\n", "\\n")
+    new_lines.append(f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
+
+
+def _find_org_section_end(new_lines: list[str], organization: str) -> int:
+    """Return the index at which to insert into the org's section."""
+    section_end = len(new_lines)
+    for i, line in enumerate(new_lines):
+        stripped = line.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        section_name = stripped[1:-1].strip().lower()
+        if section_name != organization.lower():
+            continue
+        # Find the end of this section
+        for j in range(i + 1, len(new_lines)):
+            if new_lines[j].strip().startswith("["):
+                return j
+        break
+    return section_end
+
+
+def _insert_known_hosts_into_section(
+    new_lines: list[str],
+    organization: str,
+    host_keys: str,
+) -> None:
+    """Insert GERRIT_KNOWN_HOSTS at the end of the org's section."""
+    # Find the end of the organization section and add the key there
+    section_end = _find_org_section_end(new_lines, organization)
+    escaped_keys = host_keys.replace("\n", "\\n")
+    new_lines.insert(section_end, f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
+
+
 def save_host_keys_to_config(
     host_keys: str, organization: str, config_path: str | None = None
 ) -> None:
@@ -341,62 +445,18 @@ def save_host_keys_to_config(
         if config_file.exists():
             existing_content = config_file.read_text(encoding="utf-8")
 
-        lines = existing_content.split("\n")
-        new_lines = []
-        in_org_section = False
-        org_section_found = False
-        gerrit_known_hosts_updated = False
-
-        for line in lines:
-            stripped = line.strip()
-
-            if stripped.startswith("[") and stripped.endswith("]"):
-                section_name = stripped[1:-1].strip().lower()
-                in_org_section = section_name == organization.lower()
-                if in_org_section:
-                    org_section_found = True
-
-            # If we're in the org section and find GERRIT_KNOWN_HOSTS, replace
-            elif in_org_section and "=" in line:
-                key = line.split("=", 1)[0].strip().upper()
-                if key == "GERRIT_KNOWN_HOSTS":
-                    # Replace with new host keys (properly escaped for INI)
-                    escaped_keys = host_keys.replace("\n", "\\n")
-                    new_lines.append(f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
-                    gerrit_known_hosts_updated = True
-                    continue
-
-            new_lines.append(line)
+        new_lines, org_section_found, gerrit_known_hosts_updated = (
+            _rewrite_known_hosts_lines(
+                existing_content, organization, host_keys
+            )
+        )
 
         # If organization section wasn't found, add it
         if not org_section_found:
-            if new_lines and new_lines[-1].strip():
-                new_lines.append("")  # Add blank line before new section
-            new_lines.append(f"[{organization}]")
-            escaped_keys = host_keys.replace("\n", "\\n")
-            new_lines.append(f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"')
-
+            _append_org_section(new_lines, organization, host_keys)
         # If section existed but didn't have GERRIT_KNOWN_HOSTS, add it
         elif not gerrit_known_hosts_updated:
-            # Find the end of the organization section and add the key there
-            section_end = len(new_lines)
-            for i, line in enumerate(new_lines):
-                stripped = line.strip()
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    section_name = stripped[1:-1].strip().lower()
-                    if section_name == organization.lower():
-                        # Find the end of this section
-                        for j in range(i + 1, len(new_lines)):
-                            if new_lines[j].strip().startswith("["):
-                                section_end = j
-                                break
-                        break
-
-            # Insert the GERRIT_KNOWN_HOSTS entry
-            escaped_keys = host_keys.replace("\n", "\\n")
-            new_lines.insert(
-                section_end, f'GERRIT_KNOWN_HOSTS = "{escaped_keys}"'
-            )
+            _insert_known_hosts_into_section(new_lines, organization, host_keys)
 
         config_file.write_text("\n".join(new_lines), encoding="utf-8")
 

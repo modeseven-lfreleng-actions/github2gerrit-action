@@ -280,5 +280,5 @@ def abandon_change_via_ssh(
             import shutil
 
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            log.debug("Failed to clean up SSH temp dir %s", tmp_dir)
+        except Exception as exc:
+            log.debug("Failed to clean up SSH temp dir %s: %s", tmp_dir, exc)

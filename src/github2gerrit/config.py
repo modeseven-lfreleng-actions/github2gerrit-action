@@ -209,6 +209,144 @@ def _select_section(
     return None
 
 
+def _sanitize_ssh_key_content(content_lines: list[str]) -> str:
+    """Clean the base64 content of an inline multi-line SSH key value."""
+    sanitized_lines: list[str] = []
+    for content_line in content_lines:
+        cleaned = content_line.strip()
+        # Preserve SSH key headers/footers but clean base64 content
+        if cleaned.startswith("-----") or not cleaned:
+            sanitized_lines.append(cleaned)
+            continue
+        # Remove any embedded quotes and whitespace from base64 content
+        cleaned = cleaned.replace('"', "").replace("'", "").strip()
+        if cleaned:
+            sanitized_lines.append(cleaned)
+    return "\\n".join(sanitized_lines)
+
+
+def _consume_multiline_quote(
+    lines: list[str],
+    start: int,
+    left: str,
+    out_lines: list[str],
+) -> int:
+    """Collapse a `key = "` ... `"` block into a single escaped line.
+
+    Returns the index of the next unprocessed line.
+    """
+    i = start + 1
+    block: list[str] = []
+    # Collect until a line with only a closing quote (ignoring spaces)
+    while i < len(lines) and lines[i].strip() != '"':
+        block.append(lines[i])
+        i += 1
+    if i < len(lines) and lines[i].strip() == '"':
+        joined = "\\n".join(block)
+        out_lines.append(f'{left} "{joined}"')
+        return i + 1
+    # No closing quote found; keep the original opening line.
+    log.debug(
+        "Multi-line quote not properly closed for line: %s",
+        lines[start][:50],
+    )
+    out_lines.append(lines[start])
+    return i
+
+
+def _consume_inline_quote(
+    lines: list[str],
+    start: int,
+    left: str,
+    rhs: str,
+    out_lines: list[str],
+) -> int:
+    """Collapse a value that opens with `"` but spans multiple lines.
+
+    Handles SSH private keys and other values that start with a quote but
+    contain embedded content that might otherwise confuse configparser.
+    Returns the index of the next unprocessed line.
+    """
+    content_lines = [rhs[1:]]  # Remove opening quote
+    i = start + 1
+    while i < len(lines):
+        current_line = lines[i]
+        stripped = current_line.strip()
+        if stripped.endswith('"') and not stripped.endswith('\\"'):
+            # Found closing quote - remove it and add final line
+            final_content = current_line.rstrip()
+            if final_content.endswith('"'):
+                final_content = final_content[:-1]
+            # Only add if there's content after removing quote
+            if final_content:
+                content_lines.append(final_content)
+            break
+        content_lines.append(current_line)
+        i += 1
+
+    # Join all content and sanitize for SSH keys
+    full_content = "\\n".join(content_lines)
+
+    # Special handling for SSH private keys - remove extra whitespace
+    # and line breaks
+    key_name = left.split("=")[0].strip().upper()
+    if "SSH" in key_name and "KEY" in key_name:
+        full_content = _sanitize_ssh_key_content(content_lines)
+
+    log.debug(
+        "Processed multi-line value for key %s (length: %d)",
+        left.split("=")[0].strip(),
+        len(full_content),
+    )
+    out_lines.append(f'{left} "{full_content}"')
+    return i + 1
+
+
+def _preprocess_config_text(raw_text: str) -> str:
+    """Collapse multi-line quoted values into single escaped lines.
+
+    Pre-process simple multi-line quoted values of the form::
+
+        key = "
+        line1
+        line2
+        "
+
+    We collapse these into a single line with '\\n' escapes so that
+    configparser can ingest them reliably; later, _coerce_value()
+    converts the escapes back to real newlines. SSH private keys and
+    other multi-line values with formatting inconsistencies are
+    sanitized as part of this process.
+    """
+    lines = raw_text.splitlines()
+    out_lines: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        eq_idx = line.find("=")
+        if eq_idx == -1:
+            out_lines.append(line)
+            i += 1
+            continue
+
+        left = line[: eq_idx + 1]
+        rhs = line[eq_idx + 1 :].strip()
+
+        # Handle standard multi-line quoted values: key = "
+        if rhs == '"':
+            i = _consume_multiline_quote(lines, i, left, out_lines)
+            continue
+
+        if rhs.startswith('"') and not rhs.endswith('"'):
+            i = _consume_inline_quote(lines, i, left, rhs, out_lines)
+            continue
+
+        out_lines.append(line)
+        i += 1
+
+    return "\n".join(out_lines) + ("\n" if out_lines else "")
+
+
 def _load_ini(path: Path) -> configparser.RawConfigParser:
     cp = configparser.RawConfigParser()
     # Preserve option case; mypy requires a cast for attribute requirement
@@ -216,120 +354,7 @@ def _load_ini(path: Path) -> configparser.RawConfigParser:
     try:
         with path.open("r", encoding="utf-8") as fh:
             raw_text = fh.read()
-        # Pre-process simple multi-line quoted values of the form:
-        #   key = "
-        #   line1
-        #   line2
-        #   "
-        # We collapse these into a single line with '\n' escapes so that
-        # configparser can ingest them reliably; later, _coerce_value()
-        # converts the escapes back to real newlines.
-        #
-        # We also handle SSH private keys and other multi-line values that
-        # might have formatting inconsistencies by sanitizing them.
-        lines = raw_text.splitlines()
-        out_lines: list[str] = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            eq_idx = line.find("=")
-            if eq_idx != -1:
-                left = line[: eq_idx + 1]
-                rhs = line[eq_idx + 1 :].strip()
-
-                # Handle standard multi-line quoted values: key = "
-                if rhs == '"':
-                    i += 1
-                    block: list[str] = []
-                    # Collect until a line with only a closing quote
-                    # (ignoring spaces)
-                    while i < len(lines) and lines[i].strip() != '"':
-                        block.append(lines[i])
-                        i += 1
-                    if i < len(lines) and lines[i].strip() == '"':
-                        joined = "\\n".join(block)
-                        out_lines.append(f'{left} "{joined}"')
-                        i += 1
-                        continue
-                    else:
-                        # No closing quote found; fall through
-                        # and keep original line
-                        log.debug(
-                            "Multi-line quote not properly closed for line: %s",
-                            line[:50],
-                        )
-                        out_lines.append(line)
-                        continue
-
-                # Handle SSH private keys and other values that start with a
-                # quote
-                # but contain embedded content that might confuse configparser
-                elif rhs.startswith('"') and not rhs.endswith('"'):
-                    # This looks like a multi-line value that starts on the
-                    # same line
-                    # Collect all content until we find a line ending with a
-                    # quote
-                    content_lines = [rhs[1:]]  # Remove opening quote
-                    i += 1
-
-                    while i < len(lines):
-                        current_line = lines[i]
-                        if current_line.strip().endswith(
-                            '"'
-                        ) and not current_line.strip().endswith('\\"'):
-                            # Found closing quote - remove it and add final line
-                            final_content = current_line.rstrip()
-                            if final_content.endswith('"'):
-                                final_content = final_content[:-1]
-                            # Only add if there's content after removing quote
-                            if final_content:
-                                content_lines.append(final_content)
-                            break
-                        else:
-                            content_lines.append(current_line)
-                        i += 1
-
-                    # Join all content and sanitize for SSH keys
-                    full_content = "\\n".join(content_lines)
-
-                    # Special handling for SSH private keys - remove extra
-                    # whitespace and line breaks
-                    key_name = left.split("=")[0].strip().upper()
-                    if "SSH" in key_name and "KEY" in key_name:
-                        # For SSH keys, clean up base64 content by removing
-                        # whitespace within lines
-                        sanitized_lines = []
-                        for content_line in content_lines:
-                            cleaned = content_line.strip()
-                            # Preserve SSH key headers/footers but clean base64
-                            # content
-                            if cleaned.startswith("-----") or not cleaned:
-                                sanitized_lines.append(cleaned)
-                            else:
-                                # Remove any embedded quotes and whitespace from
-                                # base64 content
-                                cleaned = (
-                                    cleaned.replace('"', "")
-                                    .replace("'", "")
-                                    .strip()
-                                )
-                                if cleaned:
-                                    sanitized_lines.append(cleaned)
-                        full_content = "\\n".join(sanitized_lines)
-
-                    log.debug(
-                        "Processed multi-line value for key %s (length: %d)",
-                        left.split("=")[0].strip(),
-                        len(full_content),
-                    )
-                    out_lines.append(f'{left} "{full_content}"')
-                    i += 1
-                    continue
-
-            out_lines.append(line)
-            i += 1
-
-        preprocessed = "\n".join(out_lines) + ("\n" if out_lines else "")
+        preprocessed = _preprocess_config_text(raw_text)
         cp.read_string(preprocessed)
     except FileNotFoundError as exc:
         log.debug("Config file not found: %s (%s)", path, exc)

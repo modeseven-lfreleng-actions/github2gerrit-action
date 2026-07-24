@@ -254,31 +254,40 @@ class CommitNormalizer:
         for config_file in config_paths:
             if not config_file.exists():
                 continue
+            if self._parse_release_drafter_config(config_file):
+                break  # Use first successfully parsed config
 
-            try:
-                with config_file.open("r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f)
+    def _parse_release_drafter_config(self, config_file: Path) -> bool:
+        """Parse a release-drafter config for commit type preferences.
 
-                autolabeler = config.get("autolabeler", [])
-                for rule in autolabeler:
-                    titles = rule.get("title", [])
+        Returns True when the file was parsed without error.
+        """
+        try:
+            with config_file.open("r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
 
-                    for title_pattern in titles:
-                        if title_pattern.startswith(
-                            "/"
-                        ) and title_pattern.endswith("/i"):
-                            pattern = title_pattern[1:-2]  # Remove /pattern/i
-                            if ":" in pattern:
-                                commit_type = pattern.split(":")[0]
-                                if commit_type in CONVENTIONAL_COMMIT_TYPES:
-                                    self.preferences.preferred_types[
-                                        commit_type
-                                    ] = self._get_capitalization(commit_type)
+            autolabeler = config.get("autolabeler", [])
+            for rule in autolabeler:
+                for title_pattern in rule.get("title", []):
+                    self._apply_release_drafter_pattern(title_pattern)
+        except Exception as e:
+            log.debug("Failed to parse release-drafter config: %s", e)
+            return False
+        else:
+            return True
 
-                break  # Use first found config
-
-            except Exception as e:
-                log.debug("Failed to parse release-drafter config: %s", e)
+    def _apply_release_drafter_pattern(self, title_pattern: str) -> None:
+        """Record a commit-type preference from a title pattern."""
+        if not (title_pattern.startswith("/") and title_pattern.endswith("/i")):
+            return
+        pattern = title_pattern[1:-2]  # Remove /pattern/i
+        if ":" not in pattern:
+            return
+        commit_type = pattern.split(":")[0]
+        if commit_type in CONVENTIONAL_COMMIT_TYPES:
+            self.preferences.preferred_types[commit_type] = (
+                self._get_capitalization(commit_type)
+            )
 
     def _analyze_git_history(self) -> None:
         """Analyze recent git history for conventional commit patterns."""

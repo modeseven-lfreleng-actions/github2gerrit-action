@@ -68,6 +68,25 @@ def _raise_no_agent_error() -> None:
     raise SSHAgentError(_MSG_NO_AGENT_AND_KEY)
 
 
+def _overwrite_file_securely(file_path: Path) -> None:
+    """Overwrite a file's contents with random data to prevent recovery."""
+    try:
+        size = file_path.stat().st_size
+        if size > 0:
+            import secrets
+
+            with open(file_path, "wb") as f:
+                f.write(secrets.token_bytes(size))
+                # Sync to ensure write completes
+                os.fsync(f.fileno())
+    except Exception as overwrite_exc:
+        log.debug(
+            "Failed to overwrite %s: %s",
+            file_path,
+            overwrite_exc,
+        )
+
+
 class SSHAgentManager:
     """Manages SSH agent lifecycle and key loading for secure authentication."""
 
@@ -384,71 +403,9 @@ class SSHAgentManager:
     def cleanup(self) -> None:
         """Securely clean up SSH agent and temporary files."""
         try:
-            # Only kill SSH agent if we started it ourselves
-            # Never kill an existing SSH agent that we're borrowing
-            if self.agent_pid and self._agent_owned_by_us:
-                try:
-                    run_cmd(["/bin/kill", str(self.agent_pid)], timeout=5)
-                    log.debug("SSH agent (PID %d) terminated", self.agent_pid)
-                except Exception as exc:
-                    log.warning("Failed to kill SSH agent: %s", exc)
-            else:
-                if self.agent_pid and not self._agent_owned_by_us:
-                    log.debug(
-                        "Not terminating SSH agent (borrowed existing agent "
-                        "with PID %d)",
-                        self.agent_pid,
-                    )
-                else:
-                    log.debug("Not terminating SSH agent (no agent running)")
-
-            # Restore original environment
-            for key, value in self._original_env.items():
-                if value:
-                    os.environ[key] = value
-                elif key in os.environ:
-                    del os.environ[key]
-
-            # Securely clean up temporary files
-            tool_ssh_dir = self.workspace / ".ssh-g2g"
-            if tool_ssh_dir.exists():
-                import shutil
-
-                # First, overwrite any key files to prevent recovery
-                try:
-                    for root, _dirs, files in os.walk(tool_ssh_dir):
-                        for file in files:
-                            file_path = Path(root) / file
-                            if file_path.exists() and file_path.is_file():
-                                # Overwrite file with random data
-                                try:
-                                    size = file_path.stat().st_size
-                                    if size > 0:
-                                        import secrets
-
-                                        with open(file_path, "wb") as f:
-                                            f.write(secrets.token_bytes(size))
-                                            # Sync to ensure write completes
-                                            os.fsync(f.fileno())
-                                except Exception as overwrite_exc:
-                                    log.debug(
-                                        "Failed to overwrite %s: %s",
-                                        file_path,
-                                        overwrite_exc,
-                                    )
-                except Exception as walk_exc:
-                    log.debug(
-                        "Failed to walk SSH temp directory for secure "
-                        "cleanup: %s",
-                        walk_exc,
-                    )
-
-                shutil.rmtree(tool_ssh_dir)
-                log.debug(
-                    "Securely cleaned up temporary SSH directory: %s",
-                    tool_ssh_dir,
-                )
-
+            self._terminate_agent()
+            self._restore_environment()
+            self._secure_cleanup_temp_dir()
         except Exception as exc:
             log.warning("Failed to clean up SSH agent: %s", exc)
         finally:
@@ -456,6 +413,59 @@ class SSHAgentManager:
             self.auth_sock = None
             self.known_hosts_path = None
             self._agent_owned_by_us = False
+
+    def _terminate_agent(self) -> None:
+        """Terminate the SSH agent only if we started it ourselves."""
+        # Never kill an existing SSH agent that we're borrowing
+        if self.agent_pid and self._agent_owned_by_us:
+            try:
+                run_cmd(["/bin/kill", str(self.agent_pid)], timeout=5)
+                log.debug("SSH agent (PID %d) terminated", self.agent_pid)
+            except Exception as exc:
+                log.warning("Failed to kill SSH agent: %s", exc)
+        elif self.agent_pid and not self._agent_owned_by_us:
+            log.debug(
+                "Not terminating SSH agent (borrowed existing agent "
+                "with PID %d)",
+                self.agent_pid,
+            )
+        else:
+            log.debug("Not terminating SSH agent (no agent running)")
+
+    def _restore_environment(self) -> None:
+        """Restore the environment variables saved at setup time."""
+        for key, value in self._original_env.items():
+            if value:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+
+    def _secure_cleanup_temp_dir(self) -> None:
+        """Overwrite and remove the tool's temporary SSH directory."""
+        tool_ssh_dir = self.workspace / ".ssh-g2g"
+        if not tool_ssh_dir.exists():
+            return
+
+        import shutil
+
+        # First, overwrite any key files to prevent recovery
+        try:
+            for root, _dirs, files in os.walk(tool_ssh_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    if file_path.exists() and file_path.is_file():
+                        _overwrite_file_securely(file_path)
+        except Exception as walk_exc:
+            log.debug(
+                "Failed to walk SSH temp directory for secure cleanup: %s",
+                walk_exc,
+            )
+
+        shutil.rmtree(tool_ssh_dir)
+        log.debug(
+            "Securely cleaned up temporary SSH directory: %s",
+            tool_ssh_dir,
+        )
 
 
 def setup_ssh_agent_auth(

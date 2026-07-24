@@ -121,9 +121,64 @@ class ReconciliationMatcher:
 
         # Phase 3 hardening: conflict / duplicate Change-Id detection before
         # any pass
-        # Build a map of existing Change-Id trailers present on local commits;
-        # if one appears on more than one commit we abort with actionable
-        # guidance.
+        self._check_duplicate_trailers(local_commits)
+
+        log.info(
+            "Starting reconciliation: %d local commits, %d Gerrit changes",
+            len(local_commits),
+            len(gerrit_changes),
+        )
+
+        # Track used changes to prevent duplicate matching
+        used_changes: set[str] = set()
+        matches: list[MatchResult] = []
+        strategy_counts: dict[MatchStrategy, int] = {}
+
+        remaining_commits = self._run_matching_passes(
+            local_commits,
+            gerrit_changes,
+            used_changes,
+            matches,
+            strategy_counts,
+        )
+
+        # Generate new Change-IDs for unmatched commits
+        self._assign_new_change_ids(remaining_commits, matches)
+
+        # Sort matches by original commit index to maintain order
+        matches.sort(key=lambda m: m.local_commit.index)
+
+        # Identify orphaned changes
+        orphaned = [
+            change
+            for change in gerrit_changes
+            if change.change_id not in used_changes
+        ]
+
+        reused_count = len(used_changes)
+        new_count = len(local_commits) - reused_count
+
+        result = ReconciliationResult(
+            matches=matches,
+            reused_count=reused_count,
+            new_count=new_count,
+            orphaned_changes=orphaned,
+            strategy_counts=strategy_counts,
+        )
+
+        # Enhanced Phase 3 summary: pass counts & ID classifications
+        self._log_reconciliation_summary(result)
+        return result
+
+    def _check_duplicate_trailers(
+        self, local_commits: list[LocalCommit]
+    ) -> None:
+        """Abort if a Change-Id trailer is reused across local commits.
+
+        Build a map of existing Change-Id trailers present on local
+        commits; if one appears on more than one commit we abort with
+        actionable guidance.
+        """
         seen_trailer_ids: dict[str, list[int]] = {}
         for lc in local_commits:
             if lc.existing_change_id:
@@ -146,17 +201,15 @@ class ReconciliationMatcher:
             )
             raise ValueError(msg)
 
-        log.info(
-            "Starting reconciliation: %d local commits, %d Gerrit changes",
-            len(local_commits),
-            len(gerrit_changes),
-        )
-
-        # Track used changes to prevent duplicate matching
-        used_changes: set[str] = set()
-        matches: list[MatchResult] = []
-        strategy_counts: dict[MatchStrategy, int] = {}
-
+    def _run_matching_passes(
+        self,
+        local_commits: list[LocalCommit],
+        gerrit_changes: list[GerritChange],
+        used_changes: set[str],
+        matches: list[MatchResult],
+        strategy_counts: dict[MatchStrategy, int],
+    ) -> list[LocalCommit]:
+        """Run all matching passes, returning still-unmatched commits."""
         # Pass A: Trailer-based matching (highest priority)
         remaining_commits = self._match_by_trailer(
             local_commits,
@@ -194,7 +247,14 @@ class ReconciliationMatcher:
             strategy_counts,
         )
 
-        # Generate new Change-IDs for unmatched commits
+        return remaining_commits
+
+    def _assign_new_change_ids(
+        self,
+        remaining_commits: list[LocalCommit],
+        matches: list[MatchResult],
+    ) -> None:
+        """Generate new Change-IDs for commits with no matched change."""
         for commit in remaining_commits:
             new_change_id = self._generate_change_id()
             matches.append(
@@ -206,31 +266,6 @@ class ReconciliationMatcher:
                     change_id=new_change_id,
                 )
             )
-
-        # Sort matches by original commit index to maintain order
-        matches.sort(key=lambda m: m.local_commit.index)
-
-        # Identify orphaned changes
-        orphaned = [
-            change
-            for change in gerrit_changes
-            if change.change_id not in used_changes
-        ]
-
-        reused_count = len(used_changes)
-        new_count = len(local_commits) - reused_count
-
-        result = ReconciliationResult(
-            matches=matches,
-            reused_count=reused_count,
-            new_count=new_count,
-            orphaned_changes=orphaned,
-            strategy_counts=strategy_counts,
-        )
-
-        # Enhanced Phase 3 summary: pass counts & ID classifications
-        self._log_reconciliation_summary(result)
-        return result
 
     def _match_by_trailer(
         self,
