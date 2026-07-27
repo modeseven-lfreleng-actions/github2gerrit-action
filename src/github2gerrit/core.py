@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 #
+# aislop-ignore-file complexity/file-too-large -- core.py is the workflow
+# orchestrator, a single large Orchestrator class. Its overly long functions
+# and deep nesting are decomposed into helpers here; splitting the class into
+# separate modules is a dedicated follow-up refactor tracked separately.
+#
 # High-level orchestrator scaffold for the GitHub PR -> Gerrit flow.
 #
 # This module defines the public orchestration surface and typed data models
@@ -36,12 +41,15 @@ import socket
 import stat
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from typing import Literal
+from typing import NoReturn
+from typing import cast
 from urllib.request import Request
 from urllib.request import urlopen
 
@@ -82,10 +90,19 @@ from .utils import is_verbose_mode
 
 
 try:
-    from .ssh_discovery import auto_discover_gerrit_host_keys
+    from .ssh_discovery import (
+        auto_discover_gerrit_host_keys as _auto_discover_gerrit_host_keys,
+    )
 except ImportError:
     # Fallback if ssh_discovery module is not available
-    auto_discover_gerrit_host_keys = None  # type: ignore[assignment]
+    _auto_discover_gerrit_host_keys = None  # type: ignore[assignment]
+
+# Typed explicitly as Optional so both mypy and basedpyright agree the
+# symbol may be None (the ImportError fallback), keeping the `is None`
+# guards at the call sites reachable and required.
+auto_discover_gerrit_host_keys: Callable[..., str | None] | None = (
+    _auto_discover_gerrit_host_keys
+)
 
 try:
     from .ssh_agent_setup import SSHAgentManager
@@ -292,6 +309,24 @@ class SubmissionResult:
     commit_shas: list[str]
 
 
+@dataclass(frozen=True)
+class _BackrefContext:
+    # Shared, per-invocation parameters for Gerrit back-reference comments.
+    gerrit: GerritInfo
+    repo: RepoNames
+    branch: str
+    # Gerrit SSH username (from GERRIT_SSH_USER_G2G).
+    user: str
+    # Gerrit host used as the SSH server.
+    server: str
+    # The back-reference comment message body.
+    message: str
+    # GitHub PR URL used for idempotence detection.
+    pr_url: str
+    # When True, always post even if a back-reference already exists.
+    force_dup: bool
+
+
 class OrchestratorError(RuntimeError):
     """Raised on unrecoverable orchestration failures."""
 
@@ -405,80 +440,17 @@ class Orchestrator:
             existing_trailers = ""
 
             if current_change:
-                rev = str(current_change.get("current_revision") or "")
-                revisions = current_change.get("revisions") or {}
-                if rev and rev in revisions:
-                    commit_data = revisions[rev].get("commit", {})
-                    current_msg = commit_data.get("message", "")
+                current_msg = self._get_current_commit_message(current_change)
+                existing_g2g_metadata, existing_trailers = (
+                    self._split_preserved_metadata(current_msg)
+                )
 
-                    # Extract G2G metadata block if present
-                    g2g_start = current_msg.find("\nGitHub2Gerrit Metadata:")
-                    if g2g_start != -1:
-                        # Find where trailers start after G2G metadata
-                        g2g_section = current_msg[g2g_start:]
-                        trailer_start = -1
-                        for line in g2g_section.split("\n"):
-                            trailer_prefixes = [
-                                "Issue-ID:",
-                                "Signed-off-by:",
-                                "Change-Id:",
-                                "GitHub-PR:",
-                                "GitHub-Hash:",
-                                "Co-authored-by:",
-                            ]
-                            if any(
-                                line.strip().startswith(prefix)
-                                for prefix in trailer_prefixes
-                            ):
-                                trailer_start = current_msg.find(
-                                    line, g2g_start
-                                )
-                                break
-
-                        if trailer_start != -1:
-                            existing_g2g_metadata = current_msg[
-                                g2g_start:trailer_start
-                            ].rstrip()
-                            existing_trailers = current_msg[trailer_start:]
-                        else:
-                            # No trailers found, G2G metadata extends to end
-                            existing_g2g_metadata = current_msg[g2g_start:]
-                    else:
-                        # No G2G metadata, just extract trailers
-                        lines = current_msg.split("\n")
-                        for i in range(len(lines) - 1, -1, -1):
-                            line = lines[i].strip()
-                            trailer_prefixes = [
-                                "Issue-ID:",
-                                "Signed-off-by:",
-                                "Change-Id:",
-                                "GitHub-PR:",
-                                "GitHub-Hash:",
-                                "Co-authored-by:",
-                            ]
-                            if line and any(
-                                line.startswith(prefix)
-                                for prefix in trailer_prefixes
-                            ):
-                                existing_trailers = "\n".join(lines[i:])
-                                break
-
-            if title and description:
-                new_message = f"{title}\n\n{description}"
-            elif title:
-                new_message = title
-            else:
-                new_message = description or ""
-
-            # Append preserved G2G metadata block
-            if existing_g2g_metadata:
-                new_message = new_message.rstrip() + existing_g2g_metadata
-
-            # Append preserved trailers
-            if existing_trailers:
-                if not new_message.endswith("\n\n"):
-                    new_message = new_message.rstrip() + "\n\n"
-                new_message += existing_trailers
+            new_message = self._assemble_updated_message(
+                title,
+                description,
+                existing_g2g_metadata,
+                existing_trailers,
+            )
 
             # Update commit message via REST API
             # PUT /changes/{change-id}/message
@@ -507,6 +479,94 @@ class Orchestrator:
         except Exception as exc:
             log.warning("Failed to update Gerrit change metadata: %s", exc)
             return False
+
+    @staticmethod
+    def _get_current_commit_message(current_change: dict[str, Any]) -> str:
+        """Return the current commit message from change details, if any."""
+        rev = str(current_change.get("current_revision") or "")
+        revisions = current_change.get("revisions") or {}
+        if rev and rev in revisions:
+            commit_data = revisions[rev].get("commit", {})
+            return str(commit_data.get("message", ""))
+        return ""
+
+    @staticmethod
+    def _find_trailer_start(
+        current_msg: str,
+        g2g_start: int,
+        trailer_prefixes: list[str],
+    ) -> int:
+        """Locate the offset of the first trailer line after a G2G block."""
+        g2g_section = current_msg[g2g_start:]
+        for line in g2g_section.split("\n"):
+            if any(
+                line.strip().startswith(prefix) for prefix in trailer_prefixes
+            ):
+                return current_msg.find(line, g2g_start)
+        return -1
+
+    def _split_preserved_metadata(self, current_msg: str) -> tuple[str, str]:
+        """Split a message into preserved G2G metadata block and trailers."""
+        trailer_prefixes = [
+            "Issue-ID:",
+            "Signed-off-by:",
+            "Change-Id:",
+            "GitHub-PR:",
+            "GitHub-Hash:",
+            "Co-authored-by:",
+        ]
+
+        # Extract G2G metadata block if present
+        g2g_start = current_msg.find("\nGitHub2Gerrit Metadata:")
+        if g2g_start != -1:
+            # Find where trailers start after G2G metadata
+            trailer_start = self._find_trailer_start(
+                current_msg, g2g_start, trailer_prefixes
+            )
+            if trailer_start != -1:
+                return (
+                    current_msg[g2g_start:trailer_start].rstrip(),
+                    current_msg[trailer_start:],
+                )
+            # No trailers found, G2G metadata extends to end
+            return current_msg[g2g_start:], ""
+
+        # No G2G metadata, just extract trailers
+        lines = current_msg.split("\n")
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].strip()
+            if line and any(
+                line.startswith(prefix) for prefix in trailer_prefixes
+            ):
+                return "", "\n".join(lines[i:])
+        return "", ""
+
+    @staticmethod
+    def _assemble_updated_message(
+        title: str | None,
+        description: str | None,
+        g2g_metadata: str,
+        trailers: str,
+    ) -> str:
+        """Compose a new commit message preserving metadata and trailers."""
+        if title and description:
+            new_message = f"{title}\n\n{description}"
+        elif title:
+            new_message = title
+        else:
+            new_message = description or ""
+
+        # Append preserved G2G metadata block
+        if g2g_metadata:
+            new_message = new_message.rstrip() + g2g_metadata
+
+        # Append preserved trailers
+        if trailers:
+            if not new_message.endswith("\n\n"):
+                new_message = new_message.rstrip() + "\n\n"
+            new_message += trailers
+
+        return new_message
 
     def _sync_gerrit_change_metadata(
         self,
@@ -618,88 +678,11 @@ class Orchestrator:
             verification_results = []
 
             for change_id in change_ids:
-                try:
-                    encoded_id = urllib.parse.quote(change_id, safe="")
-                    query_path = f"/changes/{encoded_id}?o=CURRENT_REVISION"
-
-                    change = client.get(query_path)
-
-                    if not change:
-                        log.warning(
-                            "⚠️  Could not verify change %s - not found",
-                            change_id,
-                        )
-                        verification_results.append(
-                            {
-                                "change_id": change_id,
-                                "status": "not_found",
-                                "verified": False,
-                            }
-                        )
-                        continue
-
-                    status = change.get("status", "UNKNOWN")
-                    current_revision = change.get("current_revision", "")
-                    revisions = change.get("revisions", {})
-
-                    patchset_num = 0
-                    if current_revision and current_revision in revisions:
-                        patchset_num = revisions[current_revision].get(
-                            "_number", 0
-                        )
-
-                    change_number = change.get("_number", "unknown")
-                    subject = change.get("subject", "")[:60]
-
-                    verification_results.append(
-                        {
-                            "change_id": change_id,
-                            "change_number": change_number,
-                            "status": status,
-                            "patchset": patchset_num,
-                            "subject": subject,
-                            "verified": True,
-                        }
+                verification_results.append(
+                    self._verify_single_change(
+                        client, change_id, expected_operation
                     )
-
-                    if patchset_num > 1:
-                        log.debug(
-                            "✅ Verified %s: Change %s, patchset %d, status=%s",
-                            expected_operation.upper(),
-                            change_number,
-                            patchset_num,
-                            status,
-                        )
-                    elif patchset_num == 1:
-                        log.warning(
-                            "⚠️  Change %s has patchset 1 - may be newly "
-                            "created instead of updated",
-                            change_number,
-                        )
-                    else:
-                        log.warning(
-                            "⚠️  Could not determine patchset number "
-                            "for change %s",
-                            change_number,
-                        )
-
-                    if status == "ABANDONED":
-                        log.warning(
-                            "⚠️  Change %s is ABANDONED - update may not "
-                            "be visible",
-                            change_number,
-                        )
-
-                except Exception as exc:
-                    log.debug("Failed to verify change %s: %s", change_id, exc)
-                    verification_results.append(
-                        {
-                            "change_id": change_id,
-                            "status": "error",
-                            "verified": False,
-                            "error": str(exc),
-                        }
-                    )
+                )
 
             # Summary
             verified_count = sum(
@@ -725,6 +708,99 @@ class Orchestrator:
 
         except Exception as exc:
             log.warning("Patchset verification failed (non-fatal): %s", exc)
+
+    def _verify_single_change(
+        self,
+        client: Any,
+        change_id: str,
+        expected_operation: str,
+    ) -> dict[str, Any]:
+        """Verify a single Gerrit change and return its result record."""
+        try:
+            encoded_id = urllib.parse.quote(change_id, safe="")
+            query_path = f"/changes/{encoded_id}?o=CURRENT_REVISION"
+
+            change = client.get(query_path)
+
+            if not change:
+                log.warning(
+                    "⚠️  Could not verify change %s - not found",
+                    change_id,
+                )
+                return {
+                    "change_id": change_id,
+                    "status": "not_found",
+                    "verified": False,
+                }
+
+            status = change.get("status", "UNKNOWN")
+            current_revision = change.get("current_revision", "")
+            revisions = change.get("revisions", {})
+
+            patchset_num = 0
+            if current_revision and current_revision in revisions:
+                patchset_num = revisions[current_revision].get("_number", 0)
+
+            change_number = change.get("_number", "unknown")
+            subject = change.get("subject", "")[:60]
+
+            result = {
+                "change_id": change_id,
+                "change_number": change_number,
+                "status": status,
+                "patchset": patchset_num,
+                "subject": subject,
+                "verified": True,
+            }
+
+            self._log_patchset_status(
+                patchset_num, change_number, status, expected_operation
+            )
+
+        except Exception as exc:
+            log.debug("Failed to verify change %s: %s", change_id, exc)
+            return {
+                "change_id": change_id,
+                "status": "error",
+                "verified": False,
+                "error": str(exc),
+            }
+        else:
+            return result
+
+    @staticmethod
+    def _log_patchset_status(
+        patchset_num: int,
+        change_number: Any,
+        status: str,
+        expected_operation: str,
+    ) -> None:
+        """Emit patchset/status warnings for a verified change."""
+        if patchset_num > 1:
+            log.debug(
+                "✅ Verified %s: Change %s, patchset %d, status=%s",
+                expected_operation.upper(),
+                change_number,
+                patchset_num,
+                status,
+            )
+        elif patchset_num == 1:
+            log.warning(
+                "⚠️  Change %s has patchset 1 - may be newly "
+                "created instead of updated",
+                change_number,
+            )
+        else:
+            log.warning(
+                "⚠️  Could not determine patchset number for change %s",
+                change_number,
+            )
+
+        if status == "ABANDONED":
+            log.warning(
+                "⚠️  Change %s is ABANDONED - update may not be visible",
+                change_number,
+            )
 
     def _topic_for_pr(self, gh: GitHubContext) -> str:
         """Build the canonical Gerrit topic for the current PR.
@@ -771,8 +847,6 @@ class Orchestrator:
             log.debug("No PR number provided, cannot find existing changes")
             return []
 
-        change_ids: list[str] = []
-
         expected_pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
         meta_trailers = self._build_pr_metadata_trailers(gh)
         expected_github_hash = ""
@@ -788,6 +862,50 @@ class Orchestrator:
         )
 
         # Strategy 1: Topic-based query (most reliable)
+        result = self._find_change_by_topic(gh, gerrit)
+        if result is not None:
+            return result
+
+        # Strategy 2 & 3: Query by GitHub-Hash and GitHub-PR trailers
+        if expected_github_hash:
+            result = self._find_change_by_github_hash(
+                gerrit, expected_github_hash
+            )
+            if result is not None:
+                return result
+
+        # Strategy 4: Parse mapping comments from PR. This also caches the
+        # PR title for reuse by Strategy 5 to avoid duplicate GitHub API
+        # requests.
+        cached_pr_title, result = self._find_change_by_mapping_comment(
+            gh, expected_pr_url, expected_github_hash
+        )
+        if result is not None:
+            return result
+
+        # Strategy 5: Dependency package match (supersession)
+        result = self._find_change_by_dependency_package(
+            gh, gerrit, cached_pr_title
+        )
+        if result is not None:
+            return result
+
+        log.warning(
+            "⚠️  No existing Gerrit changes found for PR #%s",
+            gh.pr_number,
+        )
+        return []
+
+    def _find_change_by_topic(
+        self,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+    ) -> list[str] | None:
+        """Strategy 1: find existing changes via the pushed Gerrit topic.
+
+        Returns the change-ids (possibly empty) when a topic query was
+        performed, or None to signal that later strategies should run.
+        """
         try:
             from .gerrit_query import query_changes_by_topic
 
@@ -822,57 +940,91 @@ class Orchestrator:
         except Exception as exc:
             log.debug("Topic-based query failed: %s", exc)
 
-        # Strategy 2 & 3: Query by GitHub-Hash and GitHub-PR trailers
-        if expected_github_hash:
-            try:
-                from .gerrit_rest import build_client_for_host
+        return None
 
-                # Use centralized URL builder
-                client = build_client_for_host(gerrit.host)
+    @staticmethod
+    def _commit_message_matches_hash(
+        change: dict[str, Any],
+        expected_github_hash: str,
+    ) -> bool:
+        """Return True if a change's commit message has the GitHub-Hash."""
+        rev = str(change.get("current_revision") or "")
+        revisions = change.get("revisions") or {}
+        if not (rev and rev in revisions):
+            return False
+        commit_data = revisions[rev].get("commit", {})
+        commit_msg = commit_data.get("message", "")
+        expected_hash_line = f"GitHub-Hash: {expected_github_hash}"
+        return expected_hash_line in commit_msg
 
-                # Build query for changes with matching GitHub-Hash trailer
+    def _collect_hash_matched_change_ids(
+        self,
+        data: list[dict[str, Any]],
+        expected_github_hash: str,
+    ) -> list[str]:
+        """Collect change-ids whose commit message matches the hash."""
+        change_ids: list[str] = []
+        for change in data:
+            if not self._commit_message_matches_hash(
+                change, expected_github_hash
+            ):
+                continue
+            cid = change.get("change_id", "")
+            if cid and cid not in change_ids:
+                change_ids.append(cid)
+        return change_ids
 
-                query = (
-                    f"project:{gerrit.project} message:{expected_github_hash}"
+    def _find_change_by_github_hash(
+        self,
+        gerrit: GerritInfo,
+        expected_github_hash: str,
+    ) -> list[str] | None:
+        """Strategy 2 & 3: find changes by GitHub-Hash trailer match."""
+        try:
+            from .gerrit_rest import build_client_for_host
+
+            # Use centralized URL builder
+            client = build_client_for_host(gerrit.host)
+
+            query = f"project:{gerrit.project} message:{expected_github_hash}"
+            encoded_q = urllib.parse.quote(query, safe="")
+            query_path = f"/changes/?q={encoded_q}&n=50&o=CURRENT_REVISION"
+
+            log.debug("Querying for GitHub-Hash: %s", expected_github_hash)
+
+            data = client.get(query_path)
+            if isinstance(data, list) and data:
+                # Filter to only those with matching GitHub-Hash in
+                # commit message
+                change_ids = self._collect_hash_matched_change_ids(
+                    data, expected_github_hash
                 )
-                encoded_q = urllib.parse.quote(query, safe="")
-                query_path = f"/changes/?q={encoded_q}&n=50&o=CURRENT_REVISION"
+                if change_ids:
+                    log.info(
+                        "✅ Found %d change(s) by GitHub-Hash trailer",
+                        len(change_ids),
+                    )
+                    return change_ids
 
-                log.debug("Querying for GitHub-Hash: %s", expected_github_hash)
+        except Exception as exc:
+            log.debug("GitHub-Hash trailer query failed: %s", exc)
 
-                data = client.get(query_path)
-                if isinstance(data, list) and data:
-                    # Filter to only those with matching GitHub-Hash in
-                    # commit message
-                    for change in data:
-                        rev = str(change.get("current_revision") or "")
-                        revisions = change.get("revisions") or {}
-                        if rev and rev in revisions:
-                            commit_data = revisions[rev].get("commit", {})
-                            commit_msg = commit_data.get("message", "")
-                            expected_hash_line = (
-                                f"GitHub-Hash: {expected_github_hash}"
-                            )
-                            if expected_hash_line in commit_msg:
-                                cid = change.get("change_id", "")
-                                if cid and cid not in change_ids:
-                                    change_ids.append(cid)
+        return None
 
-                    if change_ids:
-                        log.info(
-                            "✅ Found %d change(s) by GitHub-Hash trailer",
-                            len(change_ids),
-                        )
-                        return change_ids
+    def _find_change_by_mapping_comment(
+        self,
+        gh: GitHubContext,
+        expected_pr_url: str,
+        expected_github_hash: str,
+    ) -> tuple[str, list[str] | None]:
+        """Strategy 4: find changes from a mapping comment on the PR.
 
-            except Exception as exc:
-                log.debug("GitHub-Hash trailer query failed: %s", exc)
-
-        # Cache the PR title for reuse across strategies 4 and 5
-        # so we don't duplicate GitHub API requests.
+        Returns a tuple of the (cached) PR title and the matched change-ids
+        (or None to continue to later strategies).
+        """
         cached_pr_title: str = ""
-
-        # Strategy 4: Parse mapping comments from PR
+        if gh.pr_number is None:
+            return cached_pr_title, None
         try:
             from .mapping_comment import parse_mapping_comments
 
@@ -900,7 +1052,7 @@ class Orchestrator:
                         "✅ Found %d change(s) from mapping comment",
                         len(change_ids),
                     )
-                    return change_ids
+                    return cached_pr_title, change_ids
                 else:
                     log.warning(
                         "Mapping comment found but consistency check failed"
@@ -909,17 +1061,80 @@ class Orchestrator:
         except Exception as exc:
             log.debug("Mapping comment parsing failed: %s", exc)
 
-        # Strategy 5: Dependency package match (supersession)
-        # When a new Dependabot/Renovate PR bumps the same dependency
-        # as an existing open Gerrit change, reuse that Change-Id so
-        # the push creates a new patchset instead of a duplicate change.
+        return cached_pr_title, None
+
+    def _fetch_pr_title(self, gh: GitHubContext) -> str:
+        """Fetch the PR title from the GitHub API, empty on failure."""
+        if gh.pr_number is None:
+            return ""
         try:
-            from .gerrit_query import GerritChange
+            gh_client = build_client()
+            gh_repo = get_repo_from_env(gh_client)
+            pr_obj = get_pull(gh_repo, int(gh.pr_number))
+            return getattr(pr_obj, "title", "") or ""
+        except Exception:
+            return ""
+
+    def _collect_dependency_candidates(
+        self,
+        open_changes: list[Any],
+        current_pkg: str,
+    ) -> list[tuple[int, Any]]:
+        """Collect open changes bumping the same dependency package.
+
+        Only GitHub2Gerrit changes with a valid numeric change number are
+        considered candidates for supersession.
+        """
+        from .similarity import extract_dependency_package_from_subject
+        from .trailers import GITHUB_PR_TRAILER
+        from .trailers import parse_trailers
+
+        candidates: list[tuple[int, Any]] = []
+        for change in open_changes:
+            candidate_pkg = extract_dependency_package_from_subject(
+                change.subject
+            )
+            if not (candidate_pkg and candidate_pkg == current_pkg):
+                continue
+            # Verify this is a GitHub2Gerrit change
+            commit_msg = change.commit_message or ""
+            trailers = parse_trailers(commit_msg)
+            if GITHUB_PR_TRAILER not in trailers:
+                log.debug(
+                    "Strategy 5: skipping change %s "
+                    "(no GitHub2Gerrit metadata)",
+                    change.number,
+                )
+                continue
+            try:
+                change_num = int(change.number)
+            except (TypeError, ValueError):
+                log.debug(
+                    "Strategy 5: skipping change with "
+                    "invalid number %r for subject %r",
+                    change.number,
+                    change.subject,
+                )
+                continue
+            candidates.append((change_num, change))
+        return candidates
+
+    def _find_change_by_dependency_package(
+        self,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        cached_pr_title: str,
+    ) -> list[str] | None:
+        """Strategy 5: find an open change bumping the same dependency.
+
+        When a new Dependabot/Renovate PR bumps the same dependency as an
+        existing open Gerrit change, reuse that Change-Id so the push
+        creates a new patchset instead of a duplicate change.
+        """
+        try:
             from .gerrit_query import query_open_changes_by_project
             from .gerrit_rest import build_client_for_host
             from .similarity import extract_dependency_package_from_subject
-            from .trailers import GITHUB_PR_TRAILER
-            from .trailers import parse_trailers
 
             # Reuse PR title cached by Strategy 4 to avoid a
             # duplicate GitHub API request.
@@ -928,97 +1143,64 @@ class Orchestrator:
                 log.debug(
                     "Strategy 5: PR title cache miss, fetching from GitHub API",
                 )
-                try:
-                    gh_client = build_client()
-                    gh_repo = get_repo_from_env(gh_client)
-                    pr_obj = get_pull(gh_repo, int(gh.pr_number))
-                    pr_title = getattr(pr_obj, "title", "") or ""
-                except Exception:
-                    pr_title = ""
+                pr_title = self._fetch_pr_title(gh)
 
             current_pkg = extract_dependency_package_from_subject(pr_title)
-            if current_pkg:
-                log.debug(
-                    "Strategy 5: searching for open changes that "
-                    "bump dependency '%s'",
-                    current_pkg,
-                )
-                dep_client = build_client_for_host(gerrit.host)
-                open_changes = query_open_changes_by_project(
-                    dep_client,
-                    gerrit.project,
-                    branch=gh.base_ref,
-                    max_results=200,
-                    github_repository=gh.repository,
-                )
-
-                # Collect all matching changes, then select the
-                # oldest one (lowest change number) to avoid
-                # "downgrading" a newer change by uploading an
-                # older patchset to it.
-                candidates: list[tuple[int, GerritChange]] = []
-                for change in open_changes:
-                    candidate_pkg = extract_dependency_package_from_subject(
-                        change.subject
-                    )
-                    if candidate_pkg and candidate_pkg == current_pkg:
-                        # Verify this is a GitHub2Gerrit change
-                        commit_msg = change.commit_message or ""
-                        trailers = parse_trailers(commit_msg)
-                        if GITHUB_PR_TRAILER not in trailers:
-                            log.debug(
-                                "Strategy 5: skipping change %s "
-                                "(no GitHub2Gerrit metadata)",
-                                change.number,
-                            )
-                            continue
-                        try:
-                            change_num = int(change.number)
-                        except (TypeError, ValueError):
-                            log.debug(
-                                "Strategy 5: skipping change with "
-                                "invalid number %r for subject %r",
-                                change.number,
-                                change.subject,
-                            )
-                            continue
-                        candidates.append((change_num, change))
-
-                if candidates:
-                    # Prefer the oldest open change so the newest
-                    # PR always updates the original change and
-                    # the post-push sweep abandons the rest.
-                    candidates.sort(key=lambda t: t[0])
-                    _, oldest = candidates[0]
-                    change_ids = [oldest.change_id]
-                    log.info(
-                        "Found superseding target by dependency "
-                        "package '%s': change %s (%s) "
-                        "(oldest of %d candidate(s))",
-                        current_pkg,
-                        oldest.number,
-                        oldest.subject,
-                        len(candidates),
-                    )
-                    return change_ids
-
-                log.debug(
-                    "No open changes found for dependency '%s'",
-                    current_pkg,
-                )
-            else:
+            if not current_pkg:
                 log.debug(
                     "Strategy 5 skipped: could not extract dependency "
                     "package from PR title"
                 )
+                return None
+
+            log.debug(
+                "Strategy 5: searching for open changes that "
+                "bump dependency '%s'",
+                current_pkg,
+            )
+            dep_client = build_client_for_host(gerrit.host)
+            open_changes = query_open_changes_by_project(
+                dep_client,
+                gerrit.project,
+                branch=gh.base_ref,
+                max_results=200,
+                github_repository=gh.repository,
+            )
+
+            # Collect all matching changes, then select the
+            # oldest one (lowest change number) to avoid
+            # "downgrading" a newer change by uploading an
+            # older patchset to it.
+            candidates = self._collect_dependency_candidates(
+                open_changes, current_pkg
+            )
+
+            if candidates:
+                # Prefer the oldest open change so the newest
+                # PR always updates the original change and
+                # the post-push sweep abandons the rest.
+                candidates.sort(key=lambda t: t[0])
+                _, oldest = candidates[0]
+                change_ids = [oldest.change_id]
+                log.info(
+                    "Found superseding target by dependency "
+                    "package '%s': change %s (%s) "
+                    "(oldest of %d candidate(s))",
+                    current_pkg,
+                    oldest.number,
+                    oldest.subject,
+                    len(candidates),
+                )
+                return change_ids
+
+            log.debug(
+                "No open changes found for dependency '%s'",
+                current_pkg,
+            )
         except Exception as exc:
             log.debug("Dependency package strategy failed: %s", exc)
 
-        log.warning(
-            "⚠️  No existing Gerrit changes found for PR #%s",
-            gh.pr_number,
-        )
-        return []
+        return None
 
     # Phase 1 helper: build deterministic PR metadata trailers
     # Phase 3 introduces reconciliation helpers below for reusing prior
@@ -1139,7 +1321,6 @@ class Orchestrator:
             Complete commit message with all trailers properly ordered
         """
         from .commit_rules import apply_body_rules
-        from .commit_rules import apply_trailer_rules
         from .commit_rules import parse_commit_rules_json
         from .commit_rules import resolve_rules
         from .gitutils import _parse_trailers
@@ -1151,12 +1332,61 @@ class Orchestrator:
 
         # Split message into body and trailers
         lines = base_message.splitlines()
-        body_lines = []
 
         # Find where trailers start using generic "Key: value" detection
         # aligned with _parse_trailers() in gitutils.py: a trailer block
         # must be preceded by a blank line to avoid matching conventional
         # commit subjects like "fix: something" as trailers.
+        trailer_start = self._find_trailer_boundary(lines)
+
+        # Body is everything before trailers
+        body_lines = lines[:trailer_start]
+        base_body = "\n".join(body_lines).rstrip()
+
+        # Resolve commit rules from COMMIT_RULES_JSON
+        github_actor = os.getenv("GITHUB_ACTOR", "")
+        rules_config = parse_commit_rules_json(inputs.commit_rules_json)
+        resolved_rules = resolve_rules(
+            rules_config,
+            gerrit_project=gerrit_project,
+            github_actor=github_actor,
+        )
+
+        # Apply body-location rules (e.g. "Type: ci" for FD.io VPP)
+        if resolved_rules.has_rules:
+            base_body = apply_body_rules(base_body, resolved_rules)
+
+        trailers_ordered = self._collect_ordered_trailers(
+            existing_trailers=existing_trailers,
+            inputs=inputs,
+            gh=gh,
+            change_id=change_id,
+            preserve_existing=preserve_existing,
+            resolved_rules=resolved_rules,
+        )
+
+        # Add GitHub2Gerrit metadata block before trailers if requested
+        if include_g2g_metadata and g2g_mode and g2g_topic:
+            metadata_block = self._build_g2g_metadata_block(
+                gh, g2g_mode, g2g_topic, g2g_change_ids
+            )
+            base_body = base_body + "\n" + metadata_block
+
+        # Assemble final message
+        if trailers_ordered:
+            final_message = base_body + "\n\n" + "\n".join(trailers_ordered)
+        else:
+            final_message = base_body
+
+        return final_message
+
+    @staticmethod
+    def _find_trailer_boundary(lines: list[str]) -> int:
+        """Return the line index where the trailer block starts.
+
+        A trailer block must be preceded by a blank line to avoid matching
+        conventional commit subjects like "fix: something" as trailers.
+        """
         trailer_start = len(lines)
         in_trailer_block = True
 
@@ -1180,22 +1410,20 @@ class Orchestrator:
             elif in_trailer_block:
                 in_trailer_block = False
 
-        # Body is everything before trailers
-        body_lines = lines[:trailer_start]
-        base_body = "\n".join(body_lines).rstrip()
+        return trailer_start
 
-        # Resolve commit rules from COMMIT_RULES_JSON
-        github_actor = os.getenv("GITHUB_ACTOR", "")
-        rules_config = parse_commit_rules_json(inputs.commit_rules_json)
-        resolved_rules = resolve_rules(
-            rules_config,
-            gerrit_project=gerrit_project,
-            github_actor=github_actor,
-        )
-
-        # Apply body-location rules (e.g. "Type: ci" for FD.io VPP)
-        if resolved_rules.has_rules:
-            base_body = apply_body_rules(base_body, resolved_rules)
+    def _collect_ordered_trailers(
+        self,
+        *,
+        existing_trailers: dict[str, list[str]],
+        inputs: Inputs,
+        gh: GitHubContext,
+        change_id: str | None,
+        preserve_existing: bool,
+        resolved_rules: Any,
+    ) -> list[str]:
+        """Build the ordered trailer block for a commit message."""
+        from .commit_rules import apply_trailer_rules
 
         trailers_ordered: list[str] = []
 
@@ -1263,38 +1491,36 @@ class Orchestrator:
         #    Ticket:, Co-authored-by:) that are not explicitly rebuilt
         #    above, so custom trailers are not silently dropped.
         if preserve_existing and existing_trailers:
-            managed_keys = {
-                "Issue-ID",
-                "Signed-off-by",
-                "Change-Id",
-                "GitHub-PR",
-                "GitHub-Hash",
-            }
-            # Also treat commit-rule trailer keys as managed
-            if resolved_rules.has_rules:
-                managed_keys.update(r.key for r in resolved_rules.trailer_rules)
-            for key, values in existing_trailers.items():
-                if key in managed_keys:
-                    continue
-                for val in values:
-                    trailer_line = f"{key}: {val}"
-                    if trailer_line not in trailers_ordered:
-                        trailers_ordered.append(trailer_line)
-
-        # Add GitHub2Gerrit metadata block before trailers if requested
-        if include_g2g_metadata and g2g_mode and g2g_topic:
-            metadata_block = self._build_g2g_metadata_block(
-                gh, g2g_mode, g2g_topic, g2g_change_ids
+            self._append_unmanaged_trailers(
+                trailers_ordered, existing_trailers, resolved_rules
             )
-            base_body = base_body + "\n" + metadata_block
 
-        # Assemble final message
-        if trailers_ordered:
-            final_message = base_body + "\n\n" + "\n".join(trailers_ordered)
-        else:
-            final_message = base_body
+        return trailers_ordered
 
-        return final_message
+    @staticmethod
+    def _append_unmanaged_trailers(
+        trailers_ordered: list[str],
+        existing_trailers: dict[str, list[str]],
+        resolved_rules: Any,
+    ) -> None:
+        """Append preserved trailers not managed by the ordered rebuild."""
+        managed_keys = {
+            "Issue-ID",
+            "Signed-off-by",
+            "Change-Id",
+            "GitHub-PR",
+            "GitHub-Hash",
+        }
+        # Also treat commit-rule trailer keys as managed
+        if resolved_rules.has_rules:
+            managed_keys.update(r.key for r in resolved_rules.trailer_rules)
+        for key, values in existing_trailers.items():
+            if key in managed_keys:
+                continue
+            for val in values:
+                trailer_line = f"{key}: {val}"
+                if trailer_line not in trailers_ordered:
+                    trailers_ordered.append(trailer_line)
 
     def _emit_change_id_map_comment(
         self,
@@ -1925,34 +2151,86 @@ class Orchestrator:
         if not change_ids or not gh.pr_number:
             return None
 
+        states = self._collect_change_states(gerrit, change_ids)
+        if states is None:
+            # Fail open: unknown state must not block submission
+            return None
+
+        final_states = {"MERGED", "ABANDONED"}
+        if not all(info["status"] in final_states for _, info in states):
+            self._log_partial_final_states(states, final_states)
+            return None
+
+        # All resolved changes are in a final state
+        urls, nums, shas = self._collect_final_change_refs(gerrit, states)
+
+        # Overall status: MERGED wins for messaging purposes
+        overall_status: Literal["MERGED", "ABANDONED"] = (
+            "MERGED"
+            if any(info["status"] == "MERGED" for _, info in states)
+            else "ABANDONED"
+        )
+        change_ref = ", ".join(urls) if urls else ", ".join(change_ids)
+        log.info(
+            "Gerrit change(s) for PR #%s already %s: %s",
+            gh.pr_number,
+            overall_status.lower(),
+            change_ref,
+        )
+
+        self._reconcile_pr_for_final_changes(
+            gh=gh,
+            overall_status=overall_status,
+            change_ref=change_ref,
+            urls=urls,
+        )
+
+        return SubmissionResult(
+            change_urls=urls,
+            change_numbers=nums,
+            commit_shas=shas,
+        )
+
+    def _collect_change_states(
+        self,
+        gerrit: GerritInfo,
+        change_ids: list[str],
+    ) -> list[tuple[str, dict[str, str]]] | None:
+        """Look up Gerrit state for each change; None if any is unknown."""
         states: list[tuple[str, dict[str, str]]] = []
         for cid in change_ids:
             info = self._lookup_change_state(gerrit, cid)
             if info is None:
-                # Fail open: unknown state must not block submission
                 return None
             states.append((cid, info))
+        return states
 
-        final_states = {"MERGED", "ABANDONED"}
-        if not all(info["status"] in final_states for _, info in states):
-            open_ids = [
-                cid
-                for cid, info in states
-                if info["status"] not in final_states
-            ]
-            closed_ids = [
-                cid for cid, info in states if info["status"] in final_states
-            ]
-            if closed_ids:
-                log.warning(
-                    "Some reused Gerrit change(s) are already closed "
-                    "(%s); proceeding with open change(s): %s",
-                    ", ".join(closed_ids),
-                    ", ".join(open_ids),
-                )
-            return None
+    @staticmethod
+    def _log_partial_final_states(
+        states: list[tuple[str, dict[str, str]]],
+        final_states: set[str],
+    ) -> None:
+        """Log a warning when only some reused changes are already closed."""
+        open_ids = [
+            cid for cid, info in states if info["status"] not in final_states
+        ]
+        closed_ids = [
+            cid for cid, info in states if info["status"] in final_states
+        ]
+        if closed_ids:
+            log.warning(
+                "Some reused Gerrit change(s) are already closed "
+                "(%s); proceeding with open change(s): %s",
+                ", ".join(closed_ids),
+                ", ".join(open_ids),
+            )
 
-        # All resolved changes are in a final state
+    @staticmethod
+    def _collect_final_change_refs(
+        gerrit: GerritInfo,
+        states: list[tuple[str, dict[str, str]]],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Build change URLs, numbers, and SHAs for final-state changes."""
         url_builder = create_gerrit_url_builder(gerrit.host)
         urls: list[str] = []
         nums: list[str] = []
@@ -1969,21 +2247,19 @@ class Orchestrator:
                 nums.append(info["number"])
             if info["current_revision"]:
                 shas.append(info["current_revision"])
+        return urls, nums, shas
 
-        # Overall status: MERGED wins for messaging purposes
-        overall_status: Literal["MERGED", "ABANDONED"] = (
-            "MERGED"
-            if any(info["status"] == "MERGED" for _, info in states)
-            else "ABANDONED"
-        )
-        change_ref = ", ".join(urls) if urls else ", ".join(change_ids)
-        log.info(
-            "Gerrit change(s) for PR #%s already %s: %s",
-            gh.pr_number,
-            overall_status.lower(),
-            change_ref,
-        )
-
+    def _reconcile_pr_for_final_changes(
+        self,
+        *,
+        gh: GitHubContext,
+        overall_status: Literal["MERGED", "ABANDONED"],
+        change_ref: str,
+        urls: list[str],
+    ) -> None:
+        """Close or comment on the PR for already-final Gerrit changes."""
+        if gh.pr_number is None:
+            return
         close_merged_prs = env_bool("CLOSE_MERGED_PRS", True)
         pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
         try:
@@ -2022,12 +2298,6 @@ class Orchestrator:
                 exc,
             )
 
-        return SubmissionResult(
-            change_urls=urls,
-            change_numbers=nums,
-            commit_shas=shas,
-        )
-
     def execute(
         self,
         inputs: Inputs,
@@ -2048,20 +2318,71 @@ class Orchestrator:
         self._inputs = inputs  # Store for access by helper methods
         self._guard_pull_request_context(gh)
 
-        # Determine operation mode
-        if operation_mode is None:
-            operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+        operation_mode, is_update_operation, is_edit_operation = (
+            self._determine_operation_mode(operation_mode)
+        )
 
-        is_update_operation = operation_mode == "update"
-        is_edit_operation = operation_mode == "edit"
+        gerrit, repo_names = self._resolve_pipeline_targets(inputs, gh)
 
-        if is_update_operation:
-            log.debug("📝 Executing UPDATE operation (PR synchronize event)")
-        elif is_edit_operation:
-            log.debug("✏️  Executing EDIT operation (PR edited event)")
-        else:
-            log.debug("🆕 Executing CREATE operation (new PR or unknown event)")
+        if inputs.dry_run:
+            return self._run_dry_run(
+                gerrit=gerrit, inputs=inputs, gh=gh, repo=repo_names
+            )
 
+        self._prepare_ssh_and_git_environment(inputs, gerrit)
+
+        (
+            forced_reuse_ids,
+            is_update_operation,
+            is_edit_operation,
+            operation_mode,
+        ) = self._resolve_forced_reuse_ids(
+            inputs,
+            gh,
+            gerrit,
+            is_update_operation=is_update_operation,
+            is_edit_operation=is_edit_operation,
+            operation_mode=operation_mode,
+        )
+
+        # Determine reuse Change-IDs before preparing commits so the
+        # preparation step runs only once, with the correct IDs.
+        reuse_ids = self._determine_reuse_ids(
+            inputs, gh, gerrit, forced_reuse_ids
+        )
+
+        # State reconciliation: when every Gerrit change resolved for
+        # this PR is already in a final state (merged/abandoned), the
+        # PR is redundant. Act on the GitHub PR instead of pushing a
+        # patchset that Gerrit will reject with "change ... closed".
+        early_result = self._reconcile_final_state_changes(
+            gh=gh,
+            gerrit=gerrit,
+            change_ids=reuse_ids,
+        )
+        if early_result is not None:
+            return early_result
+
+        # Now prepare commits once with the correct reuse_ids
+        prep = self._prepare_commits(inputs, gh, gerrit, reuse_ids)
+
+        self._apply_pr_title_body_if_requested(inputs, gh, operation_mode)
+
+        return self._push_and_finalize(
+            inputs=inputs,
+            gh=gh,
+            gerrit=gerrit,
+            repo_names=repo_names,
+            prep=prep,
+            operation_mode=operation_mode,
+        )
+
+    def _resolve_pipeline_targets(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+    ) -> tuple[GerritInfo, RepoNames]:
+        """Prepare the workspace and resolve Gerrit/repository targets."""
         # Initialize git repository in workspace if it doesn't exist
         if not (self.workspace / ".git").exists():
             self._prepare_workspace_checkout(inputs=inputs, gh=gh)
@@ -2079,18 +2400,31 @@ class Orchestrator:
         gerrit = self._resolve_gerrit_info(gitreview, inputs, repo_names)
 
         log.debug("execute: resolved gerrit info: %s", gerrit)
-        if inputs.dry_run:
-            log.debug(
-                "execute: entering dry-run mode due to inputs.dry_run=True"
-            )
-            # Perform preflight validations and exit without making changes
-            self._dry_run_preflight(
-                gerrit=gerrit, inputs=inputs, gh=gh, repo=repo_names
-            )
-            log.debug("Dry run complete; skipping write operations to Gerrit")
-            return SubmissionResult(
-                change_urls=[], change_numbers=[], commit_shas=[]
-            )
+        return gerrit, repo_names
+
+    def _run_dry_run(
+        self,
+        *,
+        gerrit: GerritInfo,
+        inputs: Inputs,
+        gh: GitHubContext,
+        repo: RepoNames,
+    ) -> SubmissionResult:
+        """Run preflight validations and return an empty result."""
+        log.debug("execute: entering dry-run mode due to inputs.dry_run=True")
+        # Perform preflight validations and exit without making changes
+        self._dry_run_preflight(gerrit=gerrit, inputs=inputs, gh=gh, repo=repo)
+        log.debug("Dry run complete; skipping write operations to Gerrit")
+        return SubmissionResult(
+            change_urls=[], change_numbers=[], commit_shas=[]
+        )
+
+    def _prepare_ssh_and_git_environment(
+        self,
+        inputs: Inputs,
+        gerrit: GerritInfo,
+    ) -> None:
+        """Set up SSH, the non-interactive environment, and git config."""
         self._setup_ssh(inputs, gerrit)
         # Reset workspace preparation state for this execution
         self._workspace_prepared = False
@@ -2111,6 +2445,96 @@ class Orchestrator:
 
         # Ensure commit/tag signing is disabled before any commit operations
         # to avoid agent prompts
+        self._disable_commit_signing()
+
+        # Configure git identity BEFORE any merge operations create commits
+        self._ensure_git_user_identity(inputs)
+
+        self._configure_git(gerrit, inputs)
+
+    def _push_and_finalize(
+        self,
+        *,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        repo_names: RepoNames,
+        prep: PreparedChange,
+        operation_mode: str,
+    ) -> SubmissionResult:
+        """Push to Gerrit, query results, and run post-push actions."""
+        is_update_operation = operation_mode == "update"
+        is_edit_operation = operation_mode == "edit"
+        # Store context for downstream push/comment emission (Phase 2)
+        self._gh_context_for_push = gh
+        self._push_to_gerrit(
+            gerrit=gerrit,
+            repo=repo_names,
+            branch=self._resolve_target_branch(),
+            reviewers=self._resolve_reviewers(inputs),
+            single_commits=inputs.submit_single_commits,
+            prepared=prep,
+            gh=gh,
+        )
+
+        result = self._query_gerrit_for_results(
+            gerrit=gerrit,
+            repo=repo_names,
+            change_ids=prep.change_ids,
+        )
+
+        # Verify patchset creation and sync metadata for UPDATE/EDIT
+        self._verify_and_sync_after_push(
+            gh=gh,
+            gerrit=gerrit,
+            prep=prep,
+            is_update_operation=is_update_operation,
+            is_edit_operation=is_edit_operation,
+        )
+
+        self._add_backref_comment_in_gerrit(
+            gerrit=gerrit,
+            repo=repo_names,
+            branch=self._resolve_target_branch(),
+            commit_shas=result.commit_shas,
+            gh=gh,
+        )
+
+        self._comment_on_pull_request(gh, gerrit, result)
+
+        self._validate_committed_files(gh, result)
+
+        # Post-push supersession sweep (Option A fallback).
+        self._post_push_supersession_sweep(inputs, gerrit, gh, prep)
+
+        self._close_pull_request_if_required(gh)
+
+        log.debug("Pipeline complete: %s", result)
+        self._cleanup_ssh()
+        return result
+
+    def _determine_operation_mode(
+        self,
+        operation_mode: str | None,
+    ) -> tuple[str, bool, bool]:
+        """Resolve the operation mode and its update/edit flags."""
+        if operation_mode is None:
+            operation_mode = os.getenv("G2G_OPERATION_MODE", "unknown")
+
+        is_update_operation = operation_mode == "update"
+        is_edit_operation = operation_mode == "edit"
+
+        if is_update_operation:
+            log.debug("📝 Executing UPDATE operation (PR synchronize event)")
+        elif is_edit_operation:
+            log.debug("✏️  Executing EDIT operation (PR edited event)")
+        else:
+            log.debug("🆕 Executing CREATE operation (new PR or unknown event)")
+
+        return operation_mode, is_update_operation, is_edit_operation
+
+    def _disable_commit_signing(self) -> None:
+        """Disable commit/tag GPG signing to avoid agent prompts."""
         try:
             git_config(
                 "commit.gpgsign",
@@ -2130,124 +2554,135 @@ class Orchestrator:
         except GitError:
             git_config("tag.gpgsign", "false", global_=True)
 
-        # Configure git identity BEFORE any merge operations that create commits
-        self._ensure_git_user_identity(inputs)
+    def _resolve_forced_reuse_ids(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        *,
+        is_update_operation: bool,
+        is_edit_operation: bool,
+        operation_mode: str,
+    ) -> tuple[list[str], bool, bool, str]:
+        """Resolve reuse Change-IDs for UPDATE/EDIT, or fall back to CREATE.
 
-        self._configure_git(gerrit, inputs)
-
+        Returns the forced reuse ids alongside the (possibly updated)
+        update/edit flags and operation mode.
+        """
         forced_reuse_ids: list[str] = []
-        if is_update_operation or is_edit_operation:
-            log.debug("🔍 Searching for existing Gerrit change(s) to update...")
-            try:
-                forced_reuse_ids = self._enforce_existing_change_for_update(
-                    gh, gerrit
-                )
-                log.debug(
-                    "✅ Will update existing change(s): %s",
-                    ", ".join(forced_reuse_ids[:3])
-                    + ("..." if len(forced_reuse_ids) > 3 else ""),
-                )
-            except OrchestratorError:
-                # UPDATE found no existing Gerrit change — check whether
-                # we should fall back to CREATE instead of failing.
-                should_create = self._should_create_missing(inputs, gh)
-
-                if not should_create:
-                    raise  # propagate the original error
-
-                log.warning(
-                    "🔄 Falling back from UPDATE → CREATE for PR #%s "
-                    "(create-missing authorised)",
-                    gh.pr_number,
-                )
-                is_update_operation = False
-                is_edit_operation = False
-                operation_mode = "create"
-                os.environ["G2G_OPERATION_MODE"] = "create"
-                os.environ["G2G_FALLBACK_CREATE"] = "true"
-
-                # Notify on the PR that we are creating from scratch
-                self._post_create_missing_notice(gh)
-
-        # Determine reuse Change-IDs before preparing commits so the
-        # preparation step runs only once, with the correct IDs.
-        reuse_ids: list[str] = []
-        if inputs.submit_single_commits:
-            local_commits = self._extract_local_commits_for_reconciliation(
-                inputs, gh
+        if not (is_update_operation or is_edit_operation):
+            return (
+                forced_reuse_ids,
+                is_update_operation,
+                is_edit_operation,
+                operation_mode,
             )
 
-            # Use forced reuse IDs for UPDATE operations, otherwise reconcile
-            if forced_reuse_ids:
-                reuse_ids = forced_reuse_ids
-            else:
-                reuse_ids = self._perform_robust_reconciliation(
-                    inputs, gh, gerrit, local_commits
-                )
-        else:
-            # For squash mode, use modern reconciliation with single commit
-            local_commits = self._extract_local_commits_for_reconciliation(
-                inputs, gh
+        log.debug("🔍 Searching for existing Gerrit change(s) to update...")
+        try:
+            forced_reuse_ids = self._enforce_existing_change_for_update(
+                gh, gerrit
             )
-            # Limit to first commit for squash mode
-            single_commit = local_commits[:1] if local_commits else []
+            log.debug(
+                "✅ Will update existing change(s): %s",
+                ", ".join(forced_reuse_ids[:3])
+                + ("..." if len(forced_reuse_ids) > 3 else ""),
+            )
+        except OrchestratorError:
+            # UPDATE found no existing Gerrit change — check whether
+            # we should fall back to CREATE instead of failing.
+            should_create = self._should_create_missing(inputs, gh)
 
-            # Use forced reuse IDs for UPDATE operations, otherwise reconcile
-            if forced_reuse_ids:
-                reuse_ids = forced_reuse_ids[:1]  # Only first for squash
-            else:
-                reuse_ids = self._perform_robust_reconciliation(
-                    inputs, gh, gerrit, single_commit
-                )
+            if not should_create:
+                raise  # propagate the original error
 
-        # State reconciliation: when every Gerrit change resolved for
-        # this PR is already in a final state (merged/abandoned), the
-        # PR is redundant. Act on the GitHub PR instead of pushing a
-        # patchset that Gerrit will reject with "change ... closed".
-        early_result = self._reconcile_final_state_changes(
-            gh=gh,
-            gerrit=gerrit,
-            change_ids=reuse_ids,
+            log.warning(
+                "🔄 Falling back from UPDATE → CREATE for PR #%s "
+                "(create-missing authorised)",
+                gh.pr_number,
+            )
+            is_update_operation = False
+            is_edit_operation = False
+            operation_mode = "create"
+            os.environ["G2G_OPERATION_MODE"] = "create"
+            os.environ["G2G_FALLBACK_CREATE"] = "true"
+
+            # Notify on the PR that we are creating from scratch
+            self._post_create_missing_notice(gh)
+
+        return (
+            forced_reuse_ids,
+            is_update_operation,
+            is_edit_operation,
+            operation_mode,
         )
-        if early_result is not None:
-            return early_result
 
-        # Now prepare commits once with the correct reuse_ids
+    def _determine_reuse_ids(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        forced_reuse_ids: list[str],
+    ) -> list[str]:
+        """Determine reuse Change-IDs for the configured submission mode."""
         if inputs.submit_single_commits:
-            prep = self._prepare_single_commits(
+            local_commits = self._extract_local_commits_for_reconciliation(
+                inputs, gh
+            )
+
+            # Use forced reuse IDs for UPDATE operations, otherwise reconcile
+            if forced_reuse_ids:
+                return forced_reuse_ids
+            return self._perform_robust_reconciliation(
+                inputs, gh, gerrit, local_commits
+            )
+
+        # For squash mode, use modern reconciliation with single commit
+        local_commits = self._extract_local_commits_for_reconciliation(
+            inputs, gh
+        )
+        # Limit to first commit for squash mode
+        single_commit = local_commits[:1] if local_commits else []
+
+        # Use forced reuse IDs for UPDATE operations, otherwise reconcile
+        if forced_reuse_ids:
+            return forced_reuse_ids[:1]  # Only first for squash
+        return self._perform_robust_reconciliation(
+            inputs, gh, gerrit, single_commit
+        )
+
+    def _prepare_commits(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        reuse_ids: list[str],
+    ) -> PreparedChange:
+        """Prepare single or squashed commits with the resolved reuse ids."""
+        if inputs.submit_single_commits:
+            return self._prepare_single_commits(
                 inputs,
                 gh,
                 gerrit,
                 reuse_change_ids=reuse_ids if reuse_ids else None,
             )
-        else:
-            prep = self._prepare_squashed_commit(
-                inputs,
-                gh,
-                gerrit,
-                reuse_change_ids=reuse_ids[:1] if reuse_ids else None,
-            )
-
-        self._apply_pr_title_body_if_requested(inputs, gh, operation_mode)
-
-        # Store context for downstream push/comment emission (Phase 2)
-        self._gh_context_for_push = gh
-        self._push_to_gerrit(
-            gerrit=gerrit,
-            repo=repo_names,
-            branch=self._resolve_target_branch(),
-            reviewers=self._resolve_reviewers(inputs),
-            single_commits=inputs.submit_single_commits,
-            prepared=prep,
-            gh=gh,
+        return self._prepare_squashed_commit(
+            inputs,
+            gh,
+            gerrit,
+            reuse_change_ids=reuse_ids[:1] if reuse_ids else None,
         )
 
-        result = self._query_gerrit_for_results(
-            gerrit=gerrit,
-            repo=repo_names,
-            change_ids=prep.change_ids,
-        )
-
+    def _verify_and_sync_after_push(
+        self,
+        *,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        prep: PreparedChange,
+        is_update_operation: bool,
+        is_edit_operation: bool,
+    ) -> None:
+        """Verify patchset creation and sync metadata for UPDATE/EDIT."""
         # Verify patchset creation for UPDATE operations
         if is_update_operation or is_edit_operation:
             log.debug("🔍 Verifying patchset creation...")
@@ -2266,67 +2701,56 @@ class Orchestrator:
                 change_ids=prep.change_ids,
             )
 
-        self._add_backref_comment_in_gerrit(
-            gerrit=gerrit,
-            repo=repo_names,
-            branch=self._resolve_target_branch(),
-            commit_shas=result.commit_shas,
-            gh=gh,
-        )
+    def _post_push_supersession_sweep(
+        self,
+        inputs: Inputs,
+        gerrit: GerritInfo,
+        gh: GitHubContext,
+        prep: PreparedChange,
+    ) -> None:
+        """Abandon stale open changes bumping the same dependency package.
 
-        self._comment_on_pull_request(gh, gerrit, result)
+        After a successful push, check whether other open Gerrit changes
+        in the same project bump the same dependency package.  If Strategy
+        5 already reused the old Change-Id (update-in-place), no duplicates
+        should exist.  If that path was skipped (e.g. non-dependency PR, or
+        the query failed), this sweep catches and abandons stale changes.
+        """
+        if not (not inputs.dry_run and gerrit and prep.change_ids):
+            return
+        try:
+            from .gerrit_pr_closer import abandon_superseded_dependency_changes
 
-        self._validate_committed_files(gh, result)
-
-        # Post-push supersession sweep (Option A fallback).
-        # After a successful push, check whether other open Gerrit
-        # changes in the same project bump the same dependency
-        # package.  If Strategy 5 already reused the old Change-Id
-        # (update-in-place), no duplicates should exist.  If that
-        # path was skipped (e.g. non-dependency PR, or the query
-        # failed), this sweep catches and abandons stale changes.
-        if not inputs.dry_run and gerrit and prep.change_ids:
+            # Derive the subject from the pushed commit,
+            # regardless of whether change URL lookup
+            # succeeded.
+            push_subject = ""
             try:
-                from .gerrit_pr_closer import (
-                    abandon_superseded_dependency_changes,
-                )
-
-                # Derive the subject from the pushed commit,
-                # regardless of whether change URL lookup
-                # succeeded.
+                push_subject = run_cmd(
+                    [
+                        "git",
+                        "show",
+                        "-s",
+                        "--pretty=format:%s",
+                        "HEAD",
+                    ],
+                    cwd=self.workspace,
+                ).stdout.strip()
+            except Exception:
                 push_subject = ""
-                try:
-                    push_subject = run_cmd(
-                        [
-                            "git",
-                            "show",
-                            "-s",
-                            "--pretty=format:%s",
-                            "HEAD",
-                        ],
-                        cwd=self.workspace,
-                    ).stdout.strip()
-                except Exception:
-                    push_subject = ""
 
-                if push_subject:
-                    abandon_superseded_dependency_changes(
-                        gerrit_server=gerrit.host,
-                        gerrit_project=gerrit.project,
-                        current_subject=push_subject,
-                        exclude_change_ids=prep.change_ids,
-                        dry_run=False,
-                        target_branch=self._resolve_target_branch(),
-                        github_repository=gh.repository,
-                    )
-            except Exception as exc:
-                log.debug("Post-push supersession sweep skipped: %s", exc)
-
-        self._close_pull_request_if_required(gh)
-
-        log.debug("Pipeline complete: %s", result)
-        self._cleanup_ssh()
-        return result
+            if push_subject:
+                abandon_superseded_dependency_changes(
+                    gerrit_server=gerrit.host,
+                    gerrit_project=gerrit.project,
+                    current_subject=push_subject,
+                    exclude_change_ids=prep.change_ids,
+                    dry_run=False,
+                    target_branch=self._resolve_target_branch(),
+                    github_repository=gh.repository,
+                )
+        except Exception as exc:
+            log.debug("Post-push supersession sweep skipped: %s", exc)
 
     def _guard_pull_request_context(self, gh: GitHubContext) -> None:
         if gh.pr_number is None:
@@ -2568,133 +2992,13 @@ class Orchestrator:
         log.debug("SSH private key provided, proceeding with SSH configuration")
 
         # Check for ssh-keyscan availability early if auto-discovery needed
-        if (
-            auto_discover_gerrit_host_keys is not None
-            and not inputs.gerrit_known_hosts
-        ):
-            import shutil
-
-            keyscan_path = shutil.which("ssh-keyscan")
-            if not keyscan_path:
-                log.error(
-                    "❌ ssh-keyscan not found in PATH but is required for SSH "
-                    "host key auto-discovery"
-                )
-                log.error(
-                    "Available tools in PATH: %s",
-                    ", ".join(
-                        [
-                            tool
-                            for tool in [
-                                "ssh",
-                                "ssh-keygen",
-                                "ssh-add",
-                                "ssh-agent",
-                                "ssh-keyscan",
-                            ]
-                            if shutil.which(tool)
-                        ]
-                    ),
-                )
-                log.error("To fix this issue:")
-                log.error("1. Install openssh-client package, OR")
-                log.error("2. Provide GERRIT_KNOWN_HOSTS manually")
-            else:
-                log.debug("✅ ssh-keyscan found at: %s", keyscan_path)
+        self._check_keyscan_availability(inputs)
 
         # Auto-discover or augment host keys (merge missing
         # types/[host]:port entries)
-        effective_known_hosts = inputs.gerrit_known_hosts
-        if auto_discover_gerrit_host_keys is not None:
-            try:
-                if not effective_known_hosts:
-                    log.info(
-                        "🔍 GERRIT_KNOWN_HOSTS not provided, attempting "
-                        "auto-discovery for %s:%d...",
-                        gerrit.host,
-                        gerrit.port,
-                    )
-                    log.debug(
-                        "Auto-discovery params: host=%s, port=%d, org=%s",
-                        gerrit.host,
-                        gerrit.port,
-                        inputs.organization,
-                    )
-
-                    discovered_keys = auto_discover_gerrit_host_keys(
-                        gerrit_hostname=gerrit.host,
-                        gerrit_port=gerrit.port,
-                        organization=inputs.organization,
-                    )
-                    if discovered_keys:
-                        effective_known_hosts = discovered_keys
-                        log.info(
-                            "✅ Successfully auto-discovered SSH host keys for "
-                            "%s:%d",
-                            gerrit.host,
-                            gerrit.port,
-                        )
-                    else:
-                        log.error(
-                            "❌ Auto-discovery failed for %s:%d - SSH host key "
-                            "verification will likely fail. Check network "
-                            "connectivity and ssh-keyscan availability.",
-                            gerrit.host,
-                            gerrit.port,
-                        )
-                else:
-                    # Provided known_hosts exists; ensure it contains
-                    # [host]:port entries and modern key types
-                    lower = effective_known_hosts.lower()
-                    bracket_host = f"[{gerrit.host}]:{gerrit.port}"
-                    bracket_lower = bracket_host.lower()
-                    needs_discovery = False
-                    if bracket_lower not in lower:
-                        needs_discovery = True
-                    else:
-                        # Confirm at least one known key type exists for the
-                        # bracketed host
-                        if (
-                            f"{bracket_lower} ssh-ed25519" not in lower
-                            and f"{bracket_lower} ecdsa-sha2" not in lower
-                            and f"{bracket_lower} ssh-rsa" not in lower
-                        ):
-                            needs_discovery = True
-                    if needs_discovery:
-                        log.info(
-                            "Augmenting provided GERRIT_KNOWN_HOSTS with "
-                            "discovered entries for %s:%d",
-                            gerrit.host,
-                            gerrit.port,
-                        )
-                        discovered_keys = auto_discover_gerrit_host_keys(
-                            gerrit_hostname=gerrit.host,
-                            gerrit_port=gerrit.port,
-                            organization=inputs.organization,
-                        )
-                        if discovered_keys:
-                            # Use centralized merging logic
-                            effective_known_hosts = merge_known_hosts_content(
-                                effective_known_hosts, discovered_keys
-                            )
-                            log.info(
-                                "Known hosts augmented with discovered entries "
-                                "for %s:%d",
-                                gerrit.host,
-                                gerrit.port,
-                            )
-                        else:
-                            log.warning(
-                                "Auto-discovery returned no keys; known_hosts "
-                                "not augmented"
-                            )
-            except Exception:
-                log.exception(
-                    "❌ SSH host key auto-discovery/augmentation failed "
-                    "for %s:%d",
-                    gerrit.host,
-                    gerrit.port,
-                )
+        effective_known_hosts = self._resolve_effective_known_hosts(
+            inputs, gerrit
+        )
 
         if not effective_known_hosts:
             log.warning(
@@ -2734,6 +3038,174 @@ class Orchestrator:
 
         log.debug("Using file-based SSH authentication")
         self._setup_file_based_ssh(inputs, effective_known_hosts)
+
+    def _check_keyscan_availability(self, inputs: Inputs) -> None:
+        """Warn early if ssh-keyscan is needed but unavailable."""
+        if not (
+            auto_discover_gerrit_host_keys is not None
+            and not inputs.gerrit_known_hosts
+        ):
+            return
+
+        import shutil
+
+        keyscan_path = shutil.which("ssh-keyscan")
+        if not keyscan_path:
+            log.error(
+                "❌ ssh-keyscan not found in PATH but is required for SSH "
+                "host key auto-discovery"
+            )
+            log.error(
+                "Available tools in PATH: %s",
+                ", ".join(
+                    [
+                        tool
+                        for tool in [
+                            "ssh",
+                            "ssh-keygen",
+                            "ssh-add",
+                            "ssh-agent",
+                            "ssh-keyscan",
+                        ]
+                        if shutil.which(tool)
+                    ]
+                ),
+            )
+            log.error("To fix this issue:")
+            log.error("1. Install openssh-client package, OR")
+            log.error("2. Provide GERRIT_KNOWN_HOSTS manually")
+        else:
+            log.debug("✅ ssh-keyscan found at: %s", keyscan_path)
+
+    def _resolve_effective_known_hosts(
+        self,
+        inputs: Inputs,
+        gerrit: GerritInfo,
+    ) -> str:
+        """Resolve known_hosts, auto-discovering or augmenting as needed."""
+        effective_known_hosts = inputs.gerrit_known_hosts
+        if auto_discover_gerrit_host_keys is None:
+            return effective_known_hosts
+
+        try:
+            if not effective_known_hosts:
+                effective_known_hosts = self._discover_known_hosts(
+                    inputs, gerrit
+                )
+            else:
+                # Provided known_hosts exists; ensure it contains
+                # [host]:port entries and modern key types
+                effective_known_hosts = self._augment_known_hosts(
+                    effective_known_hosts, inputs, gerrit
+                )
+        except Exception:
+            log.exception(
+                "❌ SSH host key auto-discovery/augmentation failed for %s:%d",
+                gerrit.host,
+                gerrit.port,
+            )
+
+        return effective_known_hosts
+
+    def _discover_known_hosts(
+        self,
+        inputs: Inputs,
+        gerrit: GerritInfo,
+    ) -> str:
+        """Auto-discover host keys when none were provided.
+
+        Returns the discovered keys, or an empty string on failure.
+        """
+        if auto_discover_gerrit_host_keys is None:
+            return ""
+        log.info(
+            "🔍 GERRIT_KNOWN_HOSTS not provided, attempting "
+            "auto-discovery for %s:%d...",
+            gerrit.host,
+            gerrit.port,
+        )
+        log.debug(
+            "Auto-discovery params: host=%s, port=%d, org=%s",
+            gerrit.host,
+            gerrit.port,
+            inputs.organization,
+        )
+
+        discovered_keys = auto_discover_gerrit_host_keys(
+            gerrit_hostname=gerrit.host,
+            gerrit_port=gerrit.port,
+            organization=inputs.organization,
+        )
+        if discovered_keys:
+            log.info(
+                "✅ Successfully auto-discovered SSH host keys for %s:%d",
+                gerrit.host,
+                gerrit.port,
+            )
+            return discovered_keys
+
+        log.error(
+            "❌ Auto-discovery failed for %s:%d - SSH host key "
+            "verification will likely fail. Check network "
+            "connectivity and ssh-keyscan availability.",
+            gerrit.host,
+            gerrit.port,
+        )
+        return ""
+
+    def _augment_known_hosts(
+        self,
+        effective_known_hosts: str,
+        inputs: Inputs,
+        gerrit: GerritInfo,
+    ) -> str:
+        """Ensure provided known_hosts include [host]:port and modern keys."""
+        if auto_discover_gerrit_host_keys is None:
+            return effective_known_hosts
+        lower = effective_known_hosts.lower()
+        bracket_host = f"[{gerrit.host}]:{gerrit.port}"
+        bracket_lower = bracket_host.lower()
+        needs_discovery = False
+        if bracket_lower not in lower:
+            needs_discovery = True
+        elif (
+            f"{bracket_lower} ssh-ed25519" not in lower
+            and f"{bracket_lower} ecdsa-sha2" not in lower
+            and f"{bracket_lower} ssh-rsa" not in lower
+        ):
+            # Confirm at least one known key type exists for the
+            # bracketed host
+            needs_discovery = True
+
+        if not needs_discovery:
+            return effective_known_hosts
+
+        log.info(
+            "Augmenting provided GERRIT_KNOWN_HOSTS with "
+            "discovered entries for %s:%d",
+            gerrit.host,
+            gerrit.port,
+        )
+        discovered_keys = auto_discover_gerrit_host_keys(
+            gerrit_hostname=gerrit.host,
+            gerrit_port=gerrit.port,
+            organization=inputs.organization,
+        )
+        if discovered_keys:
+            # Use centralized merging logic
+            effective_known_hosts = merge_known_hosts_content(
+                effective_known_hosts, discovered_keys
+            )
+            log.info(
+                "Known hosts augmented with discovered entries for %s:%d",
+                gerrit.host,
+                gerrit.port,
+            )
+        else:
+            log.warning(
+                "Auto-discovery returned no keys; known_hosts not augmented"
+            )
+        return effective_known_hosts
 
     def _try_ssh_agent_setup(
         self, inputs: Inputs, effective_known_hosts: str
@@ -3455,47 +3927,63 @@ class Orchestrator:
                 self._use_ssh_agent = False
 
             # Securely remove separate SSH temporary directory and all contents
-            if self._ssh_temp_dir and self._ssh_temp_dir.exists():
-                import os
-                import shutil
-
-                # First, overwrite any key files to prevent recovery
-                try:
-                    for root, _dirs, files in os.walk(self._ssh_temp_dir):
-                        for file in files:
-                            file_path = Path(root) / file
-                            if file_path.exists() and file_path.is_file():
-                                # Overwrite file with random data
-                                try:
-                                    size = file_path.stat().st_size
-                                    if size > 0:
-                                        import secrets
-
-                                        with open(file_path, "wb") as f:
-                                            f.write(secrets.token_bytes(size))
-                                            # Sync to ensure write completes
-                                            os.fsync(f.fileno())
-                                except Exception as overwrite_exc:
-                                    log.debug(
-                                        "Failed to overwrite %s: %s",
-                                        file_path,
-                                        overwrite_exc,
-                                    )
-                except Exception as walk_exc:
-                    log.debug(
-                        "Failed to walk SSH temp directory for secure "
-                        "cleanup: %s",
-                        walk_exc,
-                    )
-
-                shutil.rmtree(self._ssh_temp_dir)
-                log.debug(
-                    "Securely cleaned up temporary SSH directory: %s",
-                    self._ssh_temp_dir,
-                )
-                self._ssh_temp_dir = None
+            self._remove_ssh_temp_dir()
         except Exception as exc:
             log.warning("Failed to clean up temporary SSH files: %s", exc)
+
+    def _remove_ssh_temp_dir(self) -> None:
+        """Securely overwrite and remove the SSH temporary directory."""
+        import shutil
+
+        if not (self._ssh_temp_dir and self._ssh_temp_dir.exists()):
+            return
+
+        # First, overwrite any key files to prevent recovery
+        self._secure_overwrite_dir(self._ssh_temp_dir)
+
+        shutil.rmtree(self._ssh_temp_dir)
+        log.debug(
+            "Securely cleaned up temporary SSH directory: %s",
+            self._ssh_temp_dir,
+        )
+        self._ssh_temp_dir = None
+
+    def _secure_overwrite_dir(self, directory: Path) -> None:
+        """Overwrite all files under a directory prior to removal."""
+        import os
+
+        try:
+            for root, _dirs, files in os.walk(directory):
+                for file in files:
+                    file_path = Path(root) / file
+                    if file_path.exists() and file_path.is_file():
+                        self._secure_overwrite_file(file_path)
+        except Exception as walk_exc:
+            log.debug(
+                "Failed to walk SSH temp directory for secure cleanup: %s",
+                walk_exc,
+            )
+
+    @staticmethod
+    def _secure_overwrite_file(file_path: Path) -> None:
+        """Overwrite a file with random data to prevent recovery."""
+        import os
+
+        try:
+            size = file_path.stat().st_size
+            if size > 0:
+                import secrets
+
+                with open(file_path, "wb") as f:
+                    f.write(secrets.token_bytes(size))
+                    # Sync to ensure write completes
+                    os.fsync(f.fileno())
+        except Exception as overwrite_exc:
+            log.debug(
+                "Failed to overwrite %s: %s",
+                file_path,
+                overwrite_exc,
+            )
 
     def _configure_git(
         self,
@@ -3506,6 +3994,17 @@ class Orchestrator:
         log.debug("Configuring git and git-review for %s", gerrit.host)
 
         # Git user identity is now configured earlier before merge operations
+        self._configure_gitreview_username(inputs)
+        # Git user identity is configured by _ensure_git_user_identity
+        # Disable GPG signing to avoid interactive prompts for signing keys
+        self._disable_commit_signing()
+        self._configure_gitreview_target(gerrit)
+        self._ensure_gerrit_remote(gerrit, inputs)
+        self._configure_hooks_path()
+        self._initialize_git_review()
+
+    def _configure_gitreview_username(self, inputs: Inputs) -> None:
+        """Configure the git-review username (repo-local, global fallback)."""
         # Prefer repo-local config; fallback to global if needed
         try:
             git_config(
@@ -3518,27 +4017,9 @@ class Orchestrator:
             git_config(
                 "gitreview.username", inputs.gerrit_ssh_user_g2g, global_=True
             )
-        # Git user identity is configured by _ensure_git_user_identity
-        # Disable GPG signing to avoid interactive prompts for signing keys
-        try:
-            git_config(
-                "commit.gpgsign",
-                "false",
-                global_=False,
-                cwd=self.workspace,
-            )
-        except GitError:
-            git_config("commit.gpgsign", "false", global_=True)
-        try:
-            git_config(
-                "tag.gpgsign",
-                "false",
-                global_=False,
-                cwd=self.workspace,
-            )
-        except GitError:
-            git_config("tag.gpgsign", "false", global_=True)
 
+    def _configure_gitreview_target(self, gerrit: GerritInfo) -> None:
+        """Configure git-review host/port/project when .gitreview is absent."""
         # Ensure git-review host/port/project are configured
         # when .gitreview is absent
         try:
@@ -3565,6 +4046,12 @@ class Orchestrator:
             git_config("gitreview.port", str(gerrit.port), global_=True)
             git_config("gitreview.project", gerrit.project, global_=True)
 
+    def _ensure_gerrit_remote(
+        self,
+        gerrit: GerritInfo,
+        inputs: Inputs,
+    ) -> None:
+        """Add the 'gerrit' remote if missing (required by git-review)."""
         # Add 'gerrit' remote if missing (required by git-review)
         try:
             run_cmd(
@@ -3586,6 +4073,8 @@ class Orchestrator:
                 env=env,
             )
 
+    def _configure_hooks_path(self) -> None:
+        """Point core.hooksPath at the repo's hooks (submodule workaround)."""
         # Workaround for submodules commit-msg hook
         hooks_path = run_cmd(
             ["git", "rev-parse", "--show-toplevel"], cwd=self.workspace
@@ -3602,6 +4091,9 @@ class Orchestrator:
                 str(Path(hooks_path) / ".git" / "hooks"),
                 global_=True,
             )
+
+    def _initialize_git_review(self) -> None:
+        """Initialize git-review once per execution (copies commit-msg hook)."""
         # Initialize git-review (copies commit-msg hook) - only once per
         # execution
         if not self._git_review_initialized:
@@ -3674,27 +4166,8 @@ class Orchestrator:
             ).stdout
             cur_msg = _clean_ellipses_from_message(cur_msg)
 
-            # Determine Change-ID to use (reuse if provided)
-            desired_change_id = None
-            if reuse_change_ids and idx < len(reuse_change_ids):
-                desired_change_id = reuse_change_ids[idx]
-
-            # Build topic for metadata (must match the pushed topic)
-            topic = self._topic_for_pr(gh)
-
-            # Use centralized function to build complete message
-            # with all trailers
-            new_msg = self._build_commit_message_with_trailers(
-                base_message=cur_msg,
-                inputs=inputs,
-                gh=gh,
-                change_id=desired_change_id,
-                preserve_existing=True,
-                include_g2g_metadata=True,
-                g2g_mode="multi-commit",
-                g2g_topic=topic,
-                g2g_change_ids=reuse_change_ids if reuse_change_ids else None,
-                gerrit_project=gerrit.project,
+            new_msg = self._build_single_commit_message(
+                cur_msg, idx, inputs, gh, gerrit, reuse_change_ids
             )
 
             # Only amend if message changed
@@ -3706,13 +4179,57 @@ class Orchestrator:
                     author=author,
                     cwd=self.workspace,
                 )
-            trailers = git_last_commit_trailers(
-                keys=["Change-Id"], cwd=self.workspace
-            )
-            for cid in trailers.get("Change-Id", []):
-                if cid:
-                    change_ids.append(cid)
+            change_ids.extend(self._collect_change_id_trailers())
             run_cmd(["git", "checkout", branch], cwd=self.workspace)
+        return self._finalize_single_commit_ids(change_ids, tmp_branch, gh)
+
+    def _build_single_commit_message(
+        self,
+        cur_msg: str,
+        idx: int,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        reuse_change_ids: list[str] | None,
+    ) -> str:
+        """Build the rebuilt message for a single cherry-picked commit."""
+        # Determine Change-ID to use (reuse if provided)
+        desired_change_id = None
+        if reuse_change_ids and idx < len(reuse_change_ids):
+            desired_change_id = reuse_change_ids[idx]
+
+        # Build topic for metadata (must match the pushed topic)
+        topic = self._topic_for_pr(gh)
+
+        # Use centralized function to build complete message
+        # with all trailers
+        return self._build_commit_message_with_trailers(
+            base_message=cur_msg,
+            inputs=inputs,
+            gh=gh,
+            change_id=desired_change_id,
+            preserve_existing=True,
+            include_g2g_metadata=True,
+            g2g_mode="multi-commit",
+            g2g_topic=topic,
+            g2g_change_ids=reuse_change_ids if reuse_change_ids else None,
+            gerrit_project=gerrit.project,
+        )
+
+    def _collect_change_id_trailers(self) -> list[str]:
+        """Return non-empty Change-Id trailers from the last commit."""
+        trailers = git_last_commit_trailers(
+            keys=["Change-Id"], cwd=self.workspace
+        )
+        return [cid for cid in trailers.get("Change-Id", []) if cid]
+
+    def _finalize_single_commit_ids(
+        self,
+        change_ids: list[str],
+        tmp_branch: str,
+        gh: GitHubContext,
+    ) -> PreparedChange:
+        """Deduplicate collected Change-IDs and log the outcome."""
         # Deduplicate while preserving order
         seen = set()
         uniq_ids = []
@@ -3768,6 +4285,48 @@ class Orchestrator:
         )
 
         # Check if we have any commits to merge
+        self._analyze_merge_situation(base_sha, head_sha)
+
+        self._checkout_with_unshallow_fallback(
+            branch_name=tmp_branch,
+            start_point=base_sha,
+            create_branch=True,
+        )
+
+        # Show git status before attempting merge
+        self._log_status_before_merge()
+
+        log.debug("About to run: git merge --squash %s", head_sha)
+        self._run_squash_merge(base_sha, head_sha)
+
+        commit_msg = self._compose_squash_commit_message(
+            inputs, gh, gerrit, base_ref, head_sha, reuse_change_ids
+        )
+
+        # Preserve primary author from the PR head commit
+        author = run_cmd(
+            ["git", "show", "-s", "--pretty=format:%an <%ae>", head_sha],
+            cwd=self.workspace,
+        ).stdout.strip()
+
+        git_commit_new(
+            message=commit_msg,
+            author=author,
+            signoff=True,
+            cwd=self.workspace,
+        )
+
+        # Debug: Check commit message after creation
+        actual_msg = run_cmd(
+            ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
+            cwd=self.workspace,
+        ).stdout.strip()
+        log.debug("Commit message after creation:\n%s", actual_msg)
+
+        return self._finalize_squashed_commit(gerrit, gh, author)
+
+    def _analyze_merge_situation(self, base_sha: str, head_sha: str) -> None:
+        """Log the pending merge and deepen shallow clones if needed."""
         try:
             merge_base = run_cmd(
                 ["git", "merge-base", base_sha, head_sha], cwd=self.workspace
@@ -3801,13 +4360,8 @@ class Orchestrator:
                 )
                 self._deepen_repository(depth=100)
 
-        self._checkout_with_unshallow_fallback(
-            branch_name=tmp_branch,
-            start_point=base_sha,
-            create_branch=True,
-        )
-
-        # Show git status before attempting merge
+    def _log_status_before_merge(self) -> None:
+        """Log git status and current branch prior to the squash merge."""
         try:
             status_output = run_cmd(
                 ["git", "status", "--porcelain"], cwd=self.workspace
@@ -3829,7 +4383,8 @@ class Orchestrator:
         except Exception as status_exc:
             log.warning("Failed to get git status before merge: %s", status_exc)
 
-        log.debug("About to run: git merge --squash %s", head_sha)
+    def _run_squash_merge(self, base_sha: str, head_sha: str) -> None:
+        """Run git merge --squash, mapping failures to user-friendly errors."""
         try:
             self._merge_squash_with_unshallow_fallback(head_sha)
         except CommandError as merge_exc:
@@ -3871,168 +4426,184 @@ class Orchestrator:
 
             raise OrchestratorError(error_msg) from merge_exc
 
-        def _collect_log_lines() -> list[str]:
-            body = run_cmd(
-                [
-                    "git",
-                    "log",
-                    "--format=%B",
-                    "--reverse",
-                    f"{base_ref}..{head_sha}",
-                ],
-                cwd=self.workspace,
-            ).stdout
-            return [ln for ln in body.splitlines() if ln.strip()]
+    def _collect_squash_log_lines(
+        self,
+        base_ref: str,
+        head_sha: str,
+    ) -> list[str]:
+        """Collect non-blank commit-message lines across the PR range."""
+        body = run_cmd(
+            [
+                "git",
+                "log",
+                "--format=%B",
+                "--reverse",
+                f"{base_ref}..{head_sha}",
+            ],
+            cwd=self.workspace,
+        ).stdout
+        return [ln for ln in body.splitlines() if ln.strip()]
 
-        def _parse_message_parts(
-            lines: list[str],
-        ) -> tuple[
-            list[str],
-            list[str],
-            list[str],
-        ]:
-            change_ids: list[str] = []
-            signed_off: list[str] = []
-            message_lines: list[str] = []
-            in_metadata_section = False
-            for ln in lines:
-                if ln.strip() in ("---", "```") or ln.startswith(
-                    "updated-dependencies:"
-                ):
-                    in_metadata_section = True
-                    continue
-                if in_metadata_section:
-                    if ln.startswith(("- dependency-", "  dependency-")):
-                        continue
-                    if (
-                        not ln.startswith(("  ", "-", "dependency-"))
-                        and ln.strip()
-                    ):
-                        in_metadata_section = False
-                # Skip Change-Id lines from body - they should only be in footer
-                if ln.startswith("Change-Id:"):
-                    log.debug(
-                        "Skipping Change-Id from commit body: %s", ln.strip()
-                    )
-                    continue
-                if ln.startswith("Signed-off-by:"):
-                    signed_off.append(ln)
-                    continue
-                if not in_metadata_section:
-                    message_lines.append(ln)
-            signed_off = sorted(set(signed_off))
-            return message_lines, signed_off, change_ids
-
-        def _clean_title_line(title_line: str) -> str:
-            title_line = _clean_squash_title_line(title_line)
-
-            # Apply conventional commit normalization if enabled
-            if inputs.normalise_commit and gh.pr_number:
-                try:
-                    client = build_client()
-                    repo = get_repo_from_env(client)
-                    pr_obj = get_pull(repo, int(gh.pr_number))
-                    author = getattr(pr_obj, "user", {})
-                    author_login = (
-                        getattr(author, "login", "") if author else ""
-                    )
-                    title_line = normalize_commit_title(
-                        title_line, author_login, self.workspace
-                    )
-                except Exception as e:
-                    log.debug(
-                        "Failed to apply commit normalization in squash "
-                        "mode: %s",
-                        e,
-                    )
-
-            return title_line
-
-        def _build_clean_message_lines(message_lines: list[str]) -> list[str]:
-            if not message_lines:
-                return []
-            title_line = _clean_title_line(message_lines[0].strip())
-            out: list[str] = [title_line]
-            if len(message_lines) > 1:
-                body_start = 1
-                while (
-                    body_start < len(message_lines)
-                    and not message_lines[body_start].strip()
-                ):
-                    body_start += 1
-                if body_start < len(message_lines):
-                    out.append("")
-                    body_content = "\n".join(message_lines[body_start:])
-                    cleaned_body_content = _clean_ellipses_from_message(
-                        body_content
-                    )
-                    if cleaned_body_content.strip():
-                        out.extend(cleaned_body_content.splitlines())
-            return out
-
-        def _maybe_reuse_change_id(pr_str: str) -> str:
-            reuse = ""
-            sync_all_prs = (
-                os.getenv("SYNC_ALL_OPEN_PRS", "false").lower() == "true"
-            )
-            if (
-                not sync_all_prs
-                and gh.event_name in ("pull_request", "pull_request_target")
-                and gh.event_action in ("reopened", "synchronize")
+    def _parse_squash_message_parts(
+        self,
+        lines: list[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Split squash log lines into message, signed-off, and change ids."""
+        change_ids: list[str] = []
+        signed_off: list[str] = []
+        message_lines: list[str] = []
+        in_metadata_section = False
+        for ln in lines:
+            if ln.strip() in ("---", "```") or ln.startswith(
+                "updated-dependencies:"
             ):
-                try:
-                    client = build_client()
-                    repo = get_repo_from_env(client)
-                    pr_obj = get_pull(repo, int(pr_str))
-                    cand = get_recent_change_ids_from_comments(
-                        pr_obj, max_comments=50
-                    )
-                    if cand:
-                        reuse = cand[-1]
-                        log.debug(
-                            "Reusing Change-ID %s for PR #%s (single-PR mode)",
-                            reuse,
-                            pr_str,
-                        )
-                except Exception:
-                    reuse = ""
-            elif sync_all_prs:
-                log.debug(
-                    "Skipping Change-ID reuse for PR #%s (multi-PR mode)",
-                    pr_str,
+                in_metadata_section = True
+                continue
+            if in_metadata_section:
+                if ln.startswith(("- dependency-", "  dependency-")):
+                    continue
+                if not ln.startswith(("  ", "-", "dependency-")) and ln.strip():
+                    in_metadata_section = False
+            # Skip Change-Id lines from body - they should only be in footer
+            if ln.startswith("Change-Id:"):
+                log.debug("Skipping Change-Id from commit body: %s", ln.strip())
+                continue
+            if ln.startswith("Signed-off-by:"):
+                signed_off.append(ln)
+                continue
+            if not in_metadata_section:
+                message_lines.append(ln)
+        signed_off = sorted(set(signed_off))
+        return message_lines, signed_off, change_ids
+
+    def _clean_squash_title(
+        self,
+        title_line: str,
+        inputs: Inputs,
+        gh: GitHubContext,
+    ) -> str:
+        """Clean and optionally normalize the squashed commit title."""
+        title_line = _clean_squash_title_line(title_line)
+
+        # Apply conventional commit normalization if enabled
+        if inputs.normalise_commit and gh.pr_number:
+            try:
+                client = build_client()
+                repo = get_repo_from_env(client)
+                pr_obj = get_pull(repo, int(gh.pr_number))
+                author = getattr(pr_obj, "user", {})
+                author_login = getattr(author, "login", "") if author else ""
+                title_line = normalize_commit_title(
+                    title_line, author_login, self.workspace
                 )
-            return reuse
+            except Exception as e:
+                log.debug(
+                    "Failed to apply commit normalization in squash mode: %s",
+                    e,
+                )
 
-        def _compose_base_message(
-            lines_in: list[str],
-            signed_off: list[str],
-        ) -> str:
-            """
-            Compose base message with Signed-off-by for centralized
-            builder.
-            """
-            msg = "\n".join(lines_in).strip()
-            # Add Signed-off-by to message body so centralized function
-            # can parse it
-            if signed_off:
-                msg += "\n\n" + "\n".join(signed_off)
-            return msg
+        return title_line
 
-        raw_lines = _collect_log_lines()
-        message_lines, signed_off, _existing_cids = _parse_message_parts(
-            raw_lines
+    def _build_clean_message_lines(
+        self,
+        message_lines: list[str],
+        inputs: Inputs,
+        gh: GitHubContext,
+    ) -> list[str]:
+        """Build the cleaned title/body lines for the squashed message."""
+        if not message_lines:
+            return []
+        title_line = self._clean_squash_title(
+            message_lines[0].strip(), inputs, gh
         )
-        clean_lines = _build_clean_message_lines(message_lines)
+        out: list[str] = [title_line]
+        if len(message_lines) > 1:
+            body_start = 1
+            while (
+                body_start < len(message_lines)
+                and not message_lines[body_start].strip()
+            ):
+                body_start += 1
+            if body_start < len(message_lines):
+                out.append("")
+                body_content = "\n".join(message_lines[body_start:])
+                cleaned_body_content = _clean_ellipses_from_message(
+                    body_content
+                )
+                if cleaned_body_content.strip():
+                    out.extend(cleaned_body_content.splitlines())
+        return out
+
+    def _maybe_reuse_change_id(self, pr_str: str, gh: GitHubContext) -> str:
+        """Reuse a Change-ID from prior PR comments when appropriate."""
+        reuse = ""
+        sync_all_prs = os.getenv("SYNC_ALL_OPEN_PRS", "false").lower() == "true"
+        if (
+            not sync_all_prs
+            and gh.event_name in ("pull_request", "pull_request_target")
+            and gh.event_action in ("reopened", "synchronize")
+        ):
+            try:
+                client = build_client()
+                repo = get_repo_from_env(client)
+                pr_obj = get_pull(repo, int(pr_str))
+                cand = get_recent_change_ids_from_comments(
+                    pr_obj, max_comments=50
+                )
+                if cand:
+                    reuse = cand[-1]
+                    log.debug(
+                        "Reusing Change-ID %s for PR #%s (single-PR mode)",
+                        reuse,
+                        pr_str,
+                    )
+            except Exception:
+                reuse = ""
+        elif sync_all_prs:
+            log.debug(
+                "Skipping Change-ID reuse for PR #%s (multi-PR mode)",
+                pr_str,
+            )
+        return reuse
+
+    @staticmethod
+    def _compose_base_message(
+        lines_in: list[str],
+        signed_off: list[str],
+    ) -> str:
+        """Compose base message with Signed-off-by for centralized builder."""
+        msg = "\n".join(lines_in).strip()
+        # Add Signed-off-by to message body so centralized function
+        # can parse it
+        if signed_off:
+            msg += "\n\n" + "\n".join(signed_off)
+        return msg
+
+    def _compose_squash_commit_message(
+        self,
+        inputs: Inputs,
+        gh: GitHubContext,
+        gerrit: GerritInfo,
+        base_ref: str,
+        head_sha: str,
+        reuse_change_ids: list[str] | None,
+    ) -> str:
+        """Build the full squashed commit message with all trailers."""
+        raw_lines = self._collect_squash_log_lines(base_ref, head_sha)
+        message_lines, signed_off, _existing_cids = (
+            self._parse_squash_message_parts(raw_lines)
+        )
+        clean_lines = self._build_clean_message_lines(message_lines, inputs, gh)
         pr_str = str(gh.pr_number or "").strip()
-        reuse_cid = _maybe_reuse_change_id(pr_str)
+        reuse_cid = self._maybe_reuse_change_id(pr_str, gh)
         if reuse_change_ids:
             cand = reuse_change_ids[0]
             if cand:
                 reuse_cid = cand
-        base_msg = _compose_base_message(clean_lines, signed_off)
+        base_msg = self._compose_base_message(clean_lines, signed_off)
 
-        # Use centralized function to build complete message with all trailers
-        commit_msg = self._build_commit_message_with_trailers(
+        # Use centralized function to build complete message with trailers
+        return self._build_commit_message_with_trailers(
             base_message=base_msg,
             inputs=inputs,
             gh=gh,
@@ -4041,26 +4612,13 @@ class Orchestrator:
             gerrit_project=gerrit.project,
         )
 
-        # Preserve primary author from the PR head commit
-        author = run_cmd(
-            ["git", "show", "-s", "--pretty=format:%an <%ae>", head_sha],
-            cwd=self.workspace,
-        ).stdout.strip()
-
-        git_commit_new(
-            message=commit_msg,
-            author=author,
-            signoff=True,
-            cwd=self.workspace,
-        )
-
-        # Debug: Check commit message after creation
-        actual_msg = run_cmd(
-            ["git", "show", "-s", "--pretty=format:%B", "HEAD"],
-            cwd=self.workspace,
-        ).stdout.strip()
-        log.debug("Commit message after creation:\n%s", actual_msg)
-
+    def _finalize_squashed_commit(
+        self,
+        gerrit: GerritInfo,
+        gh: GitHubContext,
+        author: str,
+    ) -> PreparedChange:
+        """Ensure a Change-Id is present and return the prepared change."""
         # Ensure Change-Id via commit-msg hook (amend if needed)
         cids = self._ensure_change_id_present(gerrit, author)
         if cids:
@@ -4126,7 +4684,22 @@ class Orchestrator:
         pr = str(gh.pr_number or "").strip()
         if not pr:
             return
-        # Fetch PR title/body via GitHub API (PyGithub)
+
+        title, body = self._fetch_cleaned_pr_title_body(pr, inputs)
+
+        current_body = git_show("HEAD", fmt="%B", cwd=self.workspace)
+        existing_trailers = self._extract_trailer_block(current_body)
+        commit_message = self._compose_commit_message_with_trailers(
+            title, body, existing_trailers
+        )
+        self._amend_commit_preserving_trailers(
+            commit_message, existing_trailers
+        )
+
+    def _fetch_cleaned_pr_title_body(
+        self, pr: str, inputs: Inputs
+    ) -> tuple[str, str]:
+        """Fetch PR title/body via the GitHub API and clean for commit use."""
         client = build_client()
         repo = get_repo_from_env(client)
         pr_obj = get_pull(repo, int(pr))
@@ -4139,28 +4712,34 @@ class Orchestrator:
         author_login = getattr(author, "login", "") if author else ""
         body = filter_pr_body(title, body, author_login)
 
-        # Clean up title to ensure it's a proper first line for commit message
         if title:
-            # Remove markdown links like [text](url) and keep just the text
-            title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title)
-            title = re.sub(r"\s*[.]{3,}.*$", "", title)
-            # Ensure title doesn't accidentally contain body content
-            # Split on common separators and take only the first meaningful part
-            for separator in [". Bumps ", " Bumps ", ". - ", " - "]:
-                if separator in title:
-                    title = title.split(separator)[0].strip()
-                    break
-            title = re.sub(r"[*_`]", "", title)
-            title = title.strip()
+            title = self._clean_pr_title(title, author_login, inputs)
+        return title, body
 
-            # Apply conventional commit normalization if enabled
-            if inputs.normalise_commit:
-                title = normalize_commit_title(
-                    title, author_login, self.workspace
-                )
+    def _clean_pr_title(
+        self, title: str, author_login: str, inputs: Inputs
+    ) -> str:
+        """Clean a PR title into a proper commit subject line."""
+        # Remove markdown links like [text](url) and keep just the text
+        title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title)
+        title = re.sub(r"\s*[.]{3,}.*$", "", title)
+        # Ensure title doesn't accidentally contain body content
+        # Split on common separators and take only the first meaningful part
+        for separator in [". Bumps ", " Bumps ", ". - ", " - "]:
+            if separator in title:
+                title = title.split(separator)[0].strip()
+                break
+        title = re.sub(r"[*_`]", "", title)
+        title = title.strip()
 
-        current_body = git_show("HEAD", fmt="%B", cwd=self.workspace)
+        # Apply conventional commit normalization if enabled
+        if inputs.normalise_commit:
+            title = normalize_commit_title(title, author_login, self.workspace)
+        return title
 
+    @staticmethod
+    def _extract_trailer_block(current_body: str) -> list[str]:
+        """Return the trailing trailer lines from a commit message body."""
         # Split into message body and trailer block
         # Trailers are the lines at the end that match "Key: Value" format
         lines = current_body.split("\n")
@@ -4187,18 +4766,22 @@ class Orchestrator:
                 # Found non-trailer after trailers, stop
                 break
 
-        existing_trailers = []
         if found_trailer_block:
-            existing_trailers = lines[trailer_start_idx:]
+            return lines[trailer_start_idx:]
+        return []
 
-        new_message_parts = []
+    @staticmethod
+    def _compose_commit_message_with_trailers(
+        title: str, body: str, existing_trailers: list[str]
+    ) -> str:
+        """Build a commit message from title/body, preserving trailers."""
+        new_message_parts: list[str] = []
         if title:
             new_message_parts.append(title)
         if body:
             if title:
-                new_message_parts.append(
-                    ""
-                )  # Blank line between title and body
+                # Blank line between title and body
+                new_message_parts.append("")
             new_message_parts.append(body)
 
         # Add preserved trailers
@@ -4207,8 +4790,12 @@ class Orchestrator:
             new_message_parts.append("")
             new_message_parts.extend(existing_trailers)
 
-        commit_message = "\n".join(new_message_parts).strip()
+        return "\n".join(new_message_parts).strip()
 
+    def _amend_commit_preserving_trailers(
+        self, commit_message: str, existing_trailers: list[str]
+    ) -> None:
+        """Amend HEAD with a new message and record its Change-Ids."""
         author = run_cmd(
             ["git", "show", "-s", "--pretty=format:%an <%ae>", "HEAD"],
             cwd=self.workspace,
@@ -4292,18 +4879,8 @@ class Orchestrator:
         if single_commits:
             tmp_branch = os.getenv("G2G_TMP_BRANCH", "tmp_branch")
             run_cmd(["git", "checkout", tmp_branch], cwd=self.workspace)
-        from .gerrit_query import build_gerrit_topic
 
-        # Prefer the per-PR GitHub context (correct in bulk mode, where
-        # multiple PRs process in parallel threads and the process-wide
-        # PR_NUMBER env var cannot identify individual PRs); fall back
-        # to the environment for single-PR and direct invocations.
-        pr_num: int | str | None
-        if gh is not None and gh.pr_number:
-            pr_num = gh.pr_number
-        else:
-            pr_num = os.getenv("PR_NUMBER", "").strip() or None
-        topic = build_gerrit_topic(repo.project_github, pr_num)
+        topic = self._resolve_push_topic(repo, gh)
 
         # Use our specific SSH configuration
         env = self._ssh_env()
@@ -4317,23 +4894,10 @@ class Orchestrator:
             topic,
         ]
         log.debug("Building git review command with topic: %s", topic)
-        collected_change_ids: list[str] = []
+        collected_change_ids = self._collect_push_change_ids(prepared)
 
         try:
-            if prepared:
-                collected_change_ids.extend(prepared.all_change_ids())
-            # Add any Change-Ids captured from apply_pr path (squash amend)
-            extra_ids = getattr(self, "_latest_apply_pr_change_ids", [])
-            for cid in extra_ids:
-                if cid and cid not in collected_change_ids:
-                    collected_change_ids.append(cid)
-            revs = [
-                r.strip()
-                for r in (reviewers or "").split(",")
-                if r.strip() and "@" in r and r.strip() != branch
-            ]
-            for r in revs:
-                args.extend(["--reviewer", r])
+            args.extend(self._reviewer_args(reviewers, branch))
             # Don't pass branch as positional argument to git-review
             # Instead, infer the target branch from the git configuration
 
@@ -4368,164 +4932,227 @@ class Orchestrator:
                 )
                 return
 
-            # Check for account not found error and try with case-normalized
+            # Check for account not found error and retry with case-normalized
             # emails
             account_not_found_emails = self._extract_account_not_found_emails(
                 exc
             )
-            if account_not_found_emails:
-                normalized_reviewers = self._normalize_reviewer_emails(
-                    reviewers, account_not_found_emails
+            if account_not_found_emails and (
+                self._retry_push_with_normalized_emails(
+                    args, reviewers, branch, env, account_not_found_emails
                 )
-                if normalized_reviewers != reviewers:
-                    log.debug(
-                        "Retrying with case-normalized email addresses..."
-                    )
-                    try:
-                        # Rebuild args with normalized reviewers
-                        retry_args = args[:-1]  # Remove branch (last arg)
-                        # Clear previous reviewer args and add normalized ones
-                        retry_args = [
-                            arg for arg in retry_args if arg != "--reviewer"
-                        ]
-                        retry_args = [
-                            retry_args[i]
-                            for i in range(len(retry_args))
-                            if i == 0 or retry_args[i - 1] != "--reviewer"
-                        ]
-
-                        norm_revs = [
-                            r.strip()
-                            for r in (normalized_reviewers or "").split(",")
-                            if r.strip() and "@" in r and r.strip() != branch
-                        ]
-                        for r in norm_revs:
-                            retry_args.extend(["--reviewer", r])
-                        retry_args.append(branch)
-
-                        log.debug(
-                            "Retrying git review command with normalized "
-                            "emails: %s",
-                            " ".join(retry_args),
-                        )
-                        run_cmd(retry_args, cwd=self.workspace, env=env)
-                        log.debug(
-                            "Successfully pushed changes to Gerrit with "
-                            "normalized email addresses"
-                        )
-
-                        # Update configuration file with normalized email
-                        # addresses
-                        self._update_config_with_normalized_emails(
-                            account_not_found_emails
-                        )
-                    except CommandError as retry_exc:
-                        log.warning(
-                            "Retry with normalized emails also failed: %s",
-                            self._analyze_gerrit_push_failure(retry_exc),
-                        )
-                        # Continue with original error handling
-                    else:
-                        # On success, emit mapping comment before return
-                        try:
-                            gh_context = getattr(
-                                self, "_gh_context_for_push", None
-                            )
-                            replace_existing = getattr(
-                                self, "_inputs", None
-                            ) and getattr(
-                                self._inputs,
-                                "persist_single_mapping_comment",
-                                True,
-                            )
-                            self._emit_change_id_map_comment(
-                                gh_context=gh_context,
-                                change_ids=collected_change_ids,
-                                multi=single_commits,
-                                topic=topic,
-                                replace_existing=bool(replace_existing),
-                            )
-                        except Exception as cexc:
-                            log.debug(
-                                "Failed to emit Change-Id map comment "
-                                "(retry path): %s",
-                                cexc,
-                            )
-                        return
-
-            # Analyze the specific failure reason from git review output
-            error_details = self._analyze_gerrit_push_failure(exc)
-
-            # Log the analyzed error; reserve the full traceback for
-            # verbose/debug mode to keep console output actionable
-            if is_verbose_mode():
-                log.exception("Gerrit push failed: %s", error_details)
-            else:
-                # Deliberately omit the traceback outside verbose mode
-                log.error("Gerrit push failed: %s", error_details)  # noqa: TRY400
-
-            # In debug mode, also show the raw command output
-            if is_verbose_mode():
-                log.debug("Git review command: %s", " ".join(exc.cmd or []))
-                log.debug("Return code: %s", exc.returncode)
-                if exc.stdout:
-                    log.debug("Command stdout:\n%s", exc.stdout)
-                if exc.stderr:
-                    log.debug("Command stderr:\n%s", exc.stderr)
-
-            # Include raw output in error message if analysis didn't provide
-            # useful info
-            has_raw_output = exc.stdout or exc.stderr
-            if error_details.startswith("Unknown error") and has_raw_output:
-                raw_output = ""
-                if exc.stdout:
-                    raw_output += f"stdout: {exc.stdout.strip()}\n"
-                if exc.stderr:
-                    raw_output += f"stderr: {exc.stderr.strip()}"
-                if raw_output:
-                    error_details = (
-                        f"{error_details}\nRaw output:\n{raw_output}"
-                    )
-
-            msg = (
-                f"Failed to push changes to Gerrit with git-review: "
-                f"{error_details}"
-            )
-            raise OrchestratorError(msg) from exc
-        else:
-            # Successful push: emit mapping comment (Phase 2)
-            try:
-                gh_context = getattr(self, "_gh_context_for_push", None)
-                replace_existing = getattr(self, "_inputs", None) and getattr(
-                    self._inputs, "persist_single_mapping_comment", True
-                )
-                self._emit_change_id_map_comment(
-                    gh_context=gh_context,
+            ):
+                # On success, emit mapping comment before return
+                self._emit_push_map_comment(
                     change_ids=collected_change_ids,
                     multi=single_commits,
                     topic=topic,
-                    replace_existing=bool(replace_existing),
+                    path_label="retry path",
                 )
-            except Exception as exc_emit:
-                log.debug(
-                    "Failed to emit Change-Id map comment (success path): %s",
-                    exc_emit,
-                )
+                return
+
+            self._raise_gerrit_push_error(exc)
+        else:
+            # Successful push: emit mapping comment (Phase 2)
+            self._emit_push_map_comment(
+                change_ids=collected_change_ids,
+                multi=single_commits,
+                topic=topic,
+                path_label="success path",
+            )
+        self._cleanup_tmp_branch(branch, env)
+
+    def _resolve_push_topic(
+        self, repo: RepoNames, gh: GitHubContext | None
+    ) -> str:
+        """Resolve the git-review topic for the current PR context."""
+        from .gerrit_query import build_gerrit_topic
+
+        # Prefer the per-PR GitHub context (correct in bulk mode, where
+        # multiple PRs process in parallel threads and the process-wide
+        # PR_NUMBER env var cannot identify individual PRs); fall back
+        # to the environment for single-PR and direct invocations.
+        pr_num: int | str | None
+        if gh is not None and gh.pr_number:
+            pr_num = gh.pr_number
+        else:
+            pr_num = os.getenv("PR_NUMBER", "").strip() or None
+        return build_gerrit_topic(repo.project_github, pr_num)
+
+    def _collect_push_change_ids(
+        self, prepared: PreparedChange | None
+    ) -> list[str]:
+        """Gather Change-Ids from the prepared change and apply_pr path."""
+        collected_change_ids: list[str] = []
+        if prepared:
+            collected_change_ids.extend(prepared.all_change_ids())
+        # Add any Change-Ids captured from apply_pr path (squash amend)
+        extra_ids = getattr(self, "_latest_apply_pr_change_ids", [])
+        for cid in extra_ids:
+            if cid and cid not in collected_change_ids:
+                collected_change_ids.append(cid)
+        return collected_change_ids
+
+    @staticmethod
+    def _reviewer_args(reviewers: str, branch: str) -> list[str]:
+        """Build --reviewer arguments from a comma-separated reviewer list."""
+        revs = [
+            r.strip()
+            for r in (reviewers or "").split(",")
+            if r.strip() and "@" in r and r.strip() != branch
+        ]
+        args: list[str] = []
+        for r in revs:
+            args.extend(["--reviewer", r])
+        return args
+
+    def _retry_push_with_normalized_emails(
+        self,
+        args: list[str],
+        reviewers: str,
+        branch: str,
+        env: dict[str, str],
+        account_not_found_emails: list[str],
+    ) -> bool:
+        """Retry the push using case-normalized reviewer emails.
+
+        Returns True only when a retry was attempted and succeeded.
+        """
+        normalized_reviewers = self._normalize_reviewer_emails(
+            reviewers, account_not_found_emails
+        )
+        if normalized_reviewers == reviewers:
+            return False
+
+        log.debug("Retrying with case-normalized email addresses...")
+        try:
+            # Rebuild args with normalized reviewers
+            retry_args = args[:-1]  # Remove branch (last arg)
+            # Clear previous reviewer args and add normalized ones
+            retry_args = [arg for arg in retry_args if arg != "--reviewer"]
+            retry_args = [
+                retry_args[i]
+                for i in range(len(retry_args))
+                if i == 0 or retry_args[i - 1] != "--reviewer"
+            ]
+
+            norm_revs = [
+                r.strip()
+                for r in (normalized_reviewers or "").split(",")
+                if r.strip() and "@" in r and r.strip() != branch
+            ]
+            for r in norm_revs:
+                retry_args.extend(["--reviewer", r])
+            retry_args.append(branch)
+
+            log.debug(
+                "Retrying git review command with normalized emails: %s",
+                " ".join(retry_args),
+            )
+            run_cmd(retry_args, cwd=self.workspace, env=env)
+            log.debug(
+                "Successfully pushed changes to Gerrit with "
+                "normalized email addresses"
+            )
+
+            # Update configuration file with normalized email
+            # addresses
+            self._update_config_with_normalized_emails(account_not_found_emails)
+        except CommandError as retry_exc:
+            log.warning(
+                "Retry with normalized emails also failed: %s",
+                self._analyze_gerrit_push_failure(retry_exc),
+            )
+            # Continue with original error handling
+            return False
+        else:
+            return True
+
+    def _emit_push_map_comment(
+        self,
+        *,
+        change_ids: list[str],
+        multi: bool,
+        topic: str,
+        path_label: str,
+    ) -> None:
+        """Emit the Change-Id mapping comment, tolerating failures."""
+        try:
+            gh_context = getattr(self, "_gh_context_for_push", None)
+            replace_existing = getattr(self, "_inputs", None) and getattr(
+                self._inputs, "persist_single_mapping_comment", True
+            )
+            self._emit_change_id_map_comment(
+                gh_context=gh_context,
+                change_ids=change_ids,
+                multi=multi,
+                topic=topic,
+                replace_existing=bool(replace_existing),
+            )
+        except Exception as exc_emit:
+            log.debug(
+                "Failed to emit Change-Id map comment (%s): %s",
+                path_label,
+                exc_emit,
+            )
+
+    def _raise_gerrit_push_error(self, exc: CommandError) -> NoReturn:
+        """Log an analyzed git-review failure and raise OrchestratorError."""
+        # Analyze the specific failure reason from git review output
+        error_details = self._analyze_gerrit_push_failure(exc)
+
+        # Log the analyzed error; reserve the full traceback for
+        # verbose/debug mode to keep console output actionable
+        if is_verbose_mode():
+            log.exception("Gerrit push failed: %s", error_details)
+        else:
+            # Deliberately omit the traceback outside verbose mode
+            log.error("Gerrit push failed: %s", error_details)
+
+        # In debug mode, also show the raw command output
+        if is_verbose_mode():
+            log.debug("Git review command: %s", " ".join(exc.cmd or []))
+            log.debug("Return code: %s", exc.returncode)
+            if exc.stdout:
+                log.debug("Command stdout:\n%s", exc.stdout)
+            if exc.stderr:
+                log.debug("Command stderr:\n%s", exc.stderr)
+
+        # Include raw output in error message if analysis didn't provide
+        # useful info
+        has_raw_output = exc.stdout or exc.stderr
+        if error_details.startswith("Unknown error") and has_raw_output:
+            raw_output = ""
+            if exc.stdout:
+                raw_output += f"stdout: {exc.stdout.strip()}\n"
+            if exc.stderr:
+                raw_output += f"stderr: {exc.stderr.strip()}"
+            if raw_output:
+                error_details = f"{error_details}\nRaw output:\n{raw_output}"
+
+        msg = (
+            f"Failed to push changes to Gerrit with git-review: {error_details}"
+        )
+        raise OrchestratorError(msg) from exc
+
+    def _cleanup_tmp_branch(self, branch: str, env: dict[str, str]) -> None:
+        """Switch back to the target branch and delete the temp branch."""
         tmp_branch = (os.getenv("G2G_TMP_BRANCH", "") or "").strip()
-        if tmp_branch:
-            # Switch back to the target branch, then delete the temp branch
-            run_cmd(
-                ["git", "checkout", f"origin/{branch}"],
-                check=False,
-                cwd=self.workspace,
-                env=env,
-            )
-            run_cmd(
-                ["git", "branch", "-D", tmp_branch],
-                check=False,
-                cwd=self.workspace,
-                env=env,
-            )
+        if not tmp_branch:
+            return
+        # Switch back to the target branch, then delete the temp branch
+        run_cmd(
+            ["git", "checkout", f"origin/{branch}"],
+            check=False,
+            cwd=self.workspace,
+            env=env,
+        )
+        run_cmd(
+            ["git", "branch", "-D", tmp_branch],
+            check=False,
+            cwd=self.workspace,
+            env=env,
+        )
 
     def _extract_account_not_found_emails(self, exc: CommandError) -> list[str]:
         """Extract email addresses from 'Account not found' errors.
@@ -4780,137 +5407,168 @@ class Orchestrator:
 
         try:
             # Capture the current PR commit message and tree
-            commit_msg = run_cmd(
-                ["git", "log", "--format=%B", "-n", "1", "HEAD"],
-                cwd=self.workspace,
-            ).stdout.strip()
-            pr_tree = run_cmd(
-                ["git", "show", "--quiet", "--format=%T", "HEAD"],
-                cwd=self.workspace,
-            ).stdout.strip()
+            commit_msg, pr_tree = self._capture_head_message_and_tree()
 
             # Create/update a synthetic branch based on the remote base branch
             synth_branch = f"synth-{topic}"
-            # Ensure remote ref exists locally (best-effort)
-            run_cmd(
-                ["git", "fetch", "gerrit", branch],
-                cwd=self.workspace,
-                env=env,
-                check=False,
-            )
-            run_cmd(
-                [
-                    "git",
-                    "checkout",
-                    "-B",
-                    synth_branch,
-                    f"remotes/gerrit/{branch}",
-                ],
-                cwd=self.workspace,
-                env=env,
-            )
+            self._checkout_synth_branch(synth_branch, branch, env)
 
             # Replace working tree contents with the PR tree
-            # 1) Remove current tracked files (ignore errors if none)
-            run_cmd(
-                ["git", "rm", "-r", "--quiet", "."],
-                cwd=self.workspace,
-                env=env,
-                check=False,
-            )
-            # 2) Clean untracked files/dirs (SSH files are now outside
-            # workspace)
-            run_cmd(
-                ["git", "clean", "-fdx"],
-                cwd=self.workspace,
-                env=env,
-                check=False,
-            )
-            # 3) Checkout the PR tree into working directory
-            run_cmd(
-                ["git", "checkout", pr_tree, "--", "."],
-                cwd=self.workspace,
-                env=env,
-            )
-            run_cmd(["git", "add", "-A"], cwd=self.workspace, env=env)
+            self._replace_worktree_with_tree(pr_tree, env)
 
             # Commit synthetic change with the same message (should already
             # include Change-Id)
-            import tempfile as _tempfile
-            from pathlib import Path as _Path
-
-            with _tempfile.NamedTemporaryFile(
-                "w", delete=False, encoding="utf-8"
-            ) as _tf:
-                # Ensure Signed-off-by for current committer (uploader) is
-                # present in the footer
-                try:
-                    committer_name = run_cmd(
-                        ["git", "config", "--get", "user.name"],
-                        cwd=self.workspace,
-                    ).stdout.strip()
-                except Exception:
-                    committer_name = ""
-                try:
-                    committer_email = run_cmd(
-                        ["git", "config", "--get", "user.email"],
-                        cwd=self.workspace,
-                    ).stdout.strip()
-                except Exception:
-                    committer_email = ""
-                msg_to_write = commit_msg
-                if committer_name and committer_email:
-                    sob_line = (
-                        f"Signed-off-by: {committer_name} <{committer_email}>"
-                    )
-                    if sob_line not in msg_to_write:
-                        if not msg_to_write.endswith("\n"):
-                            msg_to_write += "\n"
-                        if not msg_to_write.endswith("\n\n"):
-                            msg_to_write += "\n"
-                        msg_to_write += sob_line
-                _tf.write(msg_to_write)
-                _tf.flush()
-                _tmp_msg_path = _Path(_tf.name)
-            try:
-                run_cmd(
-                    ["git", "commit", "-F", str(_tmp_msg_path)],
-                    cwd=self.workspace,
-                    env=env,
-                )
-            finally:
-                from contextlib import suppress
-
-                with suppress(Exception):
-                    _tmp_msg_path.unlink(missing_ok=True)
+            self._commit_synthetic_change(commit_msg, env)
 
             # Push directly to refs/for/<branch> with topic and reviewers to
             # avoid rebase behavior
-            push_ref = f"refs/for/{branch}%topic={topic}"
-            revs = [
-                r.strip()
-                for r in (reviewers or "").split(",")
-                if r.strip() and "@" in r and r.strip() != branch
-            ]
-            for r in revs:
-                push_ref += f",r={r}"
-            run_cmd(
-                [
-                    "git",
-                    "push",
-                    "--no-follow-tags",
-                    "gerrit",
-                    f"HEAD:{push_ref}",
-                ],
-                cwd=self.workspace,
-                env=env,
-            )
+            self._push_synthetic_ref(branch, topic, reviewers, env)
             log.debug("Successfully pushed synthetic commit to Gerrit")
 
         except CommandError as orphan_exc:
             error_details = self._analyze_gerrit_push_failure(orphan_exc)
             msg = f"Failed to push orphan commit to Gerrit: {error_details}"
             raise OrchestratorError(msg) from orphan_exc
+
+    def _capture_head_message_and_tree(self) -> tuple[str, str]:
+        """Capture the current PR commit message and tree object."""
+        commit_msg = run_cmd(
+            ["git", "log", "--format=%B", "-n", "1", "HEAD"],
+            cwd=self.workspace,
+        ).stdout.strip()
+        pr_tree = run_cmd(
+            ["git", "show", "--quiet", "--format=%T", "HEAD"],
+            cwd=self.workspace,
+        ).stdout.strip()
+        return commit_msg, pr_tree
+
+    def _checkout_synth_branch(
+        self, synth_branch: str, branch: str, env: dict[str, str]
+    ) -> None:
+        """Create/update a synthetic branch from the remote base branch."""
+        # Ensure remote ref exists locally (best-effort)
+        run_cmd(
+            ["git", "fetch", "gerrit", branch],
+            cwd=self.workspace,
+            env=env,
+            check=False,
+        )
+        run_cmd(
+            [
+                "git",
+                "checkout",
+                "-B",
+                synth_branch,
+                f"remotes/gerrit/{branch}",
+            ],
+            cwd=self.workspace,
+            env=env,
+        )
+
+    def _replace_worktree_with_tree(
+        self, pr_tree: str, env: dict[str, str]
+    ) -> None:
+        """Replace working tree contents with the given PR tree."""
+        # 1) Remove current tracked files (ignore errors if none)
+        run_cmd(
+            ["git", "rm", "-r", "--quiet", "."],
+            cwd=self.workspace,
+            env=env,
+            check=False,
+        )
+        # 2) Clean untracked files/dirs (SSH files are now outside
+        # workspace)
+        run_cmd(
+            ["git", "clean", "-fdx"],
+            cwd=self.workspace,
+            env=env,
+            check=False,
+        )
+        # 3) Checkout the PR tree into working directory
+        run_cmd(
+            ["git", "checkout", pr_tree, "--", "."],
+            cwd=self.workspace,
+            env=env,
+        )
+        run_cmd(["git", "add", "-A"], cwd=self.workspace, env=env)
+
+    def _commit_synthetic_change(
+        self, commit_msg: str, env: dict[str, str]
+    ) -> None:
+        """Commit the synthetic change from a temporary message file."""
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
+        # Ensure Signed-off-by for current committer (uploader) is present
+        msg_to_write = self._ensure_committer_signoff(commit_msg)
+        with _tempfile.NamedTemporaryFile(
+            "w", delete=False, encoding="utf-8"
+        ) as _tf:
+            _tf.write(msg_to_write)
+            _tf.flush()
+            _tmp_msg_path = _Path(_tf.name)
+        try:
+            run_cmd(
+                ["git", "commit", "-F", str(_tmp_msg_path)],
+                cwd=self.workspace,
+                env=env,
+            )
+        finally:
+            from contextlib import suppress
+
+            with suppress(Exception):
+                _tmp_msg_path.unlink(missing_ok=True)
+
+    def _ensure_committer_signoff(self, commit_msg: str) -> str:
+        """Append a Signed-off-by trailer for the committer if missing."""
+        try:
+            committer_name = run_cmd(
+                ["git", "config", "--get", "user.name"],
+                cwd=self.workspace,
+            ).stdout.strip()
+        except Exception:
+            committer_name = ""
+        try:
+            committer_email = run_cmd(
+                ["git", "config", "--get", "user.email"],
+                cwd=self.workspace,
+            ).stdout.strip()
+        except Exception:
+            committer_email = ""
+        msg_to_write = commit_msg
+        if committer_name and committer_email:
+            sob_line = f"Signed-off-by: {committer_name} <{committer_email}>"
+            if sob_line not in msg_to_write:
+                if not msg_to_write.endswith("\n"):
+                    msg_to_write += "\n"
+                if not msg_to_write.endswith("\n\n"):
+                    msg_to_write += "\n"
+                msg_to_write += sob_line
+        return msg_to_write
+
+    def _push_synthetic_ref(
+        self, branch: str, topic: str, reviewers: str, env: dict[str, str]
+    ) -> None:
+        """Push the synthetic commit directly to refs/for/<branch>."""
+        push_ref = f"refs/for/{branch}%topic={topic}"
+        revs = [
+            r.strip()
+            for r in (reviewers or "").split(",")
+            if r.strip() and "@" in r and r.strip() != branch
+        ]
+        for r in revs:
+            push_ref += f",r={r}"
+        run_cmd(
+            [
+                "git",
+                "push",
+                "--no-follow-tags",
+                "gerrit",
+                f"HEAD:{push_ref}",
+            ],
+            cwd=self.workspace,
+            env=env,
+        )
 
     def _analyze_gerrit_push_failure(self, exc: CommandError) -> str:
         """Analyze git review failure and provide helpful error message."""
@@ -4923,6 +5581,31 @@ class Orchestrator:
         # matching
         normalized_output = " ".join(combined_lower.split())
 
+        ssh_msg = self._diagnose_ssh_or_connection_failure(
+            combined_lower, normalized_output
+        )
+        if ssh_msg is not None:
+            return ssh_msg
+
+        if "missing issue-id" in combined_lower:
+            return "Missing Issue-ID in commit message."
+        if "commit not associated to any issue" in combined_lower:
+            return "Commit not associated to any issue."
+        if (
+            "remote rejected" in combined_lower
+            and "refs/for/" in combined_lower
+        ):
+            return self._diagnose_remote_rejection(
+                combined_output, normalized_output
+            )
+
+        return self._describe_unknown_push_failure(exc)
+
+    @staticmethod
+    def _diagnose_ssh_or_connection_failure(
+        combined_lower: str, normalized_output: str
+    ) -> str | None:
+        """Return a message for SSH/auth/connection failures, else None."""
         if (
             "host key verification failed" in combined_lower
             or "no ed25519 host key is known" in combined_lower
@@ -4938,7 +5621,7 @@ class Orchestrator:
                 "'ssh-keyscan -p 29418 <gerrit-host>' "
                 "to get the current host keys."
             )
-        elif (
+        if (
             "authenticity of host" in combined_lower
             and "can't be established" in combined_lower
         ):
@@ -4951,7 +5634,7 @@ class Orchestrator:
                 "'ssh-keyscan -p 29418 <gerrit-host>' to get the host keys."
             )
         # Check for specific SSH key issues before general permission denied
-        elif (
+        if (
             "key_load_public" in combined_lower
             and "invalid format" in combined_lower
         ):
@@ -4959,18 +5642,18 @@ class Orchestrator:
                 "SSH key format is invalid. Check that the SSH private key "
                 "is properly formatted."
             )
-        elif "no matching host key type found" in normalized_output:
+        if "no matching host key type found" in normalized_output:
             return (
                 "SSH key type not supported by server. The server may not "
                 "accept this SSH key algorithm."
             )
-        elif "authentication failed" in combined_lower:
+        if "authentication failed" in combined_lower:
             return (
                 "SSH authentication failed - check SSH key, username, and "
                 "server configuration"
             )
         # Check for connection timeout/refused before "could not read" check
-        elif (
+        if (
             "connection timed out" in combined_lower
             or "connection refused" in combined_lower
         ):
@@ -4979,7 +5662,7 @@ class Orchestrator:
                 "server availability"
             )
         # Check for specific SSH publickey-only authentication failures
-        elif "permission denied (publickey)" in combined_lower and not any(
+        if "permission denied (publickey)" in combined_lower and not any(
             auth_method in combined_lower
             for auth_method in ["gssapi", "password", "keyboard"]
         ):
@@ -4987,63 +5670,61 @@ class Orchestrator:
                 "SSH public key authentication failed. The SSH key may be "
                 "invalid, not authorized for this user, or the wrong key type."
             )
-        elif "permission denied" in combined_lower:
+        if "permission denied" in combined_lower:
             return "SSH permission denied - check SSH key and user permissions"
-        elif "could not read from remote repository" in combined_lower:
+        if "could not read from remote repository" in combined_lower:
             return (
                 "Could not read from remote repository - check SSH "
                 "authentication and repository access permissions"
             )
-        elif "missing issue-id" in combined_lower:
-            return "Missing Issue-ID in commit message."
-        elif "commit not associated to any issue" in combined_lower:
-            return "Commit not associated to any issue."
-        elif (
-            "remote rejected" in combined_lower
-            and "refs/for/" in combined_lower
-        ):
-            # Extract specific rejection reason from output
-            # Handle multiline rejection messages by looking in normalized
-            # output
+        return None
 
-            # Look for the rejection pattern in the normalized output
-            rejection_match = re.search(
-                r"!\s*\[remote rejected\].*?\((.*?)\)", normalized_output
-            )
-            if rejection_match:
-                reason = rejection_match.group(1).strip()
-                if re.search(r"change\s+\S+\s+closed", reason):
-                    return (
-                        "Gerrit change is closed (merged or abandoned) "
-                        f"and cannot accept new patchsets: {reason}"
-                    )
-                return f"Gerrit rejected the push: {reason}"
+    @staticmethod
+    def _diagnose_remote_rejection(
+        combined_output: str, normalized_output: str
+    ) -> str:
+        """Extract the specific reason for a 'remote rejected' push error."""
+        # Handle multiline rejection messages by looking in normalized output
+        rejection_match = re.search(
+            r"!\s*\[remote rejected\].*?\((.*?)\)", normalized_output
+        )
+        if rejection_match:
+            reason = rejection_match.group(1).strip()
+            if re.search(r"change\s+\S+\s+closed", reason):
+                return (
+                    "Gerrit change is closed (merged or abandoned) "
+                    f"and cannot accept new patchsets: {reason}"
+                )
+            return f"Gerrit rejected the push: {reason}"
 
-            # Fallback: look line by line
-            lines = combined_output.split("\n")
-            for line in lines:
-                if "! [remote rejected]" in line:
-                    if "(" in line and ")" in line:
-                        reason = line[line.find("(") + 1 : line.find(")")]
-                        if re.search(r"change\s+\S+\s+closed", reason):
-                            return (
-                                "Gerrit change is closed (merged or "
-                                "abandoned) and cannot accept new "
-                                f"patchsets: {reason}"
-                            )
-                        return f"Gerrit rejected the push: {reason}"
-                    return f"Gerrit rejected the push: {line.strip()}"
-            return "Gerrit rejected the push for an unknown reason"
-        else:
-            # For unknown errors, include more context
-            context_parts = []
-            if exc.returncode is not None:
-                context_parts.append(f"exit code {exc.returncode}")
-            if exc.cmd:
-                context_parts.append(f"command: {' '.join(exc.cmd)}")
+        # Fallback: look line by line
+        lines = combined_output.split("\n")
+        for line in lines:
+            if "! [remote rejected]" in line:
+                if "(" in line and ")" in line:
+                    reason = line[line.find("(") + 1 : line.find(")")]
+                    if re.search(r"change\s+\S+\s+closed", reason):
+                        return (
+                            "Gerrit change is closed (merged or "
+                            "abandoned) and cannot accept new "
+                            f"patchsets: {reason}"
+                        )
+                    return f"Gerrit rejected the push: {reason}"
+                return f"Gerrit rejected the push: {line.strip()}"
+        return "Gerrit rejected the push for an unknown reason"
 
-            context = f" ({', '.join(context_parts)})" if context_parts else ""
-            return f"Unknown error{context}: {exc}"
+    @staticmethod
+    def _describe_unknown_push_failure(exc: CommandError) -> str:
+        """Build a context-rich message for an unrecognized push failure."""
+        # For unknown errors, include more context
+        context_parts = []
+        if exc.returncode is not None:
+            context_parts.append(f"exit code {exc.returncode}")
+        if exc.cmd:
+            context_parts.append(f"command: {' '.join(exc.cmd)}")
+
+        context = f" ({', '.join(context_parts)})" if context_parts else ""
+        return f"Unknown error{context}: {exc}"
 
     def _query_gerrit_for_results(
         self,
@@ -5272,116 +5953,18 @@ class Orchestrator:
         Raises:
             OrchestratorError: If hostname fails SSRF validation
         """
-        # Allowlist for known safe GitHub domains
-        safe_github_domains = {
-            "github.com",
-            "api.github.com",
-            "raw.githubusercontent.com",
-            "objects.githubusercontent.com",
-            "codeload.github.com",
-        }
-
         # Check if hostname is in our allowlist (exact match or subdomain)
-        hostname_lower = hostname.lower()
-        for safe_domain in safe_github_domains:
-            if hostname_lower == safe_domain or hostname_lower.endswith(
-                f".{safe_domain}"
-            ):
-                return  # Allow known safe domains
+        if self._is_allowlisted_github_domain(hostname):
+            return  # Allow known safe domains
 
         # For GitHub Enterprise or other domains, perform IP validation
         try:
             # Get ALL IP addresses for the hostname (both IPv4 and IPv6)
-            addr_infos = socket.getaddrinfo(
-                hostname,
-                None,
-                family=socket.AF_UNSPEC,  # Both IPv4 and IPv6
-                type=socket.SOCK_STREAM,
-            )
+            ip_addresses = self._resolve_hostname_ips(hostname)
 
-            if not addr_infos:
-                msg = f"No IP addresses found for hostname: {hostname}"
-                raise OrchestratorError(msg)
-
-            ip_addresses = set()
-            for addr_info in addr_infos:
-                ip_str = addr_info[4][
-                    0
-                ]  # Extract IP from (family, type, proto, canonname, sockaddr)
-                ip_addresses.add(ip_str)
-
-            blocked_ips = []
+            blocked_ips: list[str] = []
             for ip_str in ip_addresses:
-                try:
-                    ip_obj = ipaddress.ip_address(ip_str)
-
-                    # Block private, loopback, reserved, multicast addresses
-                    if (
-                        ip_obj.is_private
-                        or ip_obj.is_loopback
-                        or ip_obj.is_reserved
-                        or ip_obj.is_multicast
-                        or ip_obj.is_link_local
-                        or ip_obj.is_unspecified
-                    ):
-                        blocked_ips.append(ip_str)
-
-                    # Additional IPv4 specific checks
-                    if isinstance(ip_obj, ipaddress.IPv4Address):
-                        # Block additional ranges not caught by is_private
-                        if (
-                            ip_obj
-                            in ipaddress.IPv4Network(
-                                "0.0.0.0/8"
-                            )  # "This" network
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "100.64.0.0/10"
-                            )  # Carrier-grade NAT
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "169.254.0.0/16"
-                            )  # Link-local
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "192.0.0.0/24"
-                            )  # IETF Protocol Assignments
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "192.0.2.0/24"
-                            )  # Documentation
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "198.18.0.0/15"
-                            )  # Benchmarking
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "198.51.100.0/24"
-                            )  # Documentation
-                            or ip_obj
-                            in ipaddress.IPv4Network(
-                                "203.0.113.0/24"
-                            )  # Documentation
-                        ):
-                            blocked_ips.append(ip_str)
-
-                    # Additional IPv6 specific checks
-                    elif isinstance(ip_obj, ipaddress.IPv6Address) and (  # pyright: ignore[reportUnnecessaryIsInstance]
-                        ip_obj in ipaddress.IPv6Network("::1/128")  # Loopback
-                        or ip_obj
-                        in ipaddress.IPv6Network("fe80::/10")  # Link-local
-                        or ip_obj
-                        in ipaddress.IPv6Network("fc00::/7")  # Unique local
-                        or ip_obj
-                        in ipaddress.IPv6Network(
-                            "2001:db8::/32"
-                        )  # Documentation
-                    ):
-                        blocked_ips.append(ip_str)
-
-                except (ipaddress.AddressValueError, ValueError):
-                    # If we can't parse the IP, block it for safety
-                    blocked_ips.append(ip_str)
+                blocked_ips.extend(self._ssrf_block_hits(ip_str))
 
             # If ANY IP address is blocked, reject the entire hostname
             if blocked_ips:
@@ -5398,6 +5981,113 @@ class Orchestrator:
             # If hostname doesn't resolve, it's likely invalid
             msg = f"Cannot resolve hostname: {hostname}"
             raise OrchestratorError(msg) from None
+
+    @staticmethod
+    def _is_allowlisted_github_domain(hostname: str) -> bool:
+        """Return True if the hostname matches a known-safe GitHub domain."""
+        # Allowlist for known safe GitHub domains
+        safe_github_domains = {
+            "github.com",
+            "api.github.com",
+            "raw.githubusercontent.com",
+            "objects.githubusercontent.com",
+            "codeload.github.com",
+        }
+        hostname_lower = hostname.lower()
+        return any(
+            hostname_lower == safe_domain
+            or hostname_lower.endswith(f".{safe_domain}")
+            for safe_domain in safe_github_domains
+        )
+
+    @staticmethod
+    def _resolve_hostname_ips(hostname: str) -> set[str]:
+        """Resolve all IPv4/IPv6 addresses for the given hostname."""
+        addr_infos = socket.getaddrinfo(
+            hostname,
+            None,
+            family=socket.AF_UNSPEC,  # Both IPv4 and IPv6
+            type=socket.SOCK_STREAM,
+        )
+
+        if not addr_infos:
+            msg = f"No IP addresses found for hostname: {hostname}"
+            raise OrchestratorError(msg)
+
+        ip_addresses: set[str] = set()
+        for addr_info in addr_infos:
+            # Extract IP from (family, type, proto, canonname, sockaddr).
+            # sockaddr[0] is always the address string for AF_INET/AF_INET6.
+            ip_str = cast("str", addr_info[4][0])
+            ip_addresses.add(ip_str)
+        return ip_addresses
+
+    def _ssrf_block_hits(self, ip_str: str) -> list[str]:
+        """Return one entry per SSRF category the IP violates.
+
+        Mirrors the original append-per-category behavior so that an IP
+        matching multiple categories (e.g. link-local) contributes more
+        than once, preserving the exact error-message contents.
+        """
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except (ipaddress.AddressValueError, ValueError):
+            # If we can't parse the IP, block it for safety
+            return [ip_str]
+
+        hits: list[str] = []
+        # Block private, loopback, reserved, multicast addresses
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_link_local
+            or ip_obj.is_unspecified
+        ):
+            hits.append(ip_str)
+
+        # Additional IPv4 specific checks
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            if self._ipv4_in_blocked_range(ip_obj):
+                hits.append(ip_str)
+        # Additional IPv6 specific checks
+        elif isinstance(ip_obj, ipaddress.IPv6Address) and (  # pyright: ignore[reportUnnecessaryIsInstance]
+            self._ipv6_in_blocked_range(ip_obj)
+        ):
+            hits.append(ip_str)
+
+        return hits
+
+    @staticmethod
+    def _ipv4_in_blocked_range(ip_obj: ipaddress.IPv4Address) -> bool:
+        """Return True for IPv4 ranges not caught by is_private, etc."""
+        blocked_networks = [
+            "0.0.0.0/8",  # "This" network
+            "100.64.0.0/10",  # Carrier-grade NAT
+            "169.254.0.0/16",  # Link-local
+            "192.0.0.0/24",  # IETF Protocol Assignments
+            "192.0.2.0/24",  # Documentation
+            "198.18.0.0/15",  # Benchmarking
+            "198.51.100.0/24",  # Documentation
+            "203.0.113.0/24",  # Documentation
+        ]
+        return any(
+            ip_obj in ipaddress.IPv4Network(net) for net in blocked_networks
+        )
+
+    @staticmethod
+    def _ipv6_in_blocked_range(ip_obj: ipaddress.IPv6Address) -> bool:
+        """Return True for IPv6 ranges not caught by is_private, etc."""
+        blocked_networks = [
+            "::1/128",  # Loopback
+            "fe80::/10",  # Link-local
+            "fc00::/7",  # Unique local
+            "2001:db8::/32",  # Documentation
+        ]
+        return any(
+            ip_obj in ipaddress.IPv6Network(net) for net in blocked_networks
+        )
 
     def _fallback_to_api_archive(
         self, workspace: Path, gh: GitHubContext, inputs: Inputs
@@ -5774,6 +6464,24 @@ class Orchestrator:
             log.warning("No commit shas to comment on in Gerrit")
             return
 
+        if self._backref_comments_disabled():
+            return
+
+        log.debug("Adding back-reference comment in Gerrit")
+        ctx = self._build_backref_context(gerrit, repo, branch, gh)
+        log.debug("Adding back-reference comment: %s", ctx.message)
+
+        log.debug(
+            "Processing %d commit SHAs for back-reference comments",
+            len(commit_shas),
+        )
+
+        for csha in commit_shas:
+            self._post_backref_for_commit(csha, ctx)
+
+    @staticmethod
+    def _backref_comments_disabled() -> bool:
+        """Return True if back-reference comments are disabled via env."""
         # Check if back-reference comments are disabled
         skip_comments_env = os.getenv("G2G_SKIP_GERRIT_COMMENTS", "")
         log.debug(
@@ -5786,9 +6494,17 @@ class Orchestrator:
                 "Skipping back-reference comments "
                 "(G2G_SKIP_GERRIT_COMMENTS=true)"
             )
-            return
+            return True
+        return False
 
-        log.debug("Adding back-reference comment in Gerrit")
+    @staticmethod
+    def _build_backref_context(
+        gerrit: GerritInfo,
+        repo: RepoNames,
+        branch: str,
+        gh: GitHubContext,
+    ) -> _BackrefContext:
+        """Assemble the shared context for back-reference comments."""
         user = os.getenv("GERRIT_SSH_USER_G2G", "")
         server = gerrit.host
         pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
@@ -5798,233 +6514,234 @@ class Orchestrator:
             else "N/A"
         )
         message = f"GHPR: {pr_url} | Action-Run: {run_url}"
-        log.debug("Adding back-reference comment: %s", message)
-        # Idempotence override: allow forcing duplicate comments (debug/testing)
+        # Idempotence override: allow forcing duplicate comments
+        # (debug/testing)
         force_dup = os.getenv("G2G_FORCE_BACKREF_DUPLICATE", "").lower() in (
             "1",
             "true",
             "yes",
         )
-
-        def _has_existing_backref(commit_sha: str) -> bool:
-            if force_dup:
-                return False
-            try:
-                from .gerrit_rest import build_client_for_host
-
-                client = build_client_for_host(
-                    gerrit.host, timeout=8.0, max_attempts=3
-                )
-                # Query change messages for this commit
-                path = f"/changes/?q=commit:{commit_sha}&o=MESSAGES"
-                data = client.get(path)
-                if not isinstance(data, list):
-                    return False
-                for entry in data:
-                    msgs = entry.get("messages") or []
-                    for msg in msgs:
-                        txt = (msg.get("message") or "").strip()
-                        if "GHPR:" in txt and pr_url in txt:
-                            log.debug(
-                                "Skipping back-reference for %s "
-                                "(already present)",
-                                commit_sha,
-                            )
-                            return True
-            except Exception as exc:
-                log.debug(
-                    "Backref idempotence check failed for %s: %s",
-                    commit_sha,
-                    exc,
-                )
-            return False
-
-        log.debug(
-            "Processing %d commit SHAs for back-reference comments",
-            len(commit_shas),
+        return _BackrefContext(
+            gerrit=gerrit,
+            repo=repo,
+            branch=branch,
+            user=user,
+            server=server,
+            message=message,
+            pr_url=pr_url,
+            force_dup=force_dup,
         )
 
-        for csha in commit_shas:
-            log.debug("Processing commit SHA: %s", csha)
-            if _has_existing_backref(csha):
-                log.debug(
-                    "Commit %s already has back-reference, skipping", csha
-                )
-                continue
-            if not csha:
-                log.debug("Empty commit SHA, skipping")
-                continue
-            ssh_cmd: list[str] = []
-            try:
-                log.debug("Executing SSH command for commit %s", csha)
-                if self._ssh_key_path and self._ssh_known_hosts_path:
-                    # File-based SSH authentication
-                    ssh_cmd = [
-                        "ssh",
-                        "-F",
-                        "/dev/null",
-                        "-i",
-                        str(self._ssh_key_path),
-                        "-o",
-                        f"UserKnownHostsFile={self._ssh_known_hosts_path}",
-                        "-o",
-                        "IdentitiesOnly=yes",
-                        "-o",
-                        "IdentityAgent=none",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "StrictHostKeyChecking=yes",
-                        "-o",
-                        "PasswordAuthentication=no",
-                        "-o",
-                        "PubkeyAcceptedKeyTypes=+ssh-rsa",
-                        "-n",
-                        "-p",
-                        str(gerrit.port),
-                        f"{user}@{server}",
-                        (
-                            "gerrit review -m "
-                            f"{shlex.quote(message)} "
-                            "--branch "
-                            f"{shlex.quote(branch)} "
-                            "--project "
-                            f"{shlex.quote(repo.project_gerrit)} "
-                            f"{shlex.quote(csha)}"
-                        ),
-                    ]
-                elif (
-                    self._use_ssh_agent
-                    and self._ssh_agent_manager
-                    and self._ssh_agent_manager.known_hosts_path
-                ):
-                    # SSH agent authentication with known_hosts
-                    ssh_cmd = [
-                        "ssh",
-                        "-F",
-                        "/dev/null",
-                        "-o",
-                        f"UserKnownHostsFile={self._ssh_agent_manager.known_hosts_path}",
-                        "-o",
-                        "IdentitiesOnly=no",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "PreferredAuthentications=publickey",
-                        "-o",
-                        "StrictHostKeyChecking=yes",
-                        "-o",
-                        "PasswordAuthentication=no",
-                        "-o",
-                        "PubkeyAcceptedKeyTypes=+ssh-rsa",
-                        "-o",
-                        "ConnectTimeout=10",
-                        "-n",
-                        "-p",
-                        str(gerrit.port),
-                        f"{user}@{server}",
-                        (
-                            "gerrit review -m "
-                            f"{shlex.quote(message)} "
-                            "--branch "
-                            f"{shlex.quote(branch)} "
-                            "--project "
-                            f"{shlex.quote(repo.project_gerrit)} "
-                            f"{shlex.quote(csha)}"
-                        ),
-                    ]
-                else:
-                    # Fallback - use user's SSH config and agent
-                    # (local/CLI mode where no private key or managed
-                    # agent is configured). Do NOT use -F /dev/null or
-                    # IdentityAgent=none here, as that blocks
-                    # agent-based keys (e.g. Secretive, 1Password).
-                    ssh_cmd = [
-                        "ssh",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "PreferredAuthentications=publickey",
-                        "-o",
-                        "StrictHostKeyChecking=yes",
-                        "-o",
-                        "PasswordAuthentication=no",
-                        "-o",
-                        "PubkeyAcceptedKeyTypes=+ssh-rsa",
-                        "-o",
-                        "ConnectTimeout=10",
-                        "-n",
-                        "-p",
-                        str(gerrit.port),
-                        f"{user}@{server}",
-                        (
-                            "gerrit review -m "
-                            f"{shlex.quote(message)} "
-                            "--branch "
-                            f"{shlex.quote(branch)} "
-                            "--project "
-                            f"{shlex.quote(repo.project_gerrit)} "
-                            f"{shlex.quote(csha)}"
-                        ),
-                    ]
+    def _gerrit_has_backref(
+        self, commit_sha: str, ctx: _BackrefContext
+    ) -> bool:
+        """Return True if the Gerrit change already has our back-reference."""
+        if ctx.force_dup:
+            return False
+        try:
+            from .gerrit_rest import build_client_for_host
 
-                log.debug("Final SSH command: %s", " ".join(ssh_cmd))
-                # In local/CLI mode (no private key, no managed agent),
-                # preserve the system SSH_AUTH_SOCK so agent-based keys
-                # (e.g. Secretive, 1Password) can authenticate.
-                ssh_run_env = self._ssh_env()
-                saved_sock = getattr(self, "_original_ssh_auth_sock", None)
-                if (
-                    not self._ssh_key_path
-                    and not self._use_ssh_agent
-                    and saved_sock
-                ):
-                    ssh_run_env["SSH_AUTH_SOCK"] = saved_sock
-                    log.debug(
-                        "Preserving system SSH_AUTH_SOCK for "
-                        "agent-based authentication"
-                    )
-                run_cmd(
-                    ssh_cmd,
-                    cwd=self.workspace,
-                    env=ssh_run_env,
-                )
-                log.debug(
-                    "Successfully added back-reference comment for %s: %s",
-                    csha,
-                    message,
-                )
-            except CommandError as exc:
-                log.warning(
-                    "Failed to add back-reference comment for %s "
-                    "(non-fatal): %s",
-                    csha,
-                    exc,
-                )
-                if exc.stderr:
-                    log.debug("SSH stderr: %s", exc.stderr)
-                if exc.stdout:
-                    log.debug("SSH stdout: %s", exc.stdout)
-                log.debug(
-                    "SSH command that failed: %s",
-                    " ".join(ssh_cmd) if ssh_cmd else "unknown",
-                )
-                log.debug(
-                    "Back-reference comment failed but change was successfully "
-                    "submitted. You can set G2G_SKIP_GERRIT_COMMENTS=true to "
-                    "disable these comments."
-                )
-            except Exception as exc:
-                log.warning(
-                    "Failed to add back-reference comment for %s "
-                    "(non-fatal): %s",
-                    csha,
-                    exc,
-                )
-                log.debug(
-                    "Back-reference comment failure details:", exc_info=True
-                )
-                # Continue processing - this is not a fatal error
+            client = build_client_for_host(
+                ctx.gerrit.host, timeout=8.0, max_attempts=3
+            )
+            # Query change messages for this commit
+            path = f"/changes/?q=commit:{commit_sha}&o=MESSAGES"
+            data = client.get(path)
+            if not isinstance(data, list):
+                return False
+            for entry in data:
+                msgs = entry.get("messages") or []
+                for msg in msgs:
+                    txt = (msg.get("message") or "").strip()
+                    if "GHPR:" in txt and ctx.pr_url in txt:
+                        log.debug(
+                            "Skipping back-reference for %s (already present)",
+                            commit_sha,
+                        )
+                        return True
+        except Exception as exc:
+            log.debug(
+                "Backref idempotence check failed for %s: %s",
+                commit_sha,
+                exc,
+            )
+        return False
+
+    @staticmethod
+    def _gerrit_review_backref_arg(ctx: _BackrefContext, csha: str) -> str:
+        """Build the remote 'gerrit review' command for a back-reference."""
+        return (
+            "gerrit review -m "
+            f"{shlex.quote(ctx.message)} "
+            "--branch "
+            f"{shlex.quote(ctx.branch)} "
+            "--project "
+            f"{shlex.quote(ctx.repo.project_gerrit)} "
+            f"{shlex.quote(csha)}"
+        )
+
+    def _build_backref_ssh_cmd(
+        self, ctx: _BackrefContext, csha: str
+    ) -> list[str]:
+        """Build the ssh command that posts a back-reference comment."""
+        review_arg = self._gerrit_review_backref_arg(ctx, csha)
+        user_at_server = f"{ctx.user}@{ctx.server}"
+        port = str(ctx.gerrit.port)
+
+        if self._ssh_key_path and self._ssh_known_hosts_path:
+            # File-based SSH authentication
+            return [
+                "ssh",
+                "-F",
+                "/dev/null",
+                "-i",
+                str(self._ssh_key_path),
+                "-o",
+                f"UserKnownHostsFile={self._ssh_known_hosts_path}",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "IdentityAgent=none",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-n",
+                "-p",
+                port,
+                user_at_server,
+                review_arg,
+            ]
+        if (
+            self._use_ssh_agent
+            and self._ssh_agent_manager
+            and self._ssh_agent_manager.known_hosts_path
+        ):
+            # SSH agent authentication with known_hosts
+            known_hosts = self._ssh_agent_manager.known_hosts_path
+            return [
+                "ssh",
+                "-F",
+                "/dev/null",
+                "-o",
+                f"UserKnownHostsFile={known_hosts}",
+                "-o",
+                "IdentitiesOnly=no",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "PubkeyAcceptedKeyTypes=+ssh-rsa",
+                "-o",
+                "ConnectTimeout=10",
+                "-n",
+                "-p",
+                port,
+                user_at_server,
+                review_arg,
+            ]
+        # Fallback - use user's SSH config and agent (local/CLI mode
+        # where no private key or managed agent is configured). Do NOT use
+        # -F /dev/null or IdentityAgent=none here, as that blocks
+        # agent-based keys (e.g. Secretive, 1Password).
+        return [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "PubkeyAcceptedKeyTypes=+ssh-rsa",
+            "-o",
+            "ConnectTimeout=10",
+            "-n",
+            "-p",
+            port,
+            user_at_server,
+            review_arg,
+        ]
+
+    def _backref_ssh_env(self) -> dict[str, str]:
+        """Build the SSH env for back-reference comments.
+
+        In local/CLI mode (no private key, no managed agent), preserve the
+        system SSH_AUTH_SOCK so agent-based keys (e.g. Secretive,
+        1Password) can authenticate.
+        """
+        ssh_run_env = self._ssh_env()
+        saved_sock = getattr(self, "_original_ssh_auth_sock", None)
+        if not self._ssh_key_path and not self._use_ssh_agent and saved_sock:
+            ssh_run_env["SSH_AUTH_SOCK"] = saved_sock
+            log.debug(
+                "Preserving system SSH_AUTH_SOCK for agent-based authentication"
+            )
+        return ssh_run_env
+
+    def _post_backref_for_commit(self, csha: str, ctx: _BackrefContext) -> None:
+        """Post a single back-reference comment; failures are non-fatal."""
+        log.debug("Processing commit SHA: %s", csha)
+        if self._gerrit_has_backref(csha, ctx):
+            log.debug("Commit %s already has back-reference, skipping", csha)
+            return
+        if not csha:
+            log.debug("Empty commit SHA, skipping")
+            return
+        ssh_cmd: list[str] = []
+        try:
+            log.debug("Executing SSH command for commit %s", csha)
+            ssh_cmd = self._build_backref_ssh_cmd(ctx, csha)
+            log.debug("Final SSH command: %s", " ".join(ssh_cmd))
+            ssh_run_env = self._backref_ssh_env()
+            run_cmd(
+                ssh_cmd,
+                cwd=self.workspace,
+                env=ssh_run_env,
+            )
+            log.debug(
+                "Successfully added back-reference comment for %s: %s",
+                csha,
+                ctx.message,
+            )
+        except CommandError as exc:
+            log.warning(
+                "Failed to add back-reference comment for %s (non-fatal): %s",
+                csha,
+                exc,
+            )
+            if exc.stderr:
+                log.debug("SSH stderr: %s", exc.stderr)
+            if exc.stdout:
+                log.debug("SSH stdout: %s", exc.stdout)
+            log.debug(
+                "SSH command that failed: %s",
+                " ".join(ssh_cmd) if ssh_cmd else "unknown",
+            )
+            log.debug(
+                "Back-reference comment failed but change was successfully "
+                "submitted. You can set G2G_SKIP_GERRIT_COMMENTS=true to "
+                "disable these comments."
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to add back-reference comment for %s (non-fatal): %s",
+                csha,
+                exc,
+            )
+            log.debug("Back-reference comment failure details:", exc_info=True)
+            # Continue processing - this is not a fatal error
 
     def _comment_on_pull_request(
         self,
@@ -6361,89 +7078,93 @@ class Orchestrator:
             )
 
             for commit_sha in result.commit_shas:
-                try:
-                    from .gitutils import run_cmd
-
-                    files_output = run_cmd(
-                        [
-                            "git",
-                            "show",
-                            "--name-only",
-                            "--pretty=format:",
-                            commit_sha,
-                        ],
-                        cwd=self.workspace,
-                    ).stdout.strip()
-
-                    if not files_output:
-                        continue
-
-                    gerrit_files = {
-                        f.strip() for f in files_output.split("\n") if f.strip()
-                    }
-                    log.debug(
-                        "Gerrit commit %s files (%d): %s",
-                        commit_sha[:8],
-                        len(gerrit_files),
-                        sorted(gerrit_files),
-                    )
-
-                    unexpected_files = gerrit_files - github_files
-                    if unexpected_files:
-                        # Filter out known safe files that might legitimately
-                        # differ
-                        suspicious_files = []
-                        for f in unexpected_files:
-                            # Skip files that are legitimately different
-                            if f in [".gitreview", ".gitignore"]:
-                                continue
-                            # Flag SSH artifacts and other suspicious files
-                            if (
-                                ".ssh" in f
-                                or "known_hosts" in f
-                                or f.startswith("gerrit_key")
-                            ):
-                                suspicious_files.append(f)
-                            else:
-                                # Other unexpected files - log but don't error
-                                log.warning(
-                                    "Unexpected file in Gerrit commit: %s", f
-                                )
-
-                        if suspicious_files:
-                            log.error(
-                                "❌ CRITICAL: SSH artifacts detected in Gerrit "
-                                "commit %s: %s",
-                                commit_sha[:8],
-                                suspicious_files,
-                            )
-                            log.error(
-                                "This indicates a serious bug where tool "
-                                "artifacts were committed. The Gerrit change "
-                                "may need manual cleanup."
-                            )
-                            # Don't fail the pipeline, but log prominently for
-                            # monitoring
-
-                    # Also check if we're missing expected files
-                    missing_files = github_files - gerrit_files
-                    if missing_files:
-                        log.warning(
-                            "Files in GitHub PR but not in Gerrit commit "
-                            "%s: %s",
-                            commit_sha[:8],
-                            sorted(missing_files),
-                        )
-
-                except Exception as commit_exc:
-                    log.debug(
-                        "Failed to validate files for commit %s: %s",
-                        commit_sha[:8],
-                        commit_exc,
-                    )
+                self._validate_commit_files(commit_sha, github_files)
 
         except Exception as exc:
             log.debug("File validation failed (non-critical): %s", exc)
+
+    def _validate_commit_files(
+        self, commit_sha: str, github_files: set[str]
+    ) -> None:
+        """Compare one Gerrit commit's files against the GitHub PR files."""
+        try:
+            from .gitutils import run_cmd
+
+            files_output = run_cmd(
+                [
+                    "git",
+                    "show",
+                    "--name-only",
+                    "--pretty=format:",
+                    commit_sha,
+                ],
+                cwd=self.workspace,
+            ).stdout.strip()
+
+            if not files_output:
+                return
+
+            gerrit_files = {
+                f.strip() for f in files_output.split("\n") if f.strip()
+            }
+            log.debug(
+                "Gerrit commit %s files (%d): %s",
+                commit_sha[:8],
+                len(gerrit_files),
+                sorted(gerrit_files),
+            )
+
+            unexpected_files = gerrit_files - github_files
+            if unexpected_files:
+                self._report_unexpected_files(commit_sha, unexpected_files)
+
+            # Also check if we're missing expected files
+            missing_files = github_files - gerrit_files
+            if missing_files:
+                log.warning(
+                    "Files in GitHub PR but not in Gerrit commit %s: %s",
+                    commit_sha[:8],
+                    sorted(missing_files),
+                )
+
+        except Exception as commit_exc:
+            log.debug(
+                "Failed to validate files for commit %s: %s",
+                commit_sha[:8],
+                commit_exc,
+            )
+
+    @staticmethod
+    def _report_unexpected_files(
+        commit_sha: str, unexpected_files: set[str]
+    ) -> None:
+        """Log unexpected files, flagging SSH artifacts as critical."""
+        # Filter out known safe files that might legitimately differ
+        suspicious_files = []
+        for f in unexpected_files:
+            # Skip files that are legitimately different
+            if f in [".gitreview", ".gitignore"]:
+                continue
+            # Flag SSH artifacts and other suspicious files
+            if ".ssh" in f or "known_hosts" in f or f.startswith("gerrit_key"):
+                suspicious_files.append(f)
+            else:
+                # Other unexpected files - log but don't error
+                log.warning("Unexpected file in Gerrit commit: %s", f)
+
+        if suspicious_files:
+            log.error(
+                "❌ CRITICAL: SSH artifacts detected in Gerrit commit %s: %s",
+                commit_sha[:8],
+                suspicious_files,
+            )
+            log.error(
+                "This indicates a serious bug where tool "
+                "artifacts were committed. The Gerrit change "
+                "may need manual cleanup."
+            )
+            # Don't fail the pipeline, but log prominently for
+            # monitoring
 
     def _analyze_merge_failure(
         self, merge_exc: CommandError, base_sha: str, head_sha: str

@@ -21,6 +21,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+from typing import NamedTuple
 
 from .gerrit_urls import create_gerrit_url_builder
 from .github_api import GhPullRequest
@@ -156,6 +157,47 @@ class ChangeFingerprint:
             f"ChangeFingerprint(title='{self.title[:50]}...', "
             f"hash={self._content_hash})"
         )
+
+
+def _normalize_duplicate_subject(title: str) -> str:
+    """Normalize a subject/title for duplicate comparison."""
+    normalized = title.strip()
+    normalized = re.sub(
+        r"^(feat|fix|docs|style|refactor|test|chore|ci|build|perf)"
+        r"(\(.+?\))?: ",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"[*_`]", "", normalized)
+    normalized = re.sub(r"\bv\d+(\.\d+)*(-\w+)?\b", "vx.y.z", normalized)
+    normalized = re.sub(r"\b\d+(\.\d+)+(-\w+)?\b", "x.y.z", normalized)
+    normalized = re.sub(r"\b\d+\.\d+\b", "x.y.z", normalized)
+    normalized = re.sub(r"\b[a-f0-9]{7,40}\b", "commit_hash", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.lower()
+
+
+class _SimilarityInputs(NamedTuple):
+    """Precomputed inputs shared across candidate similarity scoring."""
+
+    src_subjects: list[str]
+    src_body: str
+    src_files: list[str]
+    config: Any
+    gerrit_host: str
+    gerrit_project: str
+    successful_base_path: str
+
+
+class _CandidateScore(NamedTuple):
+    """Result of scoring a single Gerrit change candidate."""
+
+    agg: float
+    ref: str
+    num: int | None
+    reasons: list[str]
+    is_hit: bool
 
 
 class DuplicateDetector:
@@ -327,29 +369,7 @@ class DuplicateDetector:
             return
         gerrit_host, gerrit_project = gerrit_info
 
-        # Helper: normalize subject like our existing title normalization
-        def _normalize_subject(title: str) -> str:
-            normalized = title.strip()
-            normalized = re.sub(
-                r"^(feat|fix|docs|style|refactor|test|chore|ci|build|perf)"
-                r"(\(.+?\))?: ",
-                "",
-                normalized,
-                flags=re.IGNORECASE,
-            )
-            normalized = re.sub(r"[*_`]", "", normalized)
-            normalized = re.sub(
-                r"\bv\d+(\.\d+)*(-\w+)?\b", "vx.y.z", normalized
-            )
-            normalized = re.sub(r"\b\d+(\.\d+)+(-\w+)?\b", "x.y.z", normalized)
-            normalized = re.sub(r"\b\d+\.\d+\b", "x.y.z", normalized)
-            normalized = re.sub(
-                r"\b[a-f0-9]{7,40}\b", "commit_hash", normalized
-            )
-            normalized = re.sub(r"\s+", " ", normalized).strip()
-            return normalized.lower()
-
-        normalized_pr_subject = _normalize_subject(pr_title)
+        normalized_pr_subject = _normalize_duplicate_subject(pr_title)
         log.debug(
             "Normalized PR subject for duplicate check: %s",
             normalized_pr_subject,
@@ -361,6 +381,69 @@ class DuplicateDetector:
         successful_base_path = url_builder.base_path
 
         # Build query: limit to recent changes, exclude abandoned; prefer open
+        query_path, dup_filter, cutoff_date = self._build_duplicate_query_path(
+            gerrit_project
+        )
+
+        log.debug(
+            "Gerrit duplicate query: host=%s project=%s filter=%s cutoff=%s "
+            "path=%s",
+            gerrit_host,
+            gerrit_project or "(any)",
+            dup_filter,
+            cutoff_date,
+            query_path,
+        )
+        changes = self._load_gerrit_changes(gerrit_host, query_path)
+        log.debug(
+            "Gerrit query returned %d change(s) for project=%s filter=%s "
+            "after=%s",
+            len(changes),
+            gerrit_project or "(any)",
+            dup_filter,
+            cutoff_date,
+        )
+
+        if changes:
+            sample_subjects = ", ".join(
+                str(c.get("subject") or "")[:60] for c in changes[:5]
+            )
+            log.debug("Sample subjects: %s", sample_subjects)
+
+        # First pass: Check for trailer-based matches (GitHub-Hash)
+        if expected_github_hash and self._has_trailer_match(
+            changes, expected_github_hash, gerrit_project
+        ):
+            # These are update targets, not duplicates - allow them to proceed
+            return
+
+        # Compare normalized subjects for exact equality
+        matched = self._find_exact_subject_matches(
+            changes, normalized_pr_subject, gerrit_project
+        )
+
+        if not matched and self._check_similarity_matches(
+            target_pr=target_pr,
+            changes=changes,
+            gerrit_host=gerrit_host,
+            gerrit_project=gerrit_project,
+            successful_base_path=successful_base_path,
+            allow_duplicates=allow_duplicates,
+        ):
+            return
+
+        self._handle_exact_matches(
+            matched, gerrit_host, successful_base_path, allow_duplicates
+        )
+
+    def _build_duplicate_query_path(
+        self, gerrit_project: str
+    ) -> tuple[str, str, str]:
+        """Build the Gerrit REST query path for duplicate detection.
+
+        Returns a tuple of (query_path, dup_filter, cutoff_date) where the
+        latter two are reused for diagnostic logging.
+        """
         cutoff_date = self._cutoff_date.date().isoformat()
         q_parts = []
         if gerrit_project:
@@ -385,341 +468,388 @@ class DuplicateDetector:
         query = " ".join(q_parts)
         encoded_q = urllib.parse.quote(query, safe="")
 
-        def _load_gerrit_json(query_path: str) -> list[dict[str, object]]:
-            try:
-                # Use centralized client that handles base path and auth
-                client = self._build_gerrit_rest_client(gerrit_host)
-                if client is None:
-                    log.debug(
-                        "Gerrit client not available; skipping duplicate check"
-                    )
-                    return []
-
-                log.debug("Querying Gerrit for duplicates: %s", query_path)
-                data = client.get(query_path)
-                if isinstance(data, list):
-                    return data
-                else:
-                    return []
-            except Exception as exc:
-                log.debug("Gerrit query failed for %s: %s", query_path, exc)
-                return []
-
         # Build query path for centralized client
         # Try CURRENT_REVISION instead of CURRENT_COMMIT to get revision data
         query_path = (
             f"/changes/?q={encoded_q}&n=50&o=CURRENT_REVISION&o=CURRENT_FILES"
             "&o=MESSAGES"
         )
+        return query_path, dup_filter, cutoff_date
 
-        log.debug(
-            "Gerrit duplicate query: host=%s project=%s filter=%s cutoff=%s "
-            "path=%s",
-            gerrit_host,
-            gerrit_project or "(any)",
-            dup_filter,
-            cutoff_date,
-            query_path,
+    def _load_gerrit_changes(
+        self, gerrit_host: str, query_path: str
+    ) -> list[dict[str, object]]:
+        """Query Gerrit and return the raw change list (empty on failure)."""
+        try:
+            # Use centralized client that handles base path and auth
+            client = self._build_gerrit_rest_client(gerrit_host)
+            if client is None:
+                log.debug(
+                    "Gerrit client not available; skipping duplicate check"
+                )
+                return []
+
+            log.debug("Querying Gerrit for duplicates: %s", query_path)
+            data = client.get(query_path)
+            if isinstance(data, list):
+                return data
+            else:
+                return []
+        except Exception as exc:
+            log.debug("Gerrit query failed for %s: %s", query_path, exc)
+            return []
+
+    @staticmethod
+    def _get_current_revision(c: dict[str, object]) -> dict[str, Any]:
+        """Return the current revision dict for a change (or empty dict)."""
+        rev = str(c.get("current_revision") or "")
+        revs_obj = c.get("revisions")
+        revs = revs_obj if isinstance(revs_obj, dict) else {}
+        cur_obj = revs.get(rev) if rev else {}
+        return cur_obj if isinstance(cur_obj, dict) else {}
+
+    @staticmethod
+    def _extract_commit_message(c: dict[str, object]) -> str:
+        """Extract the commit message from a change's revision or messages."""
+        # Try to get commit message from revisions first
+        cur = DuplicateDetector._get_current_revision(c)
+        commit = cur.get("commit") or {}
+        msg = str(commit.get("message") or "")
+
+        # If no commit message from revisions, try messages field
+        if not msg:
+            messages = c.get("messages", [])
+            if messages and isinstance(messages, list) and len(messages) > 0:
+                # Use the last message (most recent commit)
+                last_msg = messages[-1] if messages else {}
+                msg = (
+                    str(last_msg.get("message", ""))
+                    if isinstance(last_msg, dict)
+                    else ""
+                )
+        return msg
+
+    @staticmethod
+    def _extract_candidate_files(cur: dict[str, Any]) -> list[str]:
+        """Extract candidate file paths from a change's current revision."""
+        # Try to get files from current revision; some Gerrit versions may
+        # not populate revisions.files, leaving an empty file score.
+        files_dict = cur.get("files") or {}
+        return [
+            p
+            for p in files_dict
+            if isinstance(p, str) and not p.startswith("/")
+        ]
+
+    @staticmethod
+    def _extract_pr_files(target_pr: GhPullRequest) -> list[str]:
+        """Best-effort retrieval of file paths changed in the PR."""
+        src_files: list[str] = []
+        try:
+            get_files = getattr(target_pr, "get_files", None)
+            if callable(get_files):
+                files_obj = get_files()
+                if isinstance(files_obj, Iterable):
+                    for f in files_obj:
+                        fname = getattr(f, "filename", None)
+                        if fname:
+                            src_files.append(str(fname))
+        except Exception as exc:
+            # Best-effort; if files cannot be retrieved, proceed without them
+            log.debug("Failed to retrieve PR files for scoring: %s", exc)
+        return src_files
+
+    @staticmethod
+    def _build_candidate_ref(
+        gerrit_host: str,
+        successful_base_path: str,
+        proj: str,
+        num: int | None,
+    ) -> str:
+        """Build a display reference/URL for a candidate change."""
+        # Use the base path that actually worked for API calls
+        display_url_builder = create_gerrit_url_builder(
+            gerrit_host, successful_base_path
         )
-        changes = _load_gerrit_json(query_path)
-        log.debug(
-            "Gerrit query returned %d change(s) for project=%s filter=%s "
-            "after=%s",
-            len(changes),
-            gerrit_project or "(any)",
-            dup_filter,
-            cutoff_date,
+        return (
+            display_url_builder.change_url(proj, num)
+            if proj and isinstance(num, int)
+            else (f"change {num}" if isinstance(num, int) else "")
         )
 
-        if changes:
-            sample_subjects = ", ".join(
-                str(c.get("subject") or "")[:60] for c in changes[:5]
-            )
-            log.debug("Sample subjects: %s", sample_subjects)
+    def _has_trailer_match(
+        self,
+        changes: list[dict[str, object]],
+        expected_github_hash: str,
+        gerrit_project: str,
+    ) -> bool:
+        """Return True when a change carries the expected GitHub-Hash trailer.
 
-        # First pass: Check for trailer-based matches (GitHub-Hash)
-        if expected_github_hash:
-            log.debug(
-                "Checking for GitHub-Hash trailer matches: %s",
-                expected_github_hash,
-            )
-            trailer_matches: list[tuple[int, str]] = []
+        Such changes are update targets rather than duplicates.
+        """
+        log.debug(
+            "Checking for GitHub-Hash trailer matches: %s",
+            expected_github_hash,
+        )
+        trailer_matches: list[tuple[int, str]] = []
 
-            for c in changes:
-                # Extract commit message and check for GitHub trailers
-                # Extract commit message and check for GitHub trailers
+        for c in changes:
+            msg = self._extract_commit_message(c)
+            if msg:
+                github_metadata = extract_github_metadata(msg)
+                change_github_hash = github_metadata.get("GitHub-Hash", "")
 
-                # Try to get commit message from revisions first
-                rev = str(c.get("current_revision") or "")
-                revs_obj = c.get("revisions")
-                revs = revs_obj if isinstance(revs_obj, dict) else {}
-                cur_obj = revs.get(rev) if rev else {}
-                cur = cur_obj if isinstance(cur_obj, dict) else {}
-                commit = cur.get("commit") or {}
-                msg = str(commit.get("message") or "")
-
-                # If no commit message from revisions, try messages field
-                if not msg:
-                    messages = c.get("messages", [])
-                    if (
-                        messages
-                        and isinstance(messages, list)
-                        and len(messages) > 0
-                    ):
-                        # Use the last message (most recent commit)
-                        last_msg = messages[-1] if messages else {}
-                        msg = (
-                            str(last_msg.get("message", ""))
-                            if isinstance(last_msg, dict)
-                            else ""
+                if change_github_hash == expected_github_hash:
+                    num = c.get("_number")
+                    proj = str(c.get("project") or gerrit_project or "")
+                    if isinstance(num, int):
+                        trailer_matches.append((num, proj))
+                        log.debug(
+                            "Found GitHub-Hash trailer match: change %d, "
+                            "hash %s",
+                            num,
+                            change_github_hash,
                         )
 
-                if msg:
-                    github_metadata = extract_github_metadata(msg)
-                    change_github_hash = github_metadata.get("GitHub-Hash", "")
+        if trailer_matches:
+            log.debug(
+                "Found %d change(s) with matching GitHub-Hash trailer - "
+                "treating as update targets",
+                len(trailer_matches),
+            )
+            return True
+        return False
 
-                    if change_github_hash == expected_github_hash:
-                        num = c.get("_number")
-                        proj = str(c.get("project") or gerrit_project or "")
-                        if isinstance(num, int):
-                            trailer_matches.append((num, proj))
-                            log.debug(
-                                "Found GitHub-Hash trailer match: change %d, "
-                                "hash %s",
-                                num,
-                                change_github_hash,
-                            )
-
-            if trailer_matches:
-                log.debug(
-                    "Found %d change(s) with matching GitHub-Hash trailer - "
-                    "treating as update targets",
-                    len(trailer_matches),
-                )
-                # These are update targets, not duplicates - allow them to
-                # proceed
-                return
-
-        # Compare normalized subjects for exact equality
+    def _find_exact_subject_matches(
+        self,
+        changes: list[dict[str, object]],
+        normalized_pr_subject: str,
+        gerrit_project: str,
+    ) -> list[tuple[int, str]]:
+        """Return changes whose normalized subject equals the PR subject."""
         matched: list[tuple[int, str]] = []
         for c in changes:
             subj = str(c.get("subject") or "").strip()
             if not subj:
                 continue
-            if _normalize_subject(subj) == normalized_pr_subject:
+            if _normalize_duplicate_subject(subj) == normalized_pr_subject:
                 num = c.get("_number")
                 proj = str(c.get("project") or gerrit_project or "")
                 if isinstance(num, int):
                     matched.append((num, proj))
+        return matched
 
-        if not matched:
-            # No exact subject match; proceed with similarity scoring across
-            # candidates
-            log.debug(
-                "No exact-subject matches found; entering similarity scoring"
-            )
-            from .similarity import ScoringConfig
-            from .similarity import aggregate_scores
-            from .similarity import remove_commit_trailers
-            from .similarity import score_bodies
-            from .similarity import score_files
-            from .similarity import score_subjects
+    def _check_similarity_matches(
+        self,
+        *,
+        target_pr: GhPullRequest,
+        changes: list[dict[str, object]],
+        gerrit_host: str,
+        gerrit_project: str,
+        successful_base_path: str,
+        allow_duplicates: bool,
+    ) -> bool:
+        """Score candidates by similarity when no exact subject match exists.
 
-            config = ScoringConfig()
-            # Source features from the PR
-            src_subjects = [pr_title]
-            src_body = str(getattr(target_pr, "body", "") or "")
-            src_files: list[str] = []
-            try:
-                get_files = getattr(target_pr, "get_files", None)
-                if callable(get_files):
-                    files_obj = get_files()
-                    if isinstance(files_obj, Iterable):
-                        for f in files_obj:
-                            fname = getattr(f, "filename", None)
-                            if fname:
-                                src_files.append(str(fname))
-            except Exception as exc:
-                # Best-effort; if files cannot be retrieved, proceed without
-                # them
-                log.debug("Failed to retrieve PR files for scoring: %s", exc)
+        Returns ``True`` when a duplicate was detected and allowed (the
+        caller should return); raises :class:`DuplicateChangeError` when a
+        duplicate is detected and not allowed; returns ``False`` when no
+        similar change was found.
+        """
+        # No exact subject match; proceed with similarity scoring across
+        # candidates
+        log.debug("No exact-subject matches found; entering similarity scoring")
+        from .similarity import ScoringConfig
 
-            best_score = 0.0
-            best_reasons: list[str] = []
-            hits: list[tuple[float, str, int | None]] = []
-            all_nums: list[int] = []
-            for c in changes:
-                subj = str(c.get("subject") or "").strip()
-                if not subj:
-                    continue
-                # Extract commit message and files from revisions
-                # (CURRENT_COMMIT, CURRENT_FILES)
-                # Get subject and body from commit message
-                subj = str(c.get("subject") or "")
+        config = ScoringConfig()
+        # Source features from the PR
+        pr_title = (getattr(target_pr, "title", "") or "").strip()
+        similarity_inputs = _SimilarityInputs(
+            src_subjects=[pr_title],
+            src_body=str(getattr(target_pr, "body", "") or ""),
+            src_files=self._extract_pr_files(target_pr),
+            config=config,
+            gerrit_host=gerrit_host,
+            gerrit_project=gerrit_project,
+            successful_base_path=successful_base_path,
+        )
 
-                # Try to get commit message from revisions first
-                rev = str(c.get("current_revision") or "")
-                revs_obj = c.get("revisions")
-                revs = revs_obj if isinstance(revs_obj, dict) else {}
-                cur_obj = revs.get(rev) if rev else {}
-                cur = cur_obj if isinstance(cur_obj, dict) else {}
-                commit = cur.get("commit") or {}
-                msg = str(commit.get("message") or "")
+        best_score = 0.0
+        best_reasons: list[str] = []
+        hits: list[tuple[float, str, int | None]] = []
+        all_nums: list[int] = []
+        for c in changes:
+            score = self._score_candidate(c, similarity_inputs)
+            if score is None:
+                continue
+            # Track best (for reasons)
+            if score.agg > best_score:
+                best_score = score.agg
+                best_reasons = score.reasons
+            if score.is_hit:
+                hits.append((score.agg, score.ref, score.num))
+                if isinstance(score.num, int):
+                    all_nums.append(score.num)
 
-                # If no commit message from revisions, try messages field
-                if not msg:
-                    messages = c.get("messages", [])
-                    if (
-                        messages
-                        and isinstance(messages, list)
-                        and len(messages) > 0
-                    ):
-                        # Use the last message (most recent commit)
-                        last_msg = messages[-1] if messages else {}
-                        msg = (
-                            str(last_msg.get("message", ""))
-                            if isinstance(last_msg, dict)
-                            else ""
-                        )
-
-                cand_body_raw = ""
-                if "\n" in msg:
-                    cand_body_raw = msg.split("\n", 1)[1]
-                cand_body = remove_commit_trailers(cand_body_raw)
-
-                # Try to get files from current revision, fallback to files
-                # field
-                files_dict = cur.get("files") or {}
-                if not files_dict:
-                    # Some Gerrit versions may not populate revisions.files
-                    # For now, we'll have empty files which gives 0 file score
-                    pass
-
-                cand_files = [
-                    p
-                    for p in files_dict
-                    if isinstance(p, str) and not p.startswith("/")
-                ]
-
-                # Compute component scores
-                s_res = score_subjects(src_subjects, subj)
-                f_res = score_files(
-                    src_files,
-                    cand_files,
-                    workflow_min_floor=config.workflow_min_floor,
-                )
-                b_res = score_bodies(src_body, cand_body)
-
-                # Aggregate
-                agg = aggregate_scores(
-                    s_res.score, f_res.score, b_res.score, config=config
-                )
-                log.debug(
-                    "Aggregate score computed: %.2f (s=%.2f f=%.2f b=%.2f)",
-                    agg,
-                    s_res.score,
-                    f_res.score,
-                    b_res.score,
-                )
-
-                # Build candidate reference and number using successful base
-                # path
-                num_obj = c.get("_number")
-                num = int(num_obj) if isinstance(num_obj, int) else None
-                proj = str(c.get("project") or gerrit_project or "")
-
-                # Use the base path that actually worked for API calls
-                display_url_builder = create_gerrit_url_builder(
-                    gerrit_host, successful_base_path
-                )
-                ref = (
-                    display_url_builder.change_url(proj, num)
-                    if proj and isinstance(num, int)
-                    else (f"change {num}" if isinstance(num, int) else "")
-                )
-                log.debug(
-                    "Scoring candidate: ref=%s agg=%.2f (s=%.2f f=%.2f b=%.2f) "
-                    "subj='%s'",
-                    ref or "(none)",
-                    agg,
-                    s_res.score,
-                    f_res.score,
-                    b_res.score,
-                    subj[:200],
-                )
-
-                # Track best (for reasons)
-                if agg > best_score:
-                    best_score = agg
-                    # Deduplicate reasons preserving order
-                    best_reasons = list(
-                        dict.fromkeys(
-                            s_res.reasons + f_res.reasons + b_res.reasons
-                        )
-                    )
-
-                # Special handling for perfect dependency package matches
-                is_perfect_dependency_match = (
-                    s_res.score == 1.0
-                    and len(s_res.reasons) > 0
-                    and any(
-                        "Same dependency package:" in reason
-                        for reason in s_res.reasons
-                    )
-                )
-
-                # Collect candidates above threshold OR perfect dependency
-                # matches
-                dependency_threshold = (
-                    0.45  # Lower threshold for perfect dependency matches
-                )
-                effective_threshold = (
-                    dependency_threshold
-                    if is_perfect_dependency_match
-                    else config.similarity_threshold
-                )
-
-                if agg >= effective_threshold and ref:
-                    hits.append((agg, ref, num))
-                    if isinstance(num, int):
-                        all_nums.append(num)
-
-                    if (
-                        is_perfect_dependency_match
-                        and agg < config.similarity_threshold
-                    ):
-                        log.debug(
-                            "Perfect dependency match found below normal "
-                            "threshold: score=%.2f (threshold=%.2f, "
-                            "dependency_threshold=%.2f)",
-                            agg,
-                            config.similarity_threshold,
-                            dependency_threshold,
-                        )
-
-            log.debug(
-                "Similarity scoring found %d hit(s) (threshold=%.2f)",
-                len(hits),
+        log.debug(
+            "Similarity scoring found %d hit(s) (threshold=%.2f)",
+            len(hits),
+            config.similarity_threshold,
+        )
+        if hits:
+            return self._report_similarity_hits(
+                hits,
+                best_reasons,
+                all_nums,
                 config.similarity_threshold,
+                allow_duplicates,
             )
-            if hits:
-                hits_sorted = sorted(hits, key=lambda t: t[0], reverse=True)
+        return False
 
-                for s, u, _ in hits_sorted:
-                    if u:
-                        log.debug("Score: %.2f  URL: %s", s, u)
-                        safe_console_print(f"🔀 Duplicate change: {u}")
-                msg = (
-                    f"Similar Gerrit change(s) detected "
-                    f"[≥ {config.similarity_threshold:.2f}]"
-                )
-                if best_reasons:
-                    msg += f" (Reasons: {', '.join(best_reasons)})"
-                if allow_duplicates:
-                    log.warning("GERRIT DUPLICATE DETECTED (allowed): %s", msg)
-                    return
-                raise DuplicateChangeError(msg, all_nums)
+    def _score_candidate(
+        self, c: dict[str, object], si: _SimilarityInputs
+    ) -> _CandidateScore | None:
+        """Score a single Gerrit change candidate against the PR features.
 
+        Returns ``None`` for candidates without a usable subject; otherwise
+        a :class:`_CandidateScore` describing the aggregate score, display
+        reference and whether it qualifies as a similarity hit.
+        """
+        from .similarity import aggregate_scores
+        from .similarity import remove_commit_trailers
+        from .similarity import score_bodies
+        from .similarity import score_files
+        from .similarity import score_subjects
+
+        subj = str(c.get("subject") or "").strip()
+        if not subj:
+            return None
+        subj = str(c.get("subject") or "")
+        cur = self._get_current_revision(c)
+        msg = self._extract_commit_message(c)
+
+        cand_body_raw = ""
+        if "\n" in msg:
+            cand_body_raw = msg.split("\n", 1)[1]
+        cand_body = remove_commit_trailers(cand_body_raw)
+        cand_files = self._extract_candidate_files(cur)
+
+        # Compute component scores
+        s_res = score_subjects(si.src_subjects, subj)
+        f_res = score_files(
+            si.src_files,
+            cand_files,
+            workflow_min_floor=si.config.workflow_min_floor,
+        )
+        b_res = score_bodies(si.src_body, cand_body)
+
+        # Aggregate
+        agg = aggregate_scores(
+            s_res.score, f_res.score, b_res.score, config=si.config
+        )
+        log.debug(
+            "Aggregate score computed: %.2f (s=%.2f f=%.2f b=%.2f)",
+            agg,
+            s_res.score,
+            f_res.score,
+            b_res.score,
+        )
+
+        # Build candidate reference and number using successful base path
+        num_obj = c.get("_number")
+        num = int(num_obj) if isinstance(num_obj, int) else None
+        proj = str(c.get("project") or si.gerrit_project or "")
+        ref = self._build_candidate_ref(
+            si.gerrit_host, si.successful_base_path, proj, num
+        )
+        log.debug(
+            "Scoring candidate: ref=%s agg=%.2f (s=%.2f f=%.2f b=%.2f) "
+            "subj='%s'",
+            ref or "(none)",
+            agg,
+            s_res.score,
+            f_res.score,
+            b_res.score,
+            subj[:200],
+        )
+
+        # Deduplicate reasons preserving order
+        reasons = list(
+            dict.fromkeys(s_res.reasons + f_res.reasons + b_res.reasons)
+        )
+
+        # Special handling for perfect dependency package matches
+        is_perfect_dependency_match = (
+            s_res.score == 1.0
+            and len(s_res.reasons) > 0
+            and any(
+                "Same dependency package:" in reason for reason in s_res.reasons
+            )
+        )
+
+        # Collect candidates above threshold OR perfect dependency matches
+        dependency_threshold = 0.45  # Lower threshold for perfect dep matches
+        effective_threshold = (
+            dependency_threshold
+            if is_perfect_dependency_match
+            else si.config.similarity_threshold
+        )
+        is_hit = agg >= effective_threshold and bool(ref)
+        if (
+            is_hit
+            and is_perfect_dependency_match
+            and agg < si.config.similarity_threshold
+        ):
+            log.debug(
+                "Perfect dependency match found below normal "
+                "threshold: score=%.2f (threshold=%.2f, "
+                "dependency_threshold=%.2f)",
+                agg,
+                si.config.similarity_threshold,
+                dependency_threshold,
+            )
+
+        return _CandidateScore(
+            agg=agg, ref=ref, num=num, reasons=reasons, is_hit=is_hit
+        )
+
+    def _report_similarity_hits(
+        self,
+        hits: list[tuple[float, str, int | None]],
+        best_reasons: list[str],
+        all_nums: list[int],
+        similarity_threshold: float,
+        allow_duplicates: bool,
+    ) -> bool:
+        """Log/announce similarity hits and warn or raise as configured.
+
+        Returns ``True`` when duplicates are allowed (caller should return);
+        raises :class:`DuplicateChangeError` otherwise.
+        """
+        hits_sorted = sorted(hits, key=lambda t: t[0], reverse=True)
+
+        for s, u, _ in hits_sorted:
+            if u:
+                log.debug("Score: %.2f  URL: %s", s, u)
+                safe_console_print(f"🔀 Duplicate change: {u}")
+        msg = (
+            f"Similar Gerrit change(s) detected [≥ {similarity_threshold:.2f}]"
+        )
+        if best_reasons:
+            msg += f" (Reasons: {', '.join(best_reasons)})"
+        if allow_duplicates:
+            log.warning("GERRIT DUPLICATE DETECTED (allowed): %s", msg)
+            return True
+        raise DuplicateChangeError(msg, all_nums)
+
+    def _handle_exact_matches(
+        self,
+        matched: list[tuple[int, str]],
+        gerrit_host: str,
+        successful_base_path: str,
+        allow_duplicates: bool,
+    ) -> None:
+        """Announce exact subject matches and warn or raise as configured."""
         # Construct human-friendly references for logs
         matching_numbers: list[int] = []
         match_lines: list[str] = []
