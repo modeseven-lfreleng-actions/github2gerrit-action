@@ -323,7 +323,7 @@ def fetch_gitreview_raw(
 
         try:
             log.debug("Fetching .gitreview via raw URL: %s", url)
-            with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
                 text = resp.read().decode("utf-8")
             info = parse_gitreview(text)
             if info:
@@ -493,7 +493,7 @@ def make_gitreview_info(
     port: int = DEFAULT_GERRIT_PORT,
     project: str = "",
     *,
-    base_path: str | None | object = _BASE_PATH_UNSET,
+    base_path: str | object | None = _BASE_PATH_UNSET,
 ) -> GitReviewInfo:
     """Construct a :class:`GitReviewInfo` from explicit parameters.
 
