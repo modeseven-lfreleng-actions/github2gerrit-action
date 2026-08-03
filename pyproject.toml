@@ -139,6 +139,11 @@ ignore = [
 "sitecustomize.py" = ["S110", "SIM103", "SIM105", "PLW2901"]
 "src/github2gerrit/duplicate_detection.py" = ["S310"]
 "src/github2gerrit/gerrit_rest.py" = ["S310", "TRY301"]
+# S310 audits urlopen for non-HTTP schemes such as file:. This module
+# builds the URL from a literal https://raw.githubusercontent.com/ prefix
+# and passes it through _validate_raw_url, which requires scheme https and
+# host raw.githubusercontent.com before the fetch runs.
+"src/github2gerrit/gitreview.py" = ["S310"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["github2gerrit"]
