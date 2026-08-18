@@ -24,6 +24,7 @@ import pytest
 from typer.testing import CliRunner
 
 from github2gerrit.cli import app
+from github2gerrit.error_codes import ExitCode
 from github2gerrit.netrc import NetrcCredentials
 
 
@@ -31,6 +32,19 @@ from github2gerrit.netrc import NetrcCredentials
 def runner():
     """Create a CLI test runner."""
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_netrc_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop netrc environment variables leaking between tests.
+
+    ``cli._apply_netrc_options`` writes the resolved netrc options back
+    into ``os.environ``, and those same variables back the CLI options
+    through ``envvar=``. Without this isolation one test's options become
+    the next test's defaults.
+    """
+    for var in ("G2G_NO_NETRC", "G2G_NETRC_FILE", "G2G_NETRC_OPTIONAL"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture
@@ -138,15 +152,21 @@ class TestNoNetrcOption:
         )
 
         # get_credentials_for_host should not be called when --no-netrc is set
-        # Note: This assertion may need adjustment based on implementation
-        assert "Error" not in result.output or result.exit_code == 0
+        assert result.exit_code == 0
+        mock_get_creds.assert_not_called()
 
 
 class TestNetrcRequiredOption:
     """Tests for --netrc-required option."""
 
-    def test_netrc_required_fails_when_missing(self, runner, empty_netrc_dir):
+    def test_netrc_required_fails_when_missing(
+        self, runner, empty_netrc_dir, monkeypatch
+    ):
         """Test that --netrc-required fails when no .netrc file exists."""
+        # Point both search locations (cwd and home) at a directory with
+        # no .netrc so the lookup is deterministic on developer machines.
+        monkeypatch.chdir(empty_netrc_dir)
+
         result = runner.invoke(
             app,
             [
@@ -158,13 +178,8 @@ class TestNetrcRequiredOption:
             env={"HOME": str(empty_netrc_dir)},
         )
 
-        # Should fail because --netrc-required and no .netrc found
-        # The exact behavior depends on implementation
-        if result.exit_code != 0:
-            assert True  # Expected failure
-        else:
-            # May succeed if credentials come from other sources
-            pass
+        assert result.exit_code == int(ExitCode.CONFIGURATION_ERROR)
+        assert "No .netrc file found" in result.output
 
     @patch("github2gerrit.cli._process")
     def test_netrc_required_succeeds_when_present(

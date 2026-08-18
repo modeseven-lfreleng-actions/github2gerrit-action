@@ -280,8 +280,12 @@ def test_ssh_cleanup_handles_missing_files_gracefully(tmp_path: Path) -> None:
     # Should not raise an exception
     orch._cleanup_ssh()
 
-    # Assert: no errors occurred (test passes if no exception raised)
-    assert True
+    # Assert: the orchestrator stays in its unconfigured state and the
+    # workspace is untouched, so a later _setup_ssh starts from scratch.
+    assert orch._ssh_temp_dir is None
+    assert orch._ssh_agent_manager is None
+    assert orch._use_ssh_agent is False
+    assert workspace.exists()
 
 
 def test_ssh_setup_preserves_existing_user_config(
