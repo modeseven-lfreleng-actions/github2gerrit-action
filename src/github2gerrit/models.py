@@ -144,3 +144,27 @@ class GitHubContext:
         return action_map.get(action, PROperationMode.UNKNOWN)
 
     pr_number: int | None
+
+    head_repo: str = ""
+    """Full ``owner/repo`` name of the pull request head repository.
+
+    Empty when unknown (for example outside a pull request context).
+    """
+
+    @property
+    def is_fork_pr(self) -> bool:
+        """Return ``True`` when the PR head lives in a different repository.
+
+        Fork pull requests are untrusted: their tree is authored by
+        someone without write access to the base repository.  Content
+        read out of that tree must never influence where the resulting
+        change is pushed.
+
+        Returns ``False`` when either repository name is unknown, so an
+        absent signal never *weakens* handling of a same-repo PR.  The
+        caller is responsible for treating unknown provenance
+        conservatively where that matters.
+        """
+        if not self.head_repo or not self.repository:
+            return False
+        return self.head_repo.strip().lower() != self.repository.strip().lower()

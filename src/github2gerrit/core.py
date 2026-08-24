@@ -2772,10 +2772,29 @@ class Orchestrator:
           host=<hostname>
           port=<port>
           project=<repo/path>.git
+
+        For fork pull requests the local file is ignored entirely and
+        resolution is pinned to the base repository's base branch.  The
+        workspace tree comes from ``refs/pull/<N>/head``, so a fork
+        could otherwise redirect the push to a different Gerrit project
+        simply by editing ``.gitreview``.  The base repository's copy is
+        equally authoritative and not attacker-controlled, so this costs
+        no accuracy — unlike falling back to heuristics, which guess the
+        project name incorrectly for repositories such as ``of-config``.
         """
         from .gitreview import parse_gitreview
 
-        if path.exists():
+        untrusted_tree = gh is not None and gh.is_fork_pr
+
+        if untrusted_tree:
+            log.info(
+                "Fork pull request (head %s, base %s): ignoring "
+                ".gitreview from the PR tree and resolving against the "
+                "base repository",
+                gh.head_repo if gh else "",
+                gh.repository if gh else "",
+            )
+        elif path.exists():
             # Read file with explicit error handling so IO failures
             # produce a distinct message from malformed content.
             try:
@@ -2795,7 +2814,8 @@ class Orchestrator:
             msg = "invalid .gitreview: missing host/project"
             raise OrchestratorError(msg)
 
-        log.info(".gitreview not found locally; attempting remote fetch")
+        if not untrusted_tree:
+            log.info(".gitreview not found locally; attempting remote fetch")
 
         repo_obj: Any | None = None
         try:
@@ -2804,7 +2824,12 @@ class Orchestrator:
         except Exception as exc:
             log.debug("Could not build GitHub client for API fetch: %s", exc)
 
-        api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
+        # For fork PRs the head ref names a branch in the *fork*, so it
+        # must not steer lookups against the base repository.
+        if untrusted_tree:
+            api_ref = (gh.base_ref if gh else "") or None
+        else:
+            api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
 
         # Collect branch names for the raw URL fallback
         branches: list[str] = []
@@ -2825,7 +2850,7 @@ class Orchestrator:
                 api_base = str(
                     getattr(getattr(pr_obj, "base", object()), "ref", "") or ""
                 )
-                if api_head:
+                if api_head and not untrusted_tree:
                     branches.append(api_head)
                 if api_base:
                     branches.append(api_base)
@@ -2834,7 +2859,7 @@ class Orchestrator:
                 "Could not resolve PR refs via API for .gitreview: %s",
                 exc_api,
             )
-        if gh and gh.head_ref:
+        if gh and gh.head_ref and not untrusted_tree:
             branches.append(gh.head_ref)
         if gh and gh.base_ref:
             branches.append(gh.base_ref)
@@ -2849,6 +2874,9 @@ class Orchestrator:
             api_ref=api_ref,
             repo_full=repo_full,
             branches=branches,
+            # GITHUB_HEAD_REF names a branch in the fork; consulting it
+            # would reintroduce fork-controlled input.
+            include_env_refs=not untrusted_tree,
         )
         if info:
             if not info.project:

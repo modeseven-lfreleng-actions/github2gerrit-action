@@ -1429,6 +1429,19 @@ def _finish_bulk_no_prs(
     return True  # Success (no failures because no work)
 
 
+def _head_repo_for_pr(pr: Any) -> str:
+    """Return the ``owner/repo`` of a PyGithub pull request's head.
+
+    Used in bulk mode, where each pull request carries its own
+    provenance rather than inheriting it from the triggering event.
+    Returns an empty string when unavailable.
+    """
+    head = getattr(pr, "head", None)
+    repo = getattr(head, "repo", None)
+    full_name = getattr(repo, "full_name", "")
+    return str(full_name or "").strip()
+
+
 def _build_bulk_pr_tasks(
     gh: GitHubContext, prs_list: list[Any]
 ) -> list[tuple[Any, models.GitHubContext]]:
@@ -1451,6 +1464,7 @@ def _build_bulk_pr_tasks(
             base_ref=gh.base_ref,
             head_ref=gh.head_ref,
             pr_number=pr_number,
+            head_repo=_head_repo_for_pr(pr),
         )
         pr_tasks.append((pr, per_ctx))
     return pr_tasks
@@ -3019,6 +3033,31 @@ def _extract_pr_number(evt: dict[str, Any]) -> int | None:
     return None
 
 
+def _read_head_repo(evt: dict[str, Any]) -> str:
+    """Return the ``owner/repo`` of the pull request head repository.
+
+    Prefers the ``PR_HEAD_REPO`` environment variable supplied by the
+    composite action, falling back to the raw event payload so the CLI
+    behaves identically when invoked outside that wrapper.
+
+    Returns an empty string when the provenance cannot be established.
+    """
+    env_value = os.getenv("PR_HEAD_REPO", "").strip()
+    if env_value:
+        return env_value
+
+    pr = evt.get("pull_request")
+    if isinstance(pr, dict):
+        head = pr.get("head")
+        if isinstance(head, dict):
+            repo = head.get("repo")
+            if isinstance(repo, dict):
+                full_name = repo.get("full_name")
+                if isinstance(full_name, str):
+                    return full_name.strip()
+    return ""
+
+
 def _read_github_context() -> GitHubContext:
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     event_action = ""
@@ -3037,6 +3076,7 @@ def _read_github_context() -> GitHubContext:
 
     base_ref = os.getenv("GITHUB_BASE_REF", "")
     head_ref = os.getenv("GITHUB_HEAD_REF", "")
+    head_repo = _read_head_repo(evt)
 
     pr_number = _extract_pr_number(evt)
     if pr_number is None:
@@ -3056,6 +3096,7 @@ def _read_github_context() -> GitHubContext:
         base_ref=base_ref,
         head_ref=head_ref,
         pr_number=pr_number,
+        head_repo=head_repo,
     )
     return ctx
 

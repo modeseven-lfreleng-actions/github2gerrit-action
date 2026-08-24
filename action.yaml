@@ -375,6 +375,11 @@ runs:
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_BASE_REF: ${{ github.base_ref }}
         GITHUB_HEAD_REF: ${{ github.head_ref }}
+        # Full owner/repo of the PR head. Differs from GITHUB_REPOSITORY
+        # for fork pull requests, whose tree must not influence Gerrit
+        # target resolution.
+        # yamllint disable-line rule:line-length
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         GITHUB_ACTOR: ${{ github.actor }}
         SYNC_ALL_OPEN_PRS: ${{ steps.extract.outputs.sync_all }}
         PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
