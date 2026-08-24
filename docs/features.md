@@ -16,6 +16,7 @@ action in detail. For a quick start and the full inputs table, see the
 - [Closing Merged PRs](#closing-merged-prs)
 - [Automatic Cleanup](#automatic-cleanup)
 - [Restricting PRs to Automation Tools](#restricting-prs-to-automation-tools)
+- [Fork Pull Requests](#fork-pull-requests)
 - [Duplicate Detection](#duplicate-detection)
 - [Commit Message Normalization](#commit-message-normalization)
 - [Change-ID Reconciliation](#change-id-reconciliation)
@@ -283,6 +284,74 @@ Set `AUTOMATION_ONLY: "false"` to accept PRs from all users:
     AUTOMATION_ONLY: "false"
     GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
 ```
+
+## Fork Pull Requests
+
+A pull request raised from a fork carries a tree that someone without write
+access to the base repository wrote. The tool treats that tree as untrusted
+input.
+
+### No runner checkout for pull requests
+
+The action does not check the target repository out into the runner workspace
+for pull request events. It fetches `refs/pull/<N>/head` into a private
+temporary directory instead. That ref lives on the base repository and resolves
+fork pull request heads, so the tool never contacts the fork directly.
+
+This sidesteps the `pull_request_target` checkout restriction that
+`actions/checkout` enforces, and keeps fork content out of the working
+directory, where the tool might otherwise read it as configuration.
+
+Push events still check the repository out. Those runs reconcile merged Gerrit
+changes back to their GitHub pull requests, which reads commit trailers from
+the working directory. A push carries no fork content, so the checkout is safe
+there.
+
+### Gerrit target resolution
+
+For fork pull requests the tool ignores any `.gitreview` in the pull request
+tree and resolves against the **base repository** instead. A fork could
+otherwise redirect the push to a different Gerrit project simply by editing
+`.gitreview`.
+
+The tool applies the same treatment when it cannot establish where the pull
+request head lives. Specific-PR `workflow_dispatch` runs and direct URL
+invocations carry no pull request payload, and GitHub reports a null head
+repository for a deleted fork. The tool resolves provenance through the API
+where it can, and treats whatever remains unresolved as untrusted, so a missing
+signal never earns a fork unwarranted trust.
+
+Resolution order for a fork pull request:
+
+1. `.gitreview` from the base repository at the pull request's base branch,
+   via the GitHub API or `raw.githubusercontent.com`
+2. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT` inputs
+3. Per-organization configuration file
+4. Derivation from the organization name (`gerrit.[org].org`)
+
+The lookup stops at the base branch. It does not fall back to the repository
+default branch, and it does not read `.gitreview` through the API without an
+authoritative base ref, because either would answer for a branch the pull
+request does not target — and `.gitreview` outranks the explicit inputs.
+
+The base repository's copy carries the same authority and lies outside an
+attacker's reach, so this costs no accuracy. Skipping straight to derivation
+would instead guess the Gerrit project name, and that guess goes wrong for
+repositories whose name contains a hyphen that does not mark a path separator.
+
+For the same reason, the tool drops branch names that originate in the fork
+(`GITHUB_HEAD_REF` and the pull request head ref) from base-repository
+lookups. Duplicate detection, which resolves `.gitreview` independently and
+earlier, applies the same rule.
+
+Same-repository pull requests keep their previous behaviour and still read
+`.gitreview` from the pull request tree.
+
+### Approval gating
+
+The tool does not yet require a maintainer approval before it transfers a fork
+pull request to Gerrit. Until it does, use `AUTOMATION_ONLY` (see above) to
+control which pull requests the tool accepts.
 
 ## Duplicate Detection
 

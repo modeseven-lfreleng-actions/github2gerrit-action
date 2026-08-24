@@ -14,7 +14,28 @@ from enum import Enum
 from pathlib import Path
 
 
-__all__ = ["GitHubContext", "Inputs", "PROperationMode"]
+__all__ = [
+    "GitHubContext",
+    "Inputs",
+    "PROperationMode",
+    "head_repo_is_trusted",
+]
+
+
+def head_repo_is_trusted(repository: str, head_repo: str) -> bool:
+    """Return ``True`` only when a PR head is known to be in-repo.
+
+    The single definition of the trust rule, shared by
+    :attr:`GitHubContext.head_is_trusted` and by the configuration
+    layer, which resolves provenance from the environment before any
+    :class:`GitHubContext` exists.
+
+    Unresolved provenance answers ``False``: a missing signal must never
+    grant a fork the standing of a same-repository branch.
+    """
+    if not repository.strip() or not head_repo.strip():
+        return False
+    return head_repo.strip().lower() == repository.strip().lower()
 
 
 class PROperationMode(Enum):
@@ -144,3 +165,42 @@ class GitHubContext:
         return action_map.get(action, PROperationMode.UNKNOWN)
 
     pr_number: int | None
+
+    head_repo: str = ""
+    """Full ``owner/repo`` name of the pull request head repository.
+
+    Empty when unknown (for example outside a pull request context).
+    """
+
+    @property
+    def is_fork_pr(self) -> bool:
+        """Return ``True`` when the PR head lives in a different repository.
+
+        Fork pull requests are untrusted: their tree is authored by
+        someone without write access to the base repository.  Content
+        read out of that tree must never influence where the resulting
+        change is pushed.
+
+        Returns ``False`` when either repository name is unknown, so an
+        absent signal never *weakens* handling of a same-repo PR.  The
+        caller is responsible for treating unknown provenance
+        conservatively where that matters.
+        """
+        if not self.head_repo or not self.repository:
+            return False
+        return self.head_repo.strip().lower() != self.repository.strip().lower()
+
+    @property
+    def head_is_trusted(self) -> bool:
+        """Return ``True`` only when the PR head is known to be in-repo.
+
+        This is the *trust* question, deliberately distinct from
+        :attr:`is_fork_pr`, which is the factual one.  Unresolved
+        provenance answers ``False`` here so that a missing signal never
+        grants a fork the standing of a same-repository branch.
+
+        Content taken from the pull request tree, and any ref name the
+        head supplies, must be gated on this rather than on
+        ``not is_fork_pr``.
+        """
+        return head_repo_is_trusted(self.repository, self.head_repo)

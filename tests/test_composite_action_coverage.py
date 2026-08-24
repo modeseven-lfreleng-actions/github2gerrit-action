@@ -365,6 +365,7 @@ class TestEnvironmentMapping:
             "GITHUB_SHA",
             "GITHUB_BASE_REF",
             "GITHUB_HEAD_REF",
+            "PR_HEAD_REPO",
         ]
 
         for var in github_vars:
@@ -460,23 +461,31 @@ class TestStepDependencies:
 
         assert python_idx < install_idx
 
-    def test_checkout_before_cli(self, action_tester):
-        """Test repository checkout happens before CLI execution."""
+    def test_checkout_restricted_to_push_events(self, action_tester):
+        """No checkout may place pull request head content in the runner.
+
+        The tool provisions its own workspace for pull requests, so a
+        checkout is redundant there and blocks fork pull requests under
+        ``pull_request_target``.  Push runs still check out because
+        merged-PR reconciliation reads commit trailers locally.
+        """
         steps = action_tester.action_config["runs"]["steps"]
-        step_names = [step.get("name", "") for step in steps]
 
-        checkout_idx = next(
-            i
-            for i, name in enumerate(step_names)
-            if "Checkout repository" in name
-        )
-        cli_idx = next(
-            i
-            for i, name in enumerate(step_names)
-            if "Run github2gerrit Python CLI" in name
-        )
+        checkout_steps = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
 
-        assert checkout_idx < cli_idx
+        # The push checkout is required, so assert presence before
+        # asserting properties; otherwise the loop passes vacuously.
+        assert len(checkout_steps) == 1
+
+        for step in checkout_steps:
+            assert "github.event_name == 'push'" in str(step.get("if", ""))
+            assert "pull_request" not in str(
+                step.get("with", {}).get("ref", "")
+            )
 
     def test_cli_before_output_capture(self, action_tester):
         """Test CLI execution happens before output capture."""
@@ -749,7 +758,7 @@ class TestFullWorkflow:
             s for s in steps if "shell" in s and s["shell"] == "bash"
         ]
 
-        assert len(action_steps) >= 3  # Python, UV, Checkout
+        assert len(action_steps) >= 2  # Python, uv
         assert len(shell_steps) >= 4  # Various validation and processing steps
 
     @pytest.mark.integration
@@ -761,7 +770,6 @@ class TestFullWorkflow:
         required_steps = [
             "Setup Python",
             "Setup uv",
-            "Checkout repository",
             "Setup github2gerrit",
             "Run github2gerrit Python CLI",
             "Capture outputs",

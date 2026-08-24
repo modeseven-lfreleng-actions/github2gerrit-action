@@ -2757,57 +2757,49 @@ class Orchestrator:
             raise OrchestratorError(_MSG_MISSING_PR_CONTEXT)
         log.debug("PR context OK: #%s", gh.pr_number)
 
-    def _read_gitreview(
-        self,
-        path: Path,
-        gh: GitHubContext | None = None,
-    ) -> GerritInfo | None:
-        """Read .gitreview and return GerritInfo if present.
+    @staticmethod
+    def _pr_head_is_trusted(gh: GitHubContext | None) -> bool:
+        """Return ``True`` only when the PR head is known to be in-repo."""
+        return gh is not None and gh.head_is_trusted
 
-        Delegates to the shared :mod:`github2gerrit.gitreview` module
-        which consolidates parsing, local reads, GitHub API fetches,
-        and raw.githubusercontent.com fallbacks in a single place.
+    @staticmethod
+    def _parse_local_gitreview(path: Path) -> GerritInfo:
+        """Read and parse a workspace ``.gitreview``.
 
-        Expected keys:
-          host=<hostname>
-          port=<port>
-          project=<repo/path>.git
+        IO failures and malformed content raise distinct messages so a
+        permissions problem is not mistaken for a bad file.
         """
         from .gitreview import parse_gitreview
 
-        if path.exists():
-            # Read file with explicit error handling so IO failures
-            # produce a distinct message from malformed content.
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                msg = f"failed to read .gitreview at {path}: {exc}"
-                raise OrchestratorError(msg) from exc
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            msg = f"failed to read .gitreview at {path}: {exc}"
+            raise OrchestratorError(msg) from exc
 
-            info_local = parse_gitreview(text)
-            if info_local:
-                if not info_local.project:
-                    msg = "invalid .gitreview: missing host/project"
-                    raise OrchestratorError(msg)
-                log.debug("Parsed .gitreview: %s", info_local)
-                return info_local
-            # File exists and is readable but is malformed
+        info_local = parse_gitreview(text)
+        if not info_local or not info_local.project:
             msg = "invalid .gitreview: missing host/project"
             raise OrchestratorError(msg)
 
-        log.info(".gitreview not found locally; attempting remote fetch")
+        log.debug("Parsed .gitreview: %s", info_local)
+        return info_local
 
-        repo_obj: Any | None = None
-        try:
-            client = build_client()
-            repo_obj = get_repo_from_env(client)
-        except Exception as exc:
-            log.debug("Could not build GitHub client for API fetch: %s", exc)
+    def _gitreview_branch_candidates(
+        self,
+        gh: GitHubContext | None,
+        repo_obj: Any | None,
+        *,
+        untrusted_tree: bool,
+    ) -> list[str]:
+        """Build branch candidates for the raw-URL ``.gitreview`` lookup.
 
-        api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
-
-        # Collect branch names for the raw URL fallback
+        Head-side refs are omitted for an untrusted tree: the fork picks
+        its own branch name, and one matching a real base-repository
+        branch would steer the lookup to another project.
+        """
         branches: list[str] = []
+
         # Prefer PR head/base refs via GitHub API when running from a
         # direct URL and a token is available
         try:
@@ -2825,7 +2817,7 @@ class Orchestrator:
                 api_base = str(
                     getattr(getattr(pr_obj, "base", object()), "ref", "") or ""
                 )
-                if api_head:
+                if api_head and not untrusted_tree:
                     branches.append(api_head)
                 if api_base:
                     branches.append(api_base)
@@ -2834,10 +2826,46 @@ class Orchestrator:
                 "Could not resolve PR refs via API for .gitreview: %s",
                 exc_api,
             )
-        if gh and gh.head_ref:
+
+        if gh and gh.head_ref and not untrusted_tree:
             branches.append(gh.head_ref)
         if gh and gh.base_ref:
             branches.append(gh.base_ref)
+        return branches
+
+    def _fetch_remote_gitreview(
+        self,
+        gh: GitHubContext | None,
+        *,
+        untrusted_tree: bool,
+    ) -> GerritInfo | None:
+        """Resolve ``.gitreview`` from the base repository.
+
+        For an untrusted tree the lookup is pinned to the base ref.
+        Both the API default-branch read and the ``master``/``main`` raw
+        candidates are declined, because either would answer for a
+        branch the pull request does not target — and that answer
+        outranks explicit inputs in :meth:`_resolve_gerrit_info`.
+        """
+        repo_obj: Any | None = None
+        try:
+            client = build_client()
+            repo_obj = get_repo_from_env(client)
+        except Exception as exc:
+            log.debug("Could not build GitHub client for API fetch: %s", exc)
+
+        if untrusted_tree:
+            api_ref = (gh.base_ref if gh else "") or None
+            if api_ref is None:
+                # get_contents(ref=None) reads the default branch, which
+                # would silently answer a question we cannot answer.
+                log.info(
+                    "No authoritative base ref for an untrusted tree; "
+                    "skipping the .gitreview API lookup"
+                )
+                repo_obj = None
+        else:
+            api_ref = os.getenv("GITHUB_HEAD_REF") or os.getenv("GITHUB_SHA")
 
         repo_full = (
             (gh.repository if gh else os.getenv("GITHUB_REPOSITORY", "")) or ""
@@ -2848,13 +2876,68 @@ class Orchestrator:
             repo_obj=repo_obj,
             api_ref=api_ref,
             repo_full=repo_full,
-            branches=branches,
+            branches=self._gitreview_branch_candidates(
+                gh, repo_obj, untrusted_tree=untrusted_tree
+            ),
+            # GITHUB_HEAD_REF names a branch in the fork; consulting it
+            # would reintroduce fork-controlled input.
+            include_env_refs=not untrusted_tree,
+            default_branches=() if untrusted_tree else ("master", "main"),
         )
+        if info and not info.project:
+            log.warning("Remote .gitreview missing project field; ignoring")
+            return None
+        return info
+
+    def _read_gitreview(
+        self,
+        path: Path,
+        gh: GitHubContext | None = None,
+    ) -> GerritInfo | None:
+        """Read .gitreview and return GerritInfo if present.
+
+        Delegates to the shared :mod:`github2gerrit.gitreview` module
+        which consolidates parsing, local reads, GitHub API fetches,
+        and raw.githubusercontent.com fallbacks in a single place.
+
+        Expected keys:
+          host=<hostname>
+          port=<port>
+          project=<repo/path>.git
+
+        For pull requests the local file is ignored unless the head is
+        known to live in the base repository, and resolution is pinned
+        to the base repository's base branch.  The workspace tree comes
+        from ``refs/pull/<N>/head``, so a fork could otherwise redirect
+        the push to a different Gerrit project simply by editing
+        ``.gitreview``.  Unresolved provenance counts as untrusted: a
+        missing signal must never buy a fork unwarranted trust.  The
+        base repository's copy is equally authoritative and not
+        attacker-controlled, so this costs no accuracy — unlike falling
+        back to heuristics, which guess the project name incorrectly for
+        repositories such as ``of-config``.
+        """
+        # No context at all means direct operation on a local checkout,
+        # where the caller owns the tree and the file is theirs to trust.
+        in_pr_context = gh is not None and bool(gh.pr_number)
+        untrusted_tree = in_pr_context and not self._pr_head_is_trusted(gh)
+
+        if untrusted_tree:
+            log.info(
+                "Untrusted pull request tree (head %s, base %s): ignoring "
+                ".gitreview from the PR tree and resolving against the "
+                "base repository",
+                (gh.head_repo if gh else "") or "<unknown>",
+                gh.repository if gh else "",
+            )
+        elif path.exists():
+            return self._parse_local_gitreview(path)
+        else:
+            log.info(".gitreview not found locally; attempting remote fetch")
+
+        info = self._fetch_remote_gitreview(gh, untrusted_tree=untrusted_tree)
         if info:
-            if not info.project:
-                log.warning("Remote .gitreview missing project field; ignoring")
-            else:
-                return info
+            return info
 
         log.info("Remote .gitreview not available via API or HTTP")
         log.info("Falling back to inputs/env")

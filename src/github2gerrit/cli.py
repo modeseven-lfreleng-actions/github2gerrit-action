@@ -961,7 +961,11 @@ def main(
         10,
         "--fetch-depth",
         envvar="FETCH_DEPTH",
-        help="Fetch depth for checkout.",
+        help=(
+            "Git history depth. Also the git log window for merged-PR "
+            "reconciliation, so lowering it narrows how far back a "
+            "merged change is matched."
+        ),
     ),
     gerrit_known_hosts: str = typer.Option(
         "",
@@ -1429,6 +1433,25 @@ def _finish_bulk_no_prs(
     return True  # Success (no failures because no work)
 
 
+def _head_repo_for_pr(pr: Any) -> str:
+    """Return the ``owner/repo`` of a PyGithub pull request's head.
+
+    Used in bulk mode, where each pull request carries its own
+    provenance rather than inheriting it from the triggering event.
+    Returns an empty string when unavailable.
+    """
+    head = getattr(pr, "head", None)
+    repo = getattr(head, "repo", None)
+    full_name = getattr(repo, "full_name", "")
+    return str(full_name or "").strip()
+
+
+def _ref_for_pr(pr: Any, side: str) -> str:
+    """Return ``pr.<side>.ref`` as a string, or empty when unavailable."""
+    end = getattr(pr, side, None)
+    return str(getattr(end, "ref", "") or "").strip()
+
+
 def _build_bulk_pr_tasks(
     gh: GitHubContext, prs_list: list[Any]
 ) -> list[tuple[Any, models.GitHubContext]]:
@@ -1439,6 +1462,10 @@ def _build_bulk_pr_tasks(
         if pr_number <= 0:
             continue
 
+        # Bulk runs are triggered by workflow_dispatch or a repository
+        # URL, so the outer context carries no PR refs. Take each pull
+        # request's own refs so .gitreview resolves against the branch
+        # the PR actually targets.
         per_ctx = models.GitHubContext(
             event_name=gh.event_name,
             event_action=gh.event_action,
@@ -1448,9 +1475,10 @@ def _build_bulk_pr_tasks(
             server_url=gh.server_url,
             run_id=gh.run_id,
             sha=gh.sha,
-            base_ref=gh.base_ref,
-            head_ref=gh.head_ref,
+            base_ref=_ref_for_pr(pr, "base") or gh.base_ref,
+            head_ref=_ref_for_pr(pr, "head") or gh.head_ref,
             pr_number=pr_number,
+            head_repo=_head_repo_for_pr(pr),
         )
         pr_tasks.append((pr, per_ctx))
     return pr_tasks
@@ -2154,40 +2182,51 @@ def _load_effective_inputs() -> Inputs:
 
 
 def _augment_pr_refs_if_needed(gh: GitHubContext) -> GitHubContext:
-    # When a target URL was provided via CLI, G2G_TARGET_URL contains
-    # the actual URL string. We use a truthy check (non-empty string is truthy)
-    # to detect when running in direct URL mode vs GitHub Actions CI mode.
-    if (
-        os.getenv("G2G_TARGET_URL")
-        and gh.pr_number
-        and (not gh.head_ref or not gh.base_ref)
-    ):
-        try:
-            client = build_client()
-            repo = get_repo_from_env(client)
-            pr_obj = get_pull(repo, int(gh.pr_number))
-            base_ref = str(
-                getattr(getattr(pr_obj, "base", object()), "ref", "") or ""
-            )
-            head_ref = str(
-                getattr(getattr(pr_obj, "head", object()), "ref", "") or ""
-            )
-            head_sha = str(
-                getattr(getattr(pr_obj, "head", object()), "sha", "") or ""
-            )
-            if base_ref:
-                os.environ["GITHUB_BASE_REF"] = base_ref
-                log.debug("Resolved base_ref via GitHub API: %s", base_ref)
-            if head_ref:
-                os.environ["GITHUB_HEAD_REF"] = head_ref
-                log.debug("Resolved head_ref via GitHub API: %s", head_ref)
-            if head_sha:
-                os.environ["GITHUB_SHA"] = head_sha
-                log.debug("Resolved head sha via GitHub API: %s", head_sha)
-            return _read_github_context()
-        except Exception as exc:
-            log.debug("Could not resolve PR refs via GitHub API: %s", exc)
-    return gh
+    """Fill in PR refs and provenance that the event context lacks.
+
+    Direct URL invocations and specific-PR ``workflow_dispatch`` runs
+    carry no pull request payload, so ``base_ref``, ``head_ref`` and
+    ``head_repo`` all arrive empty.  Provenance in particular must not
+    stay unknown: ``_read_gitreview`` treats an unresolved head
+    repository as untrusted, so leaving it blank needlessly forfeits the
+    PR tree's own ``.gitreview`` on same-repository pull requests.
+    """
+    needs_refs = not gh.head_ref or not gh.base_ref
+    needs_provenance = not gh.head_repo
+    if not gh.pr_number or not (needs_refs or needs_provenance):
+        return gh
+
+    # Deliberately not gated on event name. Pull request events populate
+    # both refs and provenance from the payload and so return above;
+    # anything still missing them here (workflow_dispatch, issue_comment,
+    # direct URL) needs the API regardless of how it was triggered.
+    try:
+        client = build_client()
+        repo = get_repo_from_env(client)
+        pr_obj = get_pull(repo, int(gh.pr_number))
+        base_ref = _ref_for_pr(pr_obj, "base")
+        head_ref = _ref_for_pr(pr_obj, "head")
+        head_repo = _head_repo_for_pr(pr_obj)
+        head_sha = str(
+            getattr(getattr(pr_obj, "head", object()), "sha", "") or ""
+        )
+        if base_ref:
+            os.environ["GITHUB_BASE_REF"] = base_ref
+            log.debug("Resolved base_ref via GitHub API: %s", base_ref)
+        if head_ref:
+            os.environ["GITHUB_HEAD_REF"] = head_ref
+            log.debug("Resolved head_ref via GitHub API: %s", head_ref)
+        if head_repo:
+            os.environ["PR_HEAD_REPO"] = head_repo
+            log.debug("Resolved head repository via GitHub API: %s", head_repo)
+        if head_sha:
+            os.environ["GITHUB_SHA"] = head_sha
+            log.debug("Resolved head sha via GitHub API: %s", head_sha)
+    except Exception as exc:
+        log.debug("Could not resolve PR refs via GitHub API: %s", exc)
+        return gh
+    else:
+        return _read_github_context()
 
 
 def _process_close_gerrit_change(
@@ -3019,6 +3058,31 @@ def _extract_pr_number(evt: dict[str, Any]) -> int | None:
     return None
 
 
+def _read_head_repo(evt: dict[str, Any]) -> str:
+    """Return the ``owner/repo`` of the pull request head repository.
+
+    Prefers the ``PR_HEAD_REPO`` environment variable supplied by the
+    composite action, falling back to the raw event payload so the CLI
+    behaves identically when invoked outside that wrapper.
+
+    Returns an empty string when the provenance cannot be established.
+    """
+    env_value = os.getenv("PR_HEAD_REPO", "").strip()
+    if env_value:
+        return env_value
+
+    pr = evt.get("pull_request")
+    if isinstance(pr, dict):
+        head = pr.get("head")
+        if isinstance(head, dict):
+            repo = head.get("repo")
+            if isinstance(repo, dict):
+                full_name = repo.get("full_name")
+                if isinstance(full_name, str):
+                    return full_name.strip()
+    return ""
+
+
 def _read_github_context() -> GitHubContext:
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     event_action = ""
@@ -3037,6 +3101,7 @@ def _read_github_context() -> GitHubContext:
 
     base_ref = os.getenv("GITHUB_BASE_REF", "")
     head_ref = os.getenv("GITHUB_HEAD_REF", "")
+    head_repo = _read_head_repo(evt)
 
     pr_number = _extract_pr_number(evt)
     if pr_number is None:
@@ -3056,6 +3121,7 @@ def _read_github_context() -> GitHubContext:
         base_ref=base_ref,
         head_ref=head_ref,
         pr_number=pr_number,
+        head_repo=head_repo,
     )
     return ctx
 

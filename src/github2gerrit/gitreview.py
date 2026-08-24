@@ -458,6 +458,10 @@ def read_gitreview_host(
     repository: str | None = None,
     *,
     local_path: Path | None = None,
+    branches: Sequence[str] = (),
+    include_env_refs: bool = True,
+    default_branches: Sequence[str] = ("master", "main"),
+    skip_local: bool = False,
 ) -> str | None:
     """Return just the Gerrit **host** from ``.gitreview``.
 
@@ -470,6 +474,14 @@ def read_gitreview_host(
             (optional).  Falls back to ``GITHUB_REPOSITORY`` env var.
         local_path: Explicit path to a local ``.gitreview``.  When
             ``None`` (the default), ``Path(".gitreview")`` is used.
+        branches: Explicit branch candidates for the raw URL strategy.
+        include_env_refs: Consult ``GITHUB_HEAD_REF`` /
+            ``GITHUB_BASE_REF``.  Callers handling an untrusted pull
+            request must pass ``False``: ``GITHUB_HEAD_REF`` names a
+            branch the fork chose.
+        default_branches: Fallback branch names.  Pass ``()`` to pin the
+            lookup to *branches* alone.
+        skip_local: Skip the local file read entirely.
 
     Returns:
         The ``host`` string, or ``None`` if unavailable.
@@ -478,7 +490,11 @@ def read_gitreview_host(
 
     info = fetch_gitreview(
         local_path=local_path or Path(".gitreview"),
+        skip_local=skip_local,
         repo_full=repo_full,
+        branches=branches,
+        include_env_refs=include_env_refs,
+        default_branches=default_branches,
     )
     return info.host if info else None
 

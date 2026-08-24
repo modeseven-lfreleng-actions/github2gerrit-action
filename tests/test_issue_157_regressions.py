@@ -200,13 +200,21 @@ class TestReadGitreviewHostRemote:
         assert result is None
 
     @patch("github2gerrit.gitreview.urllib.request.urlopen")
-    def test_prefers_github_head_ref_over_master(
+    def test_ignores_github_head_ref(
         self,
         mock_urlopen: MagicMock,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """GITHUB_HEAD_REF is tried before master/main branches."""
+        """GITHUB_HEAD_REF must not steer the lookup.
+
+        A fork chooses its own branch name. If that name matches a real
+        branch in the base repository, honouring it here would select
+        that branch's Gerrit host. The head ref is therefore never
+        consulted; issue 157's need to find ``.gitreview`` on the right
+        branch is served by GITHUB_BASE_REF, which the fork does not
+        control.
+        """
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
         monkeypatch.setenv("GITHUB_HEAD_REF", "feature/my-branch")
@@ -223,42 +231,38 @@ class TestReadGitreviewHostRemote:
         result = _read_gitreview_host("example/repo")
         assert result == "gerrit.example.org"
 
-        # Verify the first URL tried uses the head ref, not master
-        first_call_url = mock_urlopen.call_args_list[0][0][0]
-        assert "feature/my-branch" in first_call_url
+        urls = [call[0][0] for call in mock_urlopen.call_args_list]
+        assert not any("feature/my-branch" in url for url in urls)
+        # Falls through to the default branches instead.
+        assert "master" in urls[0]
 
     @patch("github2gerrit.gitreview.urllib.request.urlopen")
-    def test_tries_base_ref_after_head_ref(
+    def test_prefers_base_ref_over_master(
         self,
         mock_urlopen: MagicMock,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """GITHUB_BASE_REF is tried after GITHUB_HEAD_REF."""
+        """GITHUB_BASE_REF is tried before the default branches."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
         monkeypatch.setenv("GITHUB_HEAD_REF", "feature/branch")
         monkeypatch.setenv("GITHUB_BASE_REF", "develop")
 
-        # First call (head ref) fails, second call (base ref) succeeds
         mock_response = MagicMock()
         mock_response.read.return_value = (
             b"[gerrit]\nhost=gerrit.dev.org\nport=29418\nproject=test.git\n"
         )
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.side_effect = [
-            OSError("Not found"),
-            mock_response,
-        ]
+        mock_urlopen.return_value = mock_response
 
         result = _read_gitreview_host("example/repo")
         assert result == "gerrit.dev.org"
 
-        # Verify both refs were tried in order
         urls = [call[0][0] for call in mock_urlopen.call_args_list]
-        assert "feature/branch" in urls[0]
-        assert "develop" in urls[1]
+        assert "develop" in urls[0]
+        assert not any("feature/branch" in url for url in urls)
 
 
 # ---------------------------------------------------------------------------

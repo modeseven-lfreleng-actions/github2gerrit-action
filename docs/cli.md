@@ -84,7 +84,7 @@ set by GitHub Actions) and undergo proper boolean parsing.
 | `--preserve-github-prs/--no-preserve-github-prs` | `PRESERVE_GITHUB_PRS`   | `true`  | Do not close GitHub PRs after pushing to Gerrit                                |
 | `--close-merged-prs/--no-close-merged-prs`       | `CLOSE_MERGED_PRS`      | `true`  | Close GitHub PRs when corresponding Gerrit changes merge                       |
 | `--force`                                        | `FORCE`                 | `false` | Force PR closure regardless of Gerrit change status (abandoned, etc.)          |
-| `--fetch-depth INTEGER`                          | `FETCH_DEPTH`           | `10`    | Fetch depth for checkout                                                       |
+| `--fetch-depth INTEGER`                          | `FETCH_DEPTH`           | `10`    | Git history depth: PR fetch, push checkout, reconciliation window              |
 | `--reviewers-email TEXT`                         | `REVIEWERS_EMAIL`       | `""`    | Email address(es) of reviewers (comma-separated)                               |
 | `--organization TEXT`                            | `ORGANIZATION`          | unset   | Organization (defaults to `GITHUB_REPOSITORY_OWNER` when unset)                |
 | `--github-actor TEXT`                            | `GITHUB_ACTOR`          | `""`    | GitHub actor (username) who triggered the workflow                             |

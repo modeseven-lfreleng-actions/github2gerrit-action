@@ -203,6 +203,35 @@ def disable_github_ci_mode(
 
 
 @pytest.fixture(autouse=True)
+def reset_gerrit_base_path_cache() -> Iterable[None]:
+    """Clear the process-wide Gerrit base-path cache around every test.
+
+    ⚠️  IMPORTANT: autouse=True is REQUIRED for test suite stability
+
+    ``gerrit_urls._BASE_PATH_CACHE`` is a module-level dict keyed by
+    host.  Tests that exercise base-path discovery populate it for
+    ``gerrit.example.org`` — the fixture host used by roughly twenty
+    test modules — and nothing reset it between tests.  Any later test
+    building a URL for that host then received an unexpected ``/r/``
+    segment, typically surfacing in
+    ``test_query_gerrit_results_success_base_path``.
+
+    The leak is order-dependent, so whether it bites depends on which
+    modules run first.  Adding, removing or renaming test files can
+    expose it without any change to the code under test, which makes it
+    hard to attribute when it does appear.
+
+    Clearing on both sides of the test keeps a dirty cache from reaching
+    a test and stops one leaving a cache behind.
+    """
+    from github2gerrit import gerrit_urls
+
+    gerrit_urls._BASE_PATH_CACHE.clear()
+    yield
+    gerrit_urls._BASE_PATH_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def isolate_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Isolate git environment for each test to prevent cross-test contamination.
