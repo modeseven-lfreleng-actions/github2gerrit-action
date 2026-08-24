@@ -51,7 +51,10 @@ on:
         default: false
         type: boolean
       FETCH_DEPTH:
-        description: "fetch-depth for the clone. (Default: 10)"
+        description: >-
+          Git history depth. Also the git log window for merged-PR
+          reconciliation, so lowering it narrows how far back a merged
+          change is matched. (Default: 10)
         required: false
         default: "10"
         type: string
@@ -284,6 +287,26 @@ jobs:
       gerrit_commit_sha: ${{ steps.g2g.outputs.gerrit_commit_sha }}
       # yamllint enable rule:line-length
     steps:
+      # Seed the workspace root with the target repository on pushes,
+      # before the action is placed at .g2g-action below.
+      #
+      # Ordering is load-bearing. actions/checkout deletes the entire
+      # contents of its target directory when that directory is not
+      # already a git repository, and it does so regardless of `clean`.
+      # Checking the target out first makes the root a repository, so
+      # the composite action's own push checkout later finds a valid
+      # repo and leaves .g2g-action alone.
+      #
+      # Pull request runs need no checkout at all: the tool fetches
+      # refs/pull/<N>/head into its own temporary directory.
+      - name: Checkout target repository (push events)
+        if: ${{ github.event_name == 'push' }}
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.FETCH_DEPTH }}
+          persist-credentials: false
+
       # Resolve the repository that provides this reusable workflow so
       # the bundled action ships from the exact same commit; the
       # workflow and action interfaces then never drift apart.

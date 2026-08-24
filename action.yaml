@@ -20,8 +20,10 @@ inputs:
     default: "false"
   FETCH_DEPTH:
     description: >-
-      Depth of the git history fetched when building the Gerrit commit.
-      Applied to the tool's own fetch of refs/pull/<N>/head
+      Depth of git history fetched. Applied to the tool's own fetch of
+      refs/pull/<N>/head, to the push-event checkout, and as the git log
+      window used to find merged commits during PR reconciliation, so
+      raising it widens how far back a merged change is matched
     required: false
     default: "10"
   PR_NUMBER:
@@ -205,6 +207,33 @@ runs:
         else
           echo "disabled=false" >> "$GITHUB_OUTPUT"
         fi
+
+    - name: "Checkout repository (push events)"
+      # Push runs reconcile merged Gerrit changes back to their GitHub
+      # PRs, which reads commit trailers with a local `git show` in the
+      # working directory. Pull request runs need no checkout: the tool
+      # fetches refs/pull/<N>/head into its own temporary directory, and
+      # checking a fork head out here would both fail under
+      # pull_request_target and expose a fork-controlled .gitreview.
+      if: >-
+        steps.disabled-check.outputs.disabled != 'true'
+        && github.event_name == 'push'
+      # yamllint disable-line rule:line-length
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        fetch-depth: ${{ inputs.FETCH_DEPTH }}
+        # The action authenticates to Gerrit over SSH and to GitHub via
+        # an explicit GITHUB_TOKEN env var, so the checkout token does
+        # not need to be persisted into the local git config.
+        persist-credentials: false
+        # Callers may place files in the workspace that this action
+        # depends on. The bundled reusable workflow checks the action
+        # itself out to .g2g-action and then runs it from there, so a
+        # cleaning checkout would delete the action mid-run. That
+        # workflow also seeds the workspace root with the target
+        # repository first, because actions/checkout wipes a directory
+        # that is not already a git repository whatever `clean` says.
+        clean: false
 
     - name: "Setup Python"
       if: steps.disabled-check.outputs.disabled != 'true'

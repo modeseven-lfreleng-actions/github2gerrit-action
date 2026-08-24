@@ -245,17 +245,28 @@ class DuplicateDetector:
         if not repo_full:
             return None
 
-        # Collect branch hints from the GitHub context
+        # Collect branch hints from the GitHub context. A fork may name
+        # its branch after one that exists in the base repository, so an
+        # untrusted head ref could steer this lookup to another project
+        # and have a legitimate change rejected against it.
+        trusted_head = gh.head_is_trusted
         branches: list[str] = []
-        if gh.head_ref:
+        if gh.head_ref and trusted_head:
             branches.append(gh.head_ref)
         if gh.base_ref:
             branches.append(gh.base_ref)
+
+        # For an untrusted head, pin the lookup to the base ref rather
+        # than letting it fall back to master/main: the default branch
+        # may map to a different Gerrit project than the one the PR
+        # targets, which would query the wrong project for duplicates.
+        default_branches = ("master", "main") if trusted_head else ()
 
         info = fetch_gitreview_raw(
             repo_full,
             branches=branches,
             include_env_refs=False,  # caller supplies refs explicitly
+            default_branches=default_branches,
         )
         if info:
             return (info.host, info.project)

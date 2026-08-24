@@ -34,6 +34,87 @@ def action_config():
         return yaml.safe_load(f)
 
 
+@pytest.fixture
+def reusable_workflow():
+    """Load the bundled reusable workflow."""
+    path = (
+        Path(__file__).parent.parent
+        / ".github"
+        / "workflows"
+        / "github2gerrit.yaml"
+    )
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+class TestReusableWorkflowCheckoutOrder:
+    """The seed checkout in the reusable workflow is load-bearing.
+
+    ``actions/checkout`` deletes the entire contents of its target
+    directory when that directory is not already a git repository,
+    regardless of ``clean``.  Seeding the workspace root with the target
+    repository first makes it a repository, so the composite action's
+    own push checkout finds a valid repo and leaves ``.g2g-action``
+    alone.  Moving or removing this step breaks push runs.
+    """
+
+    def _steps(self, reusable_workflow):
+        return reusable_workflow["jobs"]["github2gerrit"]["steps"]
+
+    def _index(self, steps, predicate):
+        return next(
+            (i for i, step in enumerate(steps) if predicate(step)),
+            -1,
+        )
+
+    def test_seed_checkout_precedes_action_checkout(self, reusable_workflow):
+        steps = self._steps(reusable_workflow)
+
+        seed_idx = self._index(
+            steps,
+            lambda s: (
+                str(s.get("uses", "")).startswith("actions/checkout@")
+                and "path" not in s.get("with", {})
+            ),
+        )
+        action_idx = self._index(
+            steps,
+            lambda s: s.get("with", {}).get("path") == ".g2g-action",
+        )
+        invoke_idx = self._index(
+            steps, lambda s: str(s.get("uses", "")) == "./.g2g-action"
+        )
+
+        assert seed_idx != -1, (
+            "the reusable workflow must seed the workspace root with the "
+            "target repository on push events"
+        )
+        assert action_idx != -1
+        assert invoke_idx != -1
+        assert seed_idx < action_idx, (
+            "the seed checkout must precede the .g2g-action checkout, or "
+            "the composite checkout will delete the action mid-run"
+        )
+        assert action_idx < invoke_idx
+
+    def test_seed_checkout_is_push_gated(self, reusable_workflow):
+        """Pull request runs must not check a fork head into the runner."""
+        steps = self._steps(reusable_workflow)
+
+        seed = steps[
+            self._index(
+                steps,
+                lambda s: (
+                    str(s.get("uses", "")).startswith("actions/checkout@")
+                    and "path" not in s.get("with", {})
+                ),
+            )
+        ]
+
+        assert "github.event_name == 'push'" in str(seed.get("if", ""))
+        assert "pull_request" not in str(seed.get("with", {}).get("ref", ""))
+
+
 class TestActionStepValidation:
     """Test action step validation and execution flow."""
 
@@ -47,6 +128,9 @@ class TestActionStepValidation:
             ("Setup Python", "Setup uv"),
             ("Setup Python", "Setup github2gerrit"),
             ("Setup uv", "Setup github2gerrit"),
+            # Push reconciliation reads commit trailers from the working
+            # directory, so the checkout must precede the CLI.
+            ("Checkout repository (push events)", "Run github2gerrit"),
             ("Setup github2gerrit", "Run github2gerrit Python CLI"),
             ("Run github2gerrit Python CLI", "Capture outputs"),
         ]
@@ -180,15 +264,19 @@ class TestActionStepValidation:
         assert uv_step is not None
         assert uv_step["uses"].startswith("astral-sh/setup-uv@")
 
-    def test_no_repository_checkout_step(self, action_config):
-        """The action must not check the target repository into the runner.
+    def test_repository_checkout_restricted_to_push(self, action_config):
+        """No checkout may place pull request head content in the runner.
 
         The tool fetches ``refs/pull/<N>/head`` into a private temporary
-        directory itself, so a runner-level checkout is redundant.  It is
-        also actively harmful: under ``pull_request_target`` a checkout of
-        a fork PR head is refused by ``actions/checkout``, and any file it
-        leaves in the working directory (notably ``.gitreview``) becomes
-        fork-controlled input to Gerrit target resolution.
+        directory itself, so a runner-level checkout is redundant for
+        pull requests.  It is also actively harmful: under
+        ``pull_request_target`` a checkout of a fork PR head is refused
+        by ``actions/checkout``, and any file it leaves in the working
+        directory (notably ``.gitreview``) becomes fork-controlled input
+        to Gerrit target resolution.
+
+        Push runs still check out, because merged-PR reconciliation
+        reads commit trailers from the working directory.
         """
         steps = action_config["runs"]["steps"]
 
@@ -198,10 +286,35 @@ class TestActionStepValidation:
             if str(step.get("uses", "")).startswith("actions/checkout@")
         ]
 
-        assert checkout_steps == [], (
-            "action.yaml must not check out the target repository; "
+        # Push reconciliation reads commit trailers from the working
+        # directory, so the push checkout is required, not merely
+        # tolerated. Assert presence first so the loop below cannot pass
+        # vacuously if the step is ever removed.
+        assert len(checkout_steps) == 1, (
+            "expected exactly one checkout step (push events); "
             f"found: {[s.get('name') for s in checkout_steps]}"
         )
+
+        for step in checkout_steps:
+            condition = str(step.get("if", ""))
+            assert "github.event_name == 'push'" in condition, (
+                f"checkout step {step.get('name')!r} must be gated to "
+                "push events"
+            )
+
+            ref = str(step.get("with", {}).get("ref", ""))
+            assert "pull_request" not in ref, (
+                f"checkout step {step.get('name')!r} must not check out "
+                "pull request head content"
+            )
+
+            # The reusable workflow places this action at .g2g-action
+            # before invoking it. A cleaning checkout would delete it
+            # mid-run, which is what SKIP_CHECKOUT used to guard.
+            assert step.get("with", {}).get("clean") is False, (
+                f"checkout step {step.get('name')!r} must set clean: false "
+                "so it cannot delete caller-placed workspace content"
+            )
 
     def test_dependency_installation_step(self, action_config):
         """Test dependency installation step."""

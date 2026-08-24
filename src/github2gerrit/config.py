@@ -520,9 +520,26 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
     Delegates to the shared :mod:`github2gerrit.gitreview` module which
     consolidates all ``.gitreview`` parsing and fetching logic.
 
-    Checks the local workspace first (available after actions/checkout),
-    then falls back to fetching via raw.githubusercontent.com when a
-    GITHUB_REPOSITORY is set.
+    This runs during parameter derivation, before the pull request
+    context is read, so provenance comes from ``PR_HEAD_REPO`` as the
+    composite action exports it.
+
+    ``GITHUB_HEAD_REF`` is consulted only when the head is known to live
+    in the base repository.  A fork chooses its own branch name, and one
+    matching a real base-repository branch would otherwise select that
+    branch's host.  Keeping the head ref for a *trusted* head matters
+    too: :meth:`Orchestrator._read_gitreview` reads the head tree in
+    that case, and dropping it here would let derivation record one host
+    while the pipeline pushes to another.
+
+    Provenance that cannot be established counts as untrusted, so the
+    absent-signal case falls back to the base ref alone.
+
+    The local working-directory file is still read.  This layer cannot
+    tell a pull request the *tool* is processing from one the *workflow*
+    merely runs inside, so any attempt to skip it here also breaks
+    legitimate local reads.  See issue #386: the fix belongs with the
+    wider question of tracking where a configuration value came from.
 
     Args:
         repository: GitHub repository in owner/repo format (optional).
@@ -532,8 +549,26 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
         The host string from .gitreview, or None if unavailable.
     """
     from .gitreview import read_gitreview_host
+    from .models import head_repo_is_trusted
 
-    return read_gitreview_host(repository)
+    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    head_repo = os.getenv("PR_HEAD_REPO", "").strip()
+    trusted_head = head_repo_is_trusted(repo_full, head_repo)
+
+    branches: list[str] = []
+    if trusted_head:
+        head_ref = os.getenv("GITHUB_HEAD_REF", "").strip()
+        if head_ref:
+            branches.append(head_ref)
+    base_ref = os.getenv("GITHUB_BASE_REF", "").strip()
+    if base_ref:
+        branches.append(base_ref)
+
+    return read_gitreview_host(
+        repository,
+        branches=tuple(branches),
+        include_env_refs=False,
+    )
 
 
 def derive_gerrit_parameters(

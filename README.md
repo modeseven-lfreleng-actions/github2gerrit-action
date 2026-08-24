@@ -189,7 +189,7 @@ uvx github2gerrit https://github.com/onap/portal-ng-bff/pull/33
 | `GERRIT_HTTP_PASSWORD`      | No       | `""`             | Gerrit HTTP password/token for REST queries                    |
 | `ORGANIZATION`              | No       | repository owner | GitHub organization/owner used for credential derivation       |
 | `PR_NUMBER`                 | No       | `"0"`            | PR number to process; `0` processes all open PRs (dispatch)    |
-| `FETCH_DEPTH`               | No       | `"10"`           | Depth of git history fetched for the PR                        |
+| `FETCH_DEPTH`               | No       | `"10"`           | Git history depth: PR fetch, push checkout, reconciliation     |
 | `SUBMIT_SINGLE_COMMITS`     | No       | `"false"`        | Submit one commit at a time to Gerrit                          |
 | `USE_PR_AS_COMMIT`          | No       | `"false"`        | Use PR title and body as the commit message                    |
 | `PRESERVE_GITHUB_PRS`       | No       | `"true"`         | Do not close GitHub PRs after pushing to Gerrit                |
@@ -266,7 +266,7 @@ Input defaults match the composite action defaults.
 | `G2G_USE_SSH_AGENT`         | boolean | `true`           | Use SSH agent instead of file-based keys         |
 | `ORGANIZATION`              | string  | repository owner | GitHub organization/owner                        |
 | `PR_NUMBER`                 | string  | `"0"`            | PR to process on dispatch; `0` processes all     |
-| `FETCH_DEPTH`               | string  | `"10"`           | Depth of git history fetched for the PR          |
+| `FETCH_DEPTH`               | string  | `"10"`           | Git depth: PR, push, reconciliation              |
 | `SUBMIT_SINGLE_COMMITS`     | boolean | `false`          | Submit one commit at a time                      |
 | `USE_PR_AS_COMMIT`          | boolean | `false`          | Use PR title and body as the commit message      |
 | `PRESERVE_GITHUB_PRS`       | boolean | `true`           | Do not close GitHub PRs after pushing            |

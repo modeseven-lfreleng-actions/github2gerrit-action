@@ -10,16 +10,23 @@ the push to an arbitrary Gerrit project.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 
+from github2gerrit import config
+from github2gerrit.cli import _augment_pr_refs_if_needed
+from github2gerrit.cli import _build_bulk_pr_tasks
 from github2gerrit.cli import _head_repo_for_pr
 from github2gerrit.cli import _read_head_repo
+from github2gerrit.cli import _ref_for_pr
 from github2gerrit.core import Orchestrator
+from github2gerrit.duplicate_detection import DuplicateDetector
 from github2gerrit.gitreview import GitReviewInfo
 from github2gerrit.models import GitHubContext
 
@@ -76,6 +83,69 @@ class TestIsForkPr:
     def test_unknown_base_repo_is_not_a_fork(self) -> None:
         ctx = _gh_ctx(repository="", head_repo=FORK_REPO)
         assert ctx.is_fork_pr is False
+
+
+class TestHeadIsTrusted:
+    """Trust is stricter than the factual fork question."""
+
+    def test_same_repo_head_is_trusted(self) -> None:
+        assert _gh_ctx(head_repo=BASE_REPO).head_is_trusted is True
+
+    def test_fork_head_is_not_trusted(self) -> None:
+        assert _gh_ctx(head_repo=FORK_REPO).head_is_trusted is False
+
+    def test_unknown_provenance_is_not_trusted(self) -> None:
+        # is_fork_pr says False, but that must not imply trust.
+        ctx = _gh_ctx(head_repo="")
+        assert ctx.is_fork_pr is False
+        assert ctx.head_is_trusted is False
+
+
+class TestDuplicateDetectionBranchHints:
+    """Duplicate detection runs before the pipeline resolver."""
+
+    def _resolve(self, gh: GitHubContext) -> dict[str, Any]:
+        detector = DuplicateDetector(repo=cast("Any", object()))
+        captured: dict[str, Any] = {}
+
+        def _fake_fetch(repo_full: str, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            return None
+
+        with patch(
+            "github2gerrit.gitreview.fetch_gitreview_raw",
+            side_effect=_fake_fetch,
+        ):
+            detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+        return captured
+
+    def test_fork_head_ref_excluded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fork may name its branch after one in the base repository."""
+        monkeypatch.delenv("GERRIT_SERVER", raising=False)
+        monkeypatch.delenv("GERRIT_PROJECT", raising=False)
+
+        kwargs = self._resolve(
+            _gh_ctx(head_repo=FORK_REPO, head_ref="stable/scandium")
+        )
+
+        assert kwargs["branches"] == ["master"]
+        # Defaults would query the default branch's Gerrit project.
+        assert kwargs["default_branches"] == ()
+
+    def test_trusted_head_ref_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GERRIT_SERVER", raising=False)
+        monkeypatch.delenv("GERRIT_PROJECT", raising=False)
+
+        kwargs = self._resolve(
+            _gh_ctx(head_repo=BASE_REPO, head_ref="topic/fix")
+        )
+
+        assert kwargs["branches"] == ["topic/fix", "master"]
+        assert kwargs["default_branches"] == ("master", "main")
 
 
 class TestReadGitreviewForkIsolation:
@@ -139,6 +209,35 @@ class TestReadGitreviewForkIsolation:
         assert "evil-branch" not in kwargs["branches"]
         assert kwargs["include_env_refs"] is False
         assert kwargs["repo_full"] == BASE_REPO
+        # master/main defaults would answer for the default branch,
+        # which may map to a different Gerrit project than the base.
+        assert kwargs["default_branches"] == ()
+
+    def test_fork_without_base_ref_skips_api_lookup(
+        self, tmp_path: Path
+    ) -> None:
+        """``get_contents(ref=None)`` would read the default branch."""
+        repo = init_repo(tmp_path / "norefs", default_branch="master")
+        write_gitreview(
+            repo,
+            host="gerrit.evil.example",
+            port=29418,
+            project="attacker/target",
+        )
+        orch = Orchestrator(workspace=repo.path)
+
+        with patch(
+            "github2gerrit.core.fetch_gitreview", return_value=None
+        ) as mock_fetch:
+            orch._read_gitreview(
+                repo.path / ".gitreview",
+                _gh_ctx(head_repo=FORK_REPO, base_ref=""),
+            )
+
+        kwargs = mock_fetch.call_args.kwargs
+        assert kwargs["api_ref"] is None
+        assert kwargs["repo_obj"] is None
+        assert kwargs["default_branches"] == ()
 
     def test_same_repo_pr_still_reads_local_file(self, tmp_path: Path) -> None:
         """Non-fork behaviour is unchanged."""
@@ -177,6 +276,58 @@ class TestReadGitreviewForkIsolation:
         assert info is not None
         assert info.project == "some/project"
 
+    def test_unknown_provenance_is_untrusted(self, tmp_path: Path) -> None:
+        """A PR whose head repository is unknown must not be trusted.
+
+        Specific-PR ``workflow_dispatch`` runs and direct URL invocations
+        carry no pull request payload, and GitHub reports a null head
+        repo for deleted forks.  Trusting the tree in those cases would
+        let a fork pick another Gerrit project.
+        """
+        repo = init_repo(tmp_path / "unknown", default_branch="master")
+        write_gitreview(
+            repo,
+            host="gerrit.evil.example",
+            port=29418,
+            project="attacker/target",
+        )
+        orch = Orchestrator(workspace=repo.path)
+
+        with patch(
+            "github2gerrit.core.fetch_gitreview", return_value=None
+        ) as mock_fetch:
+            info = orch._read_gitreview(
+                repo.path / ".gitreview",
+                _gh_ctx(head_repo=""),
+            )
+
+        assert info is None
+        mock_fetch.assert_called_once()
+        assert mock_fetch.call_args.kwargs["skip_local"] is True
+
+    def test_context_without_pr_number_reads_local_file(
+        self, tmp_path: Path
+    ) -> None:
+        """Push runs have a context but no PR, so the tree is the repo's."""
+        repo = init_repo(tmp_path / "pushed", default_branch="master")
+        write_gitreview(
+            repo,
+            host="gerrit.opendaylight.org",
+            port=29418,
+            project="mdsal",
+        )
+        orch = Orchestrator(workspace=repo.path)
+
+        with patch("github2gerrit.core.fetch_gitreview") as mock_fetch:
+            info = orch._read_gitreview(
+                repo.path / ".gitreview",
+                _gh_ctx(head_repo="", pr_number=None),
+            )
+
+        assert info is not None
+        assert info.project == "mdsal"
+        mock_fetch.assert_not_called()
+
     def test_fork_falls_through_when_base_lookup_fails(
         self, tmp_path: Path
     ) -> None:
@@ -197,6 +348,80 @@ class TestReadGitreviewForkIsolation:
             )
 
         assert info is None
+
+
+class TestConfigGitreviewProvenance:
+    """Config derivation runs before the PR context is read.
+
+    With no provenance available, or a fork head, the lookup must not
+    consult ``GITHUB_HEAD_REF``: a fork picks its own branch name, and
+    one matching a real base-repository branch would select that
+    branch's host.  A head known to live in the base repository keeps
+    its precedence, matching what ``_read_gitreview`` does later.
+    """
+
+    def _host(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        def _fake(repository: str | None = None, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            "github2gerrit.gitreview.read_gitreview_host", _fake
+        )
+        config._read_gitreview_host(BASE_REPO)
+        return captured
+
+    def test_fork_head_ref_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PR_HEAD_REPO", FORK_REPO)
+        monkeypatch.setenv("GITHUB_HEAD_REF", "stable/scandium")
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["include_env_refs"] is False
+        assert kwargs["branches"] == ("master",)
+
+    def test_unknown_provenance_ignores_head_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An absent signal must not earn the head ref any trust."""
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("GITHUB_HEAD_REF", "stable/scandium")
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        assert self._host(monkeypatch)["branches"] == ("master",)
+
+    def test_trusted_head_ref_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same-repo PRs keep head-first order.
+
+        ``_read_gitreview`` reads the head tree for a trusted head, so
+        dropping the head ref here would let derivation record one host
+        while the pipeline pushes to another.
+        """
+        monkeypatch.setenv("PR_HEAD_REPO", BASE_REPO)
+        monkeypatch.setenv("GITHUB_HEAD_REF", "topic/fix")
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        assert self._host(monkeypatch)["branches"] == ("topic/fix", "master")
+
+    def test_no_refs_falls_back_to_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Push runs have no PR refs; master/main still apply."""
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+        monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["branches"] == ()
+        assert kwargs["include_env_refs"] is False
 
 
 class TestHeadRepoResolution:
@@ -246,3 +471,110 @@ class TestHeadRepoResolution:
             head = None
 
         assert _head_repo_for_pr(_Pr()) == ""
+
+    def test_refs_read_from_pull_request_object(self) -> None:
+        class _End:
+            def __init__(self, ref: str) -> None:
+                self.ref = ref
+
+        class _Pr:
+            base = _End("stable/scandium")
+            head = _End("topic/fix")
+
+        assert _ref_for_pr(_Pr(), "base") == "stable/scandium"
+        assert _ref_for_pr(_Pr(), "head") == "topic/fix"
+
+    def test_refs_missing_yield_empty(self) -> None:
+        class _Pr:
+            base = None
+
+        assert _ref_for_pr(_Pr(), "base") == ""
+        assert _ref_for_pr(_Pr(), "head") == ""
+
+
+class TestBulkContextProvenance:
+    """Bulk runs must take refs from each PR, not the outer context."""
+
+    def test_per_pr_refs_used(self) -> None:
+        class _End:
+            def __init__(self, ref: str, full_name: str | None = None) -> None:
+                self.ref = ref
+                if full_name is not None:
+                    self.repo = type("_R", (), {"full_name": full_name})()
+
+        class _Pr:
+            number = 29
+            base = _End("stable/scandium")
+            head = _End("topic/fix", FORK_REPO)
+
+        # Bulk runs are dispatched, so the outer context has no PR refs.
+        outer = _gh_ctx(base_ref="", head_ref="", pr_number=None)
+
+        tasks = _build_bulk_pr_tasks(outer, [_Pr()])
+
+        assert len(tasks) == 1
+        _pr, ctx = tasks[0]
+        assert ctx.base_ref == "stable/scandium"
+        assert ctx.head_ref == "topic/fix"
+        assert ctx.head_repo == FORK_REPO
+        assert ctx.is_fork_pr is True
+
+
+class TestAugmentPrRefs:
+    """Provenance must be resolved whatever the triggering event."""
+
+    @pytest.mark.parametrize(
+        "event_name",
+        ["issue_comment", "workflow_dispatch", "pull_request_review", ""],
+    )
+    def test_missing_metadata_queried_for_any_event(
+        self, event_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An issue_comment payload has a PR number but no refs or head."""
+        for var in ("G2G_TARGET_URL",):
+            monkeypatch.delenv(var, raising=False)
+        # Set rather than delete so monkeypatch restores it: the code
+        # under test writes PR_HEAD_REPO through os.environ directly,
+        # which teardown would otherwise leak into later tests.
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("GITHUB_REPOSITORY", BASE_REPO)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", event_name)
+
+        class _End:
+            def __init__(self, ref: str, full_name: str = "") -> None:
+                self.ref = ref
+                self.sha = "cafebabe"
+                if full_name:
+                    self.repo = type("_R", (), {"full_name": full_name})()
+
+        class _Pr:
+            base = _End("stable/scandium")
+            head = _End("topic/fix", FORK_REPO)
+
+        ctx = _gh_ctx(base_ref="", head_ref="", head_repo="", pr_number=29)
+        ctx = dataclasses.replace(ctx, event_name=event_name)
+
+        with (
+            patch("github2gerrit.cli.build_client"),
+            patch("github2gerrit.cli.get_repo_from_env"),
+            patch("github2gerrit.cli.get_pull", return_value=_Pr()),
+        ):
+            result = _augment_pr_refs_if_needed(ctx)
+
+        assert result.head_repo == FORK_REPO
+        assert result.base_ref == "stable/scandium"
+        assert result.is_fork_pr is True
+
+    def test_complete_context_makes_no_api_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pull request payloads already carry everything needed."""
+        monkeypatch.delenv("G2G_TARGET_URL", raising=False)
+
+        ctx = _gh_ctx(head_repo=FORK_REPO, base_ref="master", head_ref="topic")
+
+        with patch("github2gerrit.cli.get_pull") as mock_get_pull:
+            result = _augment_pr_refs_if_needed(ctx)
+
+        mock_get_pull.assert_not_called()
+        assert result is ctx

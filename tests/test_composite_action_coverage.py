@@ -365,6 +365,7 @@ class TestEnvironmentMapping:
             "GITHUB_SHA",
             "GITHUB_BASE_REF",
             "GITHUB_HEAD_REF",
+            "PR_HEAD_REPO",
         ]
 
         for var in github_vars:
@@ -460,21 +461,31 @@ class TestStepDependencies:
 
         assert python_idx < install_idx
 
-    def test_no_checkout_of_target_repository(self, action_tester):
-        """No runner-level checkout of the target repository.
+    def test_checkout_restricted_to_push_events(self, action_tester):
+        """No checkout may place pull request head content in the runner.
 
-        The tool provisions its own workspace, so a checkout is redundant
-        and blocks fork pull requests under ``pull_request_target``.
+        The tool provisions its own workspace for pull requests, so a
+        checkout is redundant there and blocks fork pull requests under
+        ``pull_request_target``.  Push runs still check out because
+        merged-PR reconciliation reads commit trailers locally.
         """
         steps = action_tester.action_config["runs"]["steps"]
 
         checkout_steps = [
-            step.get("name", "")
+            step
             for step in steps
             if str(step.get("uses", "")).startswith("actions/checkout@")
         ]
 
-        assert checkout_steps == []
+        # The push checkout is required, so assert presence before
+        # asserting properties; otherwise the loop passes vacuously.
+        assert len(checkout_steps) == 1
+
+        for step in checkout_steps:
+            assert "github.event_name == 'push'" in str(step.get("if", ""))
+            assert "pull_request" not in str(
+                step.get("with", {}).get("ref", "")
+            )
 
     def test_cli_before_output_capture(self, action_tester):
         """Test CLI execution happens before output capture."""

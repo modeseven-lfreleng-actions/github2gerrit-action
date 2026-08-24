@@ -93,6 +93,12 @@ class TestActionEnvironmentMapping:
             "GITHUB_SHA": "${{ github.sha }}",
             "GITHUB_BASE_REF": "${{ github.base_ref }}",
             "GITHUB_HEAD_REF": "${{ github.head_ref }}",
+            # Provenance for fork-PR hardening. A typo or removal here
+            # silently makes every PR head unknown, which forces
+            # same-repository PRs down the untrusted path.
+            "PR_HEAD_REPO": (
+                "${{ github.event.pull_request.head.repo.full_name }}"
+            ),
             "GITHUB_TOKEN": "${{ github.token }}",
         }
 
