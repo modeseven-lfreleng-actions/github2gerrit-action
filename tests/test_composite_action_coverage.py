@@ -460,23 +460,21 @@ class TestStepDependencies:
 
         assert python_idx < install_idx
 
-    def test_checkout_before_cli(self, action_tester):
-        """Test repository checkout happens before CLI execution."""
+    def test_no_checkout_of_target_repository(self, action_tester):
+        """No runner-level checkout of the target repository.
+
+        The tool provisions its own workspace, so a checkout is redundant
+        and blocks fork pull requests under ``pull_request_target``.
+        """
         steps = action_tester.action_config["runs"]["steps"]
-        step_names = [step.get("name", "") for step in steps]
 
-        checkout_idx = next(
-            i
-            for i, name in enumerate(step_names)
-            if "Checkout repository" in name
-        )
-        cli_idx = next(
-            i
-            for i, name in enumerate(step_names)
-            if "Run github2gerrit Python CLI" in name
-        )
+        checkout_steps = [
+            step.get("name", "")
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
 
-        assert checkout_idx < cli_idx
+        assert checkout_steps == []
 
     def test_cli_before_output_capture(self, action_tester):
         """Test CLI execution happens before output capture."""
@@ -749,7 +747,7 @@ class TestFullWorkflow:
             s for s in steps if "shell" in s and s["shell"] == "bash"
         ]
 
-        assert len(action_steps) >= 3  # Python, UV, Checkout
+        assert len(action_steps) >= 2  # Python, uv
         assert len(shell_steps) >= 4  # Various validation and processing steps
 
     @pytest.mark.integration
@@ -761,7 +759,6 @@ class TestFullWorkflow:
         required_steps = [
             "Setup Python",
             "Setup uv",
-            "Checkout repository",
             "Setup github2gerrit",
             "Run github2gerrit Python CLI",
             "Capture outputs",

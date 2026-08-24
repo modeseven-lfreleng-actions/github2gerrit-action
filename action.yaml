@@ -19,18 +19,11 @@ inputs:
     required: false
     default: "false"
   FETCH_DEPTH:
-    description: "Fetch depth for checkout"
+    description: >-
+      Depth of the git history fetched when building the Gerrit commit.
+      Applied to the tool's own fetch of refs/pull/<N>/head
     required: false
     default: "10"
-  SKIP_CHECKOUT:
-    description: >-
-      Skip the internal repository checkout. Set when the caller has
-      already checked out the target repository at the desired ref
-      (e.g. the bundled reusable workflow, which also checks out this
-      action into the workspace and must not have it deleted by a
-      nested checkout)
-    required: false
-    default: "false"
   PR_NUMBER:
     description: "Pull request number to process, use 0 to process all open"
     required: false
@@ -212,20 +205,6 @@ runs:
         else
           echo "disabled=false" >> "$GITHUB_OUTPUT"
         fi
-
-    - name: "Checkout repository"
-      # yamllint disable-line rule:line-length
-      if: steps.disabled-check.outputs.disabled != 'true' && inputs.SKIP_CHECKOUT != 'true'
-      # yamllint disable-line rule:line-length
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        fetch-depth: ${{ inputs.FETCH_DEPTH }}
-        # Ensure we are on the PR's head SHA when triggered by PR events
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
-        # The action authenticates to Gerrit over SSH and to GitHub via an
-        # explicit GITHUB_TOKEN env var, so the checkout token does not need
-        # to be persisted into the local git config.
-        persist-credentials: false
 
     - name: "Setup Python"
       if: steps.disabled-check.outputs.disabled != 'true'

@@ -47,7 +47,6 @@ class TestActionStepValidation:
             ("Setup Python", "Setup uv"),
             ("Setup Python", "Setup github2gerrit"),
             ("Setup uv", "Setup github2gerrit"),
-            ("Checkout repository", "Run github2gerrit Python CLI"),
             ("Setup github2gerrit", "Run github2gerrit Python CLI"),
             ("Run github2gerrit Python CLI", "Capture outputs"),
         ]
@@ -181,26 +180,28 @@ class TestActionStepValidation:
         assert uv_step is not None
         assert uv_step["uses"].startswith("astral-sh/setup-uv@")
 
-    def test_checkout_step(self, action_config):
-        """Test repository checkout step configuration."""
+    def test_no_repository_checkout_step(self, action_config):
+        """The action must not check the target repository into the runner.
+
+        The tool fetches ``refs/pull/<N>/head`` into a private temporary
+        directory itself, so a runner-level checkout is redundant.  It is
+        also actively harmful: under ``pull_request_target`` a checkout of
+        a fork PR head is refused by ``actions/checkout``, and any file it
+        leaves in the working directory (notably ``.gitreview``) becomes
+        fork-controlled input to Gerrit target resolution.
+        """
         steps = action_config["runs"]["steps"]
-        checkout_step = next(
-            (
-                step
-                for step in steps
-                if step.get("name") == "Checkout repository"
-            ),
-            None,
+
+        checkout_steps = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+
+        assert checkout_steps == [], (
+            "action.yaml must not check out the target repository; "
+            f"found: {[s.get('name') for s in checkout_steps]}"
         )
-
-        assert checkout_step is not None
-        assert checkout_step["uses"].startswith("actions/checkout@")
-
-        with_config = checkout_step.get("with", {})
-        assert "fetch-depth" in with_config
-        assert with_config["fetch-depth"] == "${{ inputs.FETCH_DEPTH }}"
-        assert "ref" in with_config
-        assert "github.event.pull_request.head.sha" in with_config["ref"]
 
     def test_dependency_installation_step(self, action_config):
         """Test dependency installation step."""

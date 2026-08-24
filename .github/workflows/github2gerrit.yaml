@@ -284,17 +284,6 @@ jobs:
       gerrit_commit_sha: ${{ steps.g2g.outputs.gerrit_commit_sha }}
       # yamllint enable rule:line-length
     steps:
-      # Check out the target repository first; the composite action's
-      # internal checkout is skipped (SKIP_CHECKOUT) so it cannot wipe
-      # the bundled action checkout performed below
-      - name: Checkout target repository
-        # yamllint disable-line rule:line-length
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: ${{ inputs.FETCH_DEPTH }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
       # Resolve the repository that provides this reusable workflow so
       # the bundled action ships from the exact same commit; the
       # workflow and action interfaces then never drift apart.
@@ -361,7 +350,6 @@ jobs:
           GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE }}
           GERRIT_BRANCH: ${{ inputs.GERRIT_BRANCH }}
         with:
-          SKIP_CHECKOUT: true
           PR_NUMBER: ${{ inputs.PR_NUMBER }}
           SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
           USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
