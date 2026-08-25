@@ -44,6 +44,7 @@ __all__ = [
     "ApprovalStatus",
     "evaluate_fork_approval",
     "render_blocked_comment",
+    "render_cleared_comment",
 ]
 
 log = logging.getLogger("github2gerrit.pr_approval")
@@ -185,7 +186,11 @@ def evaluate_fork_approval(
             continue
 
         commit_id = str(getattr(review, "commit_id", "") or "").strip().lower()
-        if target and commit_id and commit_id != target:
+        if not target or not commit_id or commit_id != target:
+            # The guarantee is that the approval covers exactly the
+            # commit about to be transferred. Absent SHA metadata
+            # cannot establish that, so it withholds approval rather
+            # than being waved through.
             stale_approvers.append(login)
             continue
 
@@ -216,7 +221,7 @@ def evaluate_fork_approval(
             reason=(
                 "the approval from "
                 + ", ".join(stale_approvers)
-                + " predates the current commit"
+                + " does not cover the current commit"
             ),
             stale_approvers=stale_approvers,
         )
@@ -224,6 +229,33 @@ def evaluate_fork_approval(
     return ApprovalStatus(
         approved=False,
         reason="no maintainer has approved this pull request",
+    )
+
+
+def render_cleared_comment(
+    status: ApprovalStatus,
+    *,
+    head_sha: str,
+) -> str:
+    """Build the replacement for a notice whose block has lifted.
+
+    Posted by editing the earlier notice rather than adding a second
+    comment, so the pull request does not keep telling a contributor
+    they are waiting for something that already happened.
+    """
+    short_sha = head_sha[:7] if head_sha else "unknown"
+
+    return "\n".join(
+        [
+            APPROVAL_MARKER,
+            "### Approved",
+            "",
+            f"This pull request is {status.reason}, for commit "
+            f"`{short_sha}`, and transfers to Gerrit.",
+            "",
+            "Pushing further commits requires a fresh approval, because "
+            "an approval covers the commit it was given for.",
+        ]
     )
 
 
@@ -239,8 +271,9 @@ def render_blocked_comment(
         APPROVAL_MARKER,
         "### Awaiting maintainer approval",
         "",
-        "This pull request comes from a fork, so it does not transfer to "
-        "Gerrit until a maintainer approves it.",
+        "This pull request does not transfer to Gerrit until a maintainer "
+        "approves it. That applies to pull requests raised from a fork, "
+        "and to any whose origin the tool could not establish.",
         "",
         f"**Status:** {status.reason}.",
         "",

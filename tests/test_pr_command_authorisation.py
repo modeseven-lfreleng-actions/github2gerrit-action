@@ -323,7 +323,7 @@ class TestShouldCreateMissingAuthorisation:
             patch("github2gerrit.core.get_repo_from_env"),
             patch("github2gerrit.core.get_pull", return_value=pr),
         ):
-            return orch._should_create_missing(inputs, gh)
+            return orch._should_create_missing(inputs, gh)[0]
 
     def test_directive_from_outsider_ignored(self) -> None:
         assert self._run([_comment(DIRECTIVE, "NONE", "outsider")]) is False

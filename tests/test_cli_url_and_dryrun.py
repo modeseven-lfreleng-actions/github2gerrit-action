@@ -52,7 +52,7 @@ class _DummyOrchestrator:
     Test stub for Orchestrator used to capture calls to execute().
     """
 
-    def __init__(self, workspace: Any) -> None:
+    def __init__(self, workspace: Any, approved_sha: str = "") -> None:
         self.workspace = workspace
 
     def _prepare_workspace_checkout(self, *, inputs: Any, gh: Any) -> None:

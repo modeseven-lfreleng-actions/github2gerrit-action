@@ -93,6 +93,9 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
+  # Re-runs when a maintainer approves a fork pull request
+  pull_request_review:
+    types: [submitted, dismissed]
   push:
     branches: [main, master]
   workflow_dispatch:
@@ -140,6 +143,9 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
+  # Re-runs when a maintainer approves a fork pull request
+  pull_request_review:
+    types: [submitted, dismissed]
   workflow_dispatch:
 
 permissions:

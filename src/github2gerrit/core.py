@@ -1650,40 +1650,56 @@ class Orchestrator:
         self,
         inputs: Inputs,
         gh: GitHubContext,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """Decide whether to fall back from UPDATE to CREATE.
 
-        Returns ``True`` when either the ``--create-missing`` CLI flag
-        is active **or** a ``@github2gerrit create missing change``
-        comment is present on the PR *from a trusted author*.
+        Three things authorise the fallback: the ``--create-missing``
+        flag, a review-triggered run on an untrusted head, and a
+        ``@github2gerrit create missing change`` comment from a trusted
+        author.
 
         Comment authorship is checked because these mirrors are public:
         without it, anyone able to comment could force creation of a
         Gerrit change that the UPDATE path deliberately declined to
         make.
+
+        Returns:
+            ``(should_create, reason)``. The reason is returned rather
+            than restated by the notice, so the explanation the
+            contributor sees cannot drift from the condition that
+            actually fired.
         """
         # 1. Explicit CLI / environment flag
         if inputs.create_missing:
             log.info(
                 "✅ --create-missing flag is set; authorising CREATE fallback"
             )
-            return True
+            return True, "Triggered by the `--create-missing` flag."
 
-        # 2. A review is what unblocks a fork pull request, so a
+        # 2. A review is what unblocks a gated pull request, so a
         #    review-triggered run may legitimately be the first one to
         #    reach Gerrit. Treating a missing change as an error there
-        #    would fail every fork PR on its first approval.
-        if gh.event_name == "pull_request_review":
+        #    would fail every gated PR on its first approval.
+        #
+        #    Scoped to heads that actually pass through the gate. A
+        #    same-repository PR was never gated, so a review on one
+        #    must not quietly override CREATE_MISSING=false.
+        if gh.event_name == "pull_request_review" and not gh.head_is_trusted:
             log.info(
-                "✅ Review-triggered run for PR #%s; authorising CREATE "
-                "fallback because no Gerrit change exists yet",
+                "✅ Review-triggered run for PR #%s from an untrusted head; "
+                "authorising CREATE fallback because no Gerrit change "
+                "exists yet",
                 gh.pr_number,
             )
-            return True
+            return True, (
+                "Triggered by a maintainer's approving review, which is "
+                "the first run permitted to reach Gerrit for this pull "
+                "request."
+            )
 
         # 3. Scan PR comments for the directive
         if not gh.pr_number:
-            return False
+            return False, ""
 
         try:
             from .pr_commands import CMD_CREATE_MISSING
@@ -1702,7 +1718,10 @@ class Orchestrator:
                     gh.pr_number,
                     match.comment_index,
                 )
-                return True
+                return True, (
+                    "Triggered by the `@github2gerrit create missing "
+                    "change` comment."
+                )
 
             log.debug(
                 "No @github2gerrit create-missing command found in "
@@ -1715,13 +1734,21 @@ class Orchestrator:
                 exc,
             )
 
-        return False
+        return False, ""
 
     def _post_create_missing_notice(
         self,
         gh: GitHubContext,
+        reason: str = "",
     ) -> None:
-        """Post a comment on the PR noting the CREATE fallback."""
+        """Post a comment on the PR noting the CREATE fallback.
+
+        Args:
+            gh: GitHub context.
+            reason: What authorised the fallback. Passed in rather than
+                restated here, so the notice cannot drift out of step
+                with the conditions in ``_should_create_missing``.
+        """
         if not gh.pr_number:
             return
         # Respect CI_TESTING
@@ -1731,6 +1758,7 @@ class Orchestrator:
             "yes",
         ):
             return
+        attribution = f"\n\n_{reason}_" if reason else ""
         try:
             client_gh = build_client()
             repo = get_repo_from_env(client_gh)
@@ -1740,9 +1768,7 @@ class Orchestrator:
                 "🔄 **GitHub2Gerrit**: No existing Gerrit change found for "
                 "this PR.\n"
                 "Creating a new Gerrit change (fallback from UPDATE "
-                "operation).\n\n"
-                "_Triggered by `@github2gerrit create missing change` "
-                "comment or `--create-missing` flag._",
+                f"operation).{attribution}",
             )
         except Exception as exc:
             log.warning(
@@ -2041,8 +2067,15 @@ class Orchestrator:
         self,
         *,
         workspace: Path,
+        approved_sha: str = "",
     ) -> None:
         self.workspace = workspace
+        # Commit the fork approval gate authorised, when one applied.
+        # Passed explicitly rather than read from the environment:
+        # bulk runs process several pull requests concurrently, and a
+        # process-global value would let one worker clear or overwrite
+        # another's constraint. Empty means no gate applied.
+        self._approved_sha: str = approved_sha.strip()
         # SSH configuration paths (set by _setup_ssh)
         self._ssh_key_path: Path | None = None
         self._ssh_known_hosts_path: Path | None = None
@@ -2605,7 +2638,9 @@ class Orchestrator:
         except OrchestratorError:
             # UPDATE found no existing Gerrit change — check whether
             # we should fall back to CREATE instead of failing.
-            should_create = self._should_create_missing(inputs, gh)
+            should_create, create_reason = self._should_create_missing(
+                inputs, gh
+            )
 
             if not should_create:
                 raise  # propagate the original error
@@ -2622,7 +2657,7 @@ class Orchestrator:
             os.environ["G2G_FALLBACK_CREATE"] = "true"
 
             # Notify on the PR that we are creating from scratch
-            self._post_create_missing_notice(gh)
+            self._post_create_missing_notice(gh, create_reason)
 
         return (
             forced_reuse_ids,
@@ -5987,10 +6022,71 @@ class Orchestrator:
             except Exception as exc:
                 log.debug("PR fetch failed, will try API fallback: %s", exc)
 
+        if fetch_success:
+            self._enforce_approved_head(gh)
+
         # Fallback to GitHub API archive if git fetch failed (CLI's resilience)
         if not fetch_success and pr_num_str and pr_num_str != "0":
             log.info("Git fetch failed, falling back to GitHub API archive")
             self._fallback_to_api_archive(self.workspace, gh, inputs)
+
+    def _enforce_approved_head(self, gh: GitHubContext) -> None:
+        """Refuse a head that differs from the one the gate approved.
+
+        The approval gate reads the head SHA from the API, but the
+        workspace is populated from ``refs/pull/<N>/head`` or, on
+        fallback, from an archive of the PR's *current* head. Both can
+        move after the check. Without this comparison a push timed
+        against the workflow would put an unreviewed commit into
+        Gerrit.
+
+        No constraint is recorded when no gate applied, so
+        same-repository pull requests and direct CLI runs are
+        unaffected.
+        """
+        from .gitutils import run_cmd
+
+        approved = self._approved_sha.strip().lower()
+        if not approved:
+            return
+
+        result = run_cmd(["git", "rev-parse", "HEAD"], cwd=self.workspace)
+        fetched = (result.stdout or "").strip().lower()
+
+        if fetched == approved:
+            log.debug("Fetched head matches the approved commit %s", approved)
+            return
+
+        msg = (
+            f"pull request head moved after approval: approved "
+            f"{approved[:12]}, fetched {fetched[:12]}. Refusing to "
+            f"transfer an unreviewed commit; the next run will ask for "
+            f"approval of the new head"
+        )
+        raise OrchestratorError(msg)
+
+    def _assert_archive_sha_approved(self, head_sha: str) -> None:
+        """Refuse an archive of a head the gate did not approve.
+
+        The archive fallback re-reads the pull request's *current* head
+        from the API, so it must be checked before download rather than
+        after: unlike the git path there is no commit object to compare
+        once the files have landed.
+        """
+        approved = self._approved_sha.strip().lower()
+        if not approved:
+            return
+
+        if head_sha.strip().lower() == approved:
+            return
+
+        msg = (
+            f"pull request head moved after approval: approved "
+            f"{approved[:12]}, archive offers {head_sha[:12]}. Refusing "
+            f"to transfer an unreviewed commit; the next run will ask "
+            f"for approval of the new head"
+        )
+        raise OrchestratorError(msg)
 
     def _validate_and_get_api_base_url(self, server_url: str) -> str:
         """Validate server URL and return appropriate API base URL.
@@ -6218,6 +6314,10 @@ class Orchestrator:
             raise
 
         head_sha = pr_data["head"]["sha"]
+
+        # Checked before the download, not after: the archive yields a
+        # file tree with no commit object to compare against.
+        self._assert_archive_sha_approved(head_sha)
 
         # Download archive
         archive_url = f"{api_base}/repos/{repo_full}/zipball/{head_sha}"

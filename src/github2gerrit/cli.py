@@ -85,6 +85,7 @@ from .pr_approval import APPROVAL_MARKER
 from .pr_approval import ApprovalStatus
 from .pr_approval import evaluate_fork_approval
 from .pr_approval import render_blocked_comment
+from .pr_approval import render_cleared_comment
 from .rich_display import RICH_AVAILABLE
 from .rich_display import DummyProgressTracker
 from .rich_display import G2GProgressTracker
@@ -259,35 +260,64 @@ def _check_fork_approval(
     pr_obj: Any | None,
     gh: GitHubContext,
     progress_tracker: Any = None,
-) -> bool:
-    """Report whether a fork pull request may transfer to Gerrit.
+) -> tuple[bool, str]:
+    """Report whether a pull request may transfer to Gerrit.
 
     Same-repository pull requests are unaffected: their head branch
-    already implies write access. Fork pull requests require an
+    already implies write access. Everything else — forks, and pull
+    requests whose provenance could not be established — requires an
     approving review from a trusted maintainer, bound to the current
     head commit.
+
+    Only a head positively known to live in the base repository skips
+    the gate. Unknown provenance does not: `is_fork_pr` answers a
+    factual question and reports ``False`` when it cannot tell, whereas
+    ``head_is_trusted`` answers the authorisation question and reports
+    ``False`` in the same case. Using the latter keeps the gate closed
+    when metadata is missing, which is exactly when it matters most.
+
+    The gate applies to unattended runs only. A direct CLI invocation
+    is a person acting deliberately with their own credentials, and
+    needs no second signature.
 
     Runs before any fork content is fetched and before the Gerrit key
     is materialised, so a blocked pull request never reaches either.
 
     Returns:
-        ``True`` to continue, ``False`` to stop processing this pull
-        request. Blocking is not an error: the pull request is simply
-        waiting for a human, and a failed check would misrepresent
-        that.
+        ``(allowed, approved_sha)``. ``approved_sha`` is the commit the
+        gate authorised, empty when no gate applied. It is returned
+        rather than stored globally because bulk runs process several
+        pull requests concurrently, where shared state would let one
+        worker clear or overwrite another's constraint.
+
+        Blocking is not an error: the pull request is simply waiting
+        for a human, and a failed check would misrepresent that.
     """
-    if not gh.is_fork_pr:
-        return True
+    if gh.head_is_trusted:
+        return True, ""
+
+    if not _is_github_actions_context():
+        # Direct CLI invocation. The operator chose this pull request
+        # and is using their own credentials, so they are the authority
+        # the gate would otherwise be looking for. The gate exists for
+        # the unattended path, where the tool acts on a shared identity
+        # with nobody watching.
+        log.debug(
+            "Not running under GitHub Actions; approval gate not applied "
+            "to PR #%s",
+            gh.pr_number,
+        )
+        return True, ""
 
     if pr_obj is None:
         # Fail closed. Reaching here means the pull request could not
         # be resolved, so approval cannot be established either way.
         log.warning(
-            "🛑 Fork pull request #%s not transferred to Gerrit: the tool "
+            "🛑 Pull request #%s not transferred to Gerrit: the tool "
             "could not resolve the pull request to check for approval",
             gh.pr_number,
         )
-        return False
+        return False, ""
 
     head_sha = str(
         getattr(getattr(pr_obj, "head", None), "sha", "") or ""
@@ -302,14 +332,18 @@ def _check_fork_approval(
 
     if status.approved:
         log.info(
-            "✅ Fork pull request #%s authorised: %s",
+            "✅ Pull request #%s authorised: %s",
             gh.pr_number,
             status.reason,
         )
-        return True
+        # The workspace fetch reads refs/pull/<N>/head, which the
+        # contributor can move after this check. Carry what was
+        # approved so the fetch can refuse anything else.
+        _clear_fork_approval_notice(pr_obj, status, head_sha)
+        return True, head_sha
 
     log.warning(
-        "🛑 Fork pull request #%s not transferred to Gerrit: %s. "
+        "🛑 Pull request #%s not transferred to Gerrit: %s. "
         "Reviews count from: %s",
         gh.pr_number,
         status.reason,
@@ -322,7 +356,64 @@ def _check_fork_approval(
     )
 
     _post_fork_approval_notice(pr_obj, status, head_sha)
+    return False, ""
+
+
+def _edit_owned_marker_comment(pr_obj: Any, body: str) -> bool:
+    """Replace the tool's own approval notice, if one exists.
+
+    The marker is not proof of authorship — anyone may paste it into a
+    comment. Ownership is established by *attempting the edit*: the API
+    refuses to edit another user's comment, so a failure means the
+    comment was not ours and the search continues.
+
+    Returns:
+        ``True`` when a notice of ours was updated.
+    """
+    try:
+        issue = pr_obj.as_issue()
+        comments = list(issue.get_comments())
+    except Exception as exc:
+        log.debug("Could not read comments for approval notice: %s", exc)
+        return False
+
+    # Newest first: if several carry the marker, keep the most recent.
+    for comment in reversed(comments):
+        if APPROVAL_MARKER not in (getattr(comment, "body", "") or ""):
+            continue
+        try:
+            comment.edit(body)
+        except Exception as exc:
+            log.debug(
+                "Could not edit comment carrying the approval marker; "
+                "it is probably not ours: %s",
+                exc,
+            )
+            continue
+        else:
+            return True
     return False
+
+
+def _clear_fork_approval_notice(
+    pr_obj: Any,
+    status: ApprovalStatus,
+    head_sha: str,
+) -> None:
+    """Retract an earlier block notice once approval arrives.
+
+    Only edits an existing notice; it does not create one. A pull
+    request that was never blocked has nothing to retract, and adding a
+    comment to say so would be noise.
+
+    Best-effort: failing to tidy a comment must not stop a transfer
+    that has been authorised.
+    """
+    if env_bool("CI_TESTING", False):
+        return
+    _edit_owned_marker_comment(
+        pr_obj, render_cleared_comment(status, head_sha=head_sha)
+    )
 
 
 def _post_fork_approval_notice(
@@ -339,15 +430,10 @@ def _post_fork_approval_notice(
         return
 
     body = render_blocked_comment(status, head_sha=head_sha)
+    if _edit_owned_marker_comment(pr_obj, body):
+        return
 
     try:
-        issue = pr_obj.as_issue()
-        for comment in issue.get_comments():
-            existing = getattr(comment, "body", "") or ""
-            if APPROVAL_MARKER in existing:
-                if existing.strip() != body.strip():
-                    comment.edit(body)
-                return
         create_pr_comment(pr_obj, body)
     except Exception as exc:
         log.debug("Could not post fork approval notice: %s", exc)
@@ -1654,12 +1740,13 @@ def _submit_bulk_pr(
     per_ctx: models.GitHubContext,
     pr_number: int,
     progress_tracker: G2GProgressTracker | DummyProgressTracker,
+    approved_sha: str = "",
 ) -> _BulkPrResult:
     """Run the orchestrator for a single PR in multi-PR mode."""
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)
-            orch = Orchestrator(workspace=workspace)
+            orch = Orchestrator(workspace=workspace, approved_sha=approved_sha)
             result_multi = orch.execute(inputs=data, gh=per_ctx)
             _record_change_tracker_result(progress_tracker, result_multi)
             return "success", result_multi, None
@@ -1709,7 +1796,8 @@ def _process_bulk_pr(
         return "skipped", None, None
 
     # Fork PRs need a maintainer's approval before anything is fetched
-    if not _check_fork_approval(pr, per_ctx, progress_tracker):
+    allowed, approved_sha = _check_fork_approval(pr, per_ctx, progress_tracker)
+    if not allowed:
         return "skipped", None, None
 
     skip_result = _check_bulk_pr_duplicates(
@@ -1718,7 +1806,9 @@ def _process_bulk_pr(
     if skip_result is not None:
         return skip_result
 
-    return _submit_bulk_pr(data, per_ctx, pr_number, progress_tracker)
+    return _submit_bulk_pr(
+        data, per_ctx, pr_number, progress_tracker, approved_sha
+    )
 
 
 def _record_bulk_success(
@@ -2215,10 +2305,11 @@ def _process_single(
     data: Inputs,
     gh: GitHubContext,
     progress_tracker: G2GProgressTracker | DummyProgressTracker | None = None,
+    approved_sha: str = "",
 ) -> tuple[bool, SubmissionResult]:
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
-        orch = Orchestrator(workspace=workspace)
+        orch = Orchestrator(workspace=workspace, approved_sha=approved_sha)
         _prepare_single_checkout(orch, workspace, data, gh, progress_tracker)
         _log_single_pre_submit(data, progress_tracker)
         pipeline_success, result = _run_single_submission(
@@ -3068,7 +3159,20 @@ def _handle_single_pr(
     # Augment PR refs via API when in URL mode and token present
     gh = _augment_pr_refs_if_needed(gh)
 
+    # A review only exists to unblock a gated pull request. On a
+    # same-repository head there is nothing to unblock, so stop rather
+    # than resubmitting an unchanged commit every time somebody
+    # comments on, approves or requests changes to a pull request.
+    if gh.event_name == "pull_request_review" and gh.head_is_trusted:
+        log.info(
+            "Review on PR #%s, whose head is in this repository; "
+            "nothing to unblock, so no transfer is needed",
+            gh.pr_number,
+        )
+        sys.exit(int(ExitCode.SUCCESS))
+
     # Display PR information with Rich formatting
+    approved_sha = ""
     if gh.pr_number:
         pr_obj = _extract_and_display_pr_info(gh, data, progress_tracker)
 
@@ -3078,7 +3182,10 @@ def _handle_single_pr(
         # token cannot skip the gate.
         if pr_obj is None:
             pr_obj = _resolve_pr_for_gate(gh, data)
-        if not _check_fork_approval(pr_obj, gh, progress_tracker):
+        allowed, approved_sha = _check_fork_approval(
+            pr_obj, gh, progress_tracker
+        )
+        if not allowed:
             sys.exit(int(ExitCode.SUCCESS))
 
     # Check for duplicates in single-PR mode (before workspace setup)
@@ -3091,7 +3198,9 @@ def _handle_single_pr(
     log.debug("Processing PR #%s from %s", gh.pr_number, gh.repository)
     log.debug("Target Gerrit server: %s", data.gerrit_server)
     log.debug("Target Gerrit project: %s", data.gerrit_project)
-    pipeline_success, result = _process_single(data, gh, progress_tracker)
+    pipeline_success, result = _process_single(
+        data, gh, progress_tracker, approved_sha
+    )
 
     # Run abandoned-PR and Gerrit cleanup if the pipeline was successful
     # Skip in G2G_NO_GERRIT: no Gerrit server to query

@@ -467,7 +467,7 @@ class TestShouldCreateMissing:
         inputs = self._make_inputs(create_missing=True)
         gh = self._make_gh()
 
-        result = orch._should_create_missing(inputs, gh)
+        result, _reason = orch._should_create_missing(inputs, gh)
         assert result is True
 
     def test_no_flag_no_comment_returns_false(self, tmp_path):
@@ -502,7 +502,7 @@ class TestShouldCreateMissing:
             ),
             patch("github2gerrit.core.get_pull", return_value=mock_pr),
         ):
-            result = orch._should_create_missing(inputs, gh)
+            result, _reason = orch._should_create_missing(inputs, gh)
             assert result is False
 
     def test_comment_directive_returns_true(self, tmp_path):
@@ -543,7 +543,7 @@ class TestShouldCreateMissing:
             ),
             patch("github2gerrit.core.get_pull", return_value=mock_pr),
         ):
-            result = orch._should_create_missing(inputs, gh)
+            result, _reason = orch._should_create_missing(inputs, gh)
             assert result is True
 
     def test_no_pr_number_returns_false(self, tmp_path):
@@ -554,7 +554,7 @@ class TestShouldCreateMissing:
         inputs = self._make_inputs(create_missing=False)
         gh = self._make_gh(pr_number=None)
 
-        result = orch._should_create_missing(inputs, gh)
+        result, _reason = orch._should_create_missing(inputs, gh)
         assert result is False
 
     def test_github_api_failure_returns_false(self, tmp_path):
@@ -569,7 +569,7 @@ class TestShouldCreateMissing:
             "github2gerrit.core.build_client",
             side_effect=RuntimeError("API unavailable"),
         ):
-            result = orch._should_create_missing(inputs, gh)
+            result, _reason = orch._should_create_missing(inputs, gh)
             assert result is False
 
     def test_alias_in_comment_returns_true(self, tmp_path):
@@ -606,7 +606,7 @@ class TestShouldCreateMissing:
             ),
             patch("github2gerrit.core.get_pull", return_value=mock_pr),
         ):
-            result = orch._should_create_missing(inputs, gh)
+            result, _reason = orch._should_create_missing(inputs, gh)
             assert result is True
 
 

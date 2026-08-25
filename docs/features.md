@@ -420,6 +420,16 @@ An approving review, where every one of the following holds:
 - no trusted reviewer has since requested changes; and
 - the reviewer is not the pull request author.
 
+A pull request whose provenance the tool cannot establish takes the same path as
+a fork. Approval is a question about authority, and an absent signal is not an
+answer.
+
+The gate applies to unattended runs. Running the CLI directly against a pull
+request URL does not require an approval: the operator chose that pull request
+and is using their own credentials, so they are already the authority the gate
+looks for. It exists for the automated path, where the tool acts on a shared
+identity with nobody watching.
+
 Binding to the head commit matters. GitHub keeps approvals across pushes unless
 branch protection dismisses them, so an approval that was not checked against a
 commit would let a contributor gain approval for one revision and then push a
@@ -444,7 +454,8 @@ on:
     types: [submitted, dismissed]
 ```
 
-Without that trigger a maintainer must re-run the failed job by hand.
+Without that trigger the tool only reconsiders a pull request on its next
+push, or when a maintainer dispatches the workflow by hand.
 
 #### When the gate blocks
 
@@ -455,6 +466,21 @@ The tool posts one comment explaining what is missing, and edits that same
 comment on later runs rather than adding another. Where an approval exists but
 covers an earlier commit, the comment says so, so a maintainer who did approve
 is not told that nobody has.
+
+Once approval arrives, the tool edits that comment again to record it, so a
+transferred pull request does not keep displaying a stale block.
+
+#### If the head moves mid-run
+
+The gate reads the head commit from the API, while the workspace fetch reads
+`refs/pull/<N>/head`, which the contributor can move meanwhile. The tool
+compares the commit it fetched against the commit the maintainer approved and
+refuses a mismatch, so a push timed against a running workflow cannot slip an
+unreviewed commit into Gerrit.
+
+That refusal fails the run, unlike the ordinary blocked case, because it falls
+outside the normal course of events. The push that caused it triggers a fresh
+run, which asks for approval of the new commit in the usual way.
 
 ## Duplicate Detection
 
