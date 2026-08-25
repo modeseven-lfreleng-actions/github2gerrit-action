@@ -69,6 +69,7 @@ from .gerrit_pr_closer import extract_pr_url_from_gerrit_change
 from .gerrit_pr_closer import parse_pr_url
 from .gerrit_pr_closer import process_recent_commits_for_pr_closure
 from .github_api import build_client
+from .github_api import create_pr_comment
 from .github_api import get_pr_title_body
 from .github_api import get_pull
 from .github_api import get_repo_from_env
@@ -80,6 +81,10 @@ from .models import GitHubContext
 from .models import Inputs
 from .netrc import NetrcParseError
 from .netrc import get_credentials_for_host
+from .pr_approval import APPROVAL_MARKER
+from .pr_approval import ApprovalStatus
+from .pr_approval import evaluate_fork_approval
+from .pr_approval import render_blocked_comment
 from .rich_display import RICH_AVAILABLE
 from .rich_display import DummyProgressTracker
 from .rich_display import G2GProgressTracker
@@ -87,6 +92,7 @@ from .rich_display import display_pr_info
 from .rich_display import safe_console_print
 from .rich_display import safe_typer_echo
 from .rich_logging import setup_rich_aware_logging
+from .trust import describe_trust_policy
 from .utils import append_github_output
 from .utils import env_bool
 from .utils import env_str
@@ -228,14 +234,137 @@ def _check_automation_only(
         )
 
 
+def _resolve_pr_for_gate(gh: GitHubContext, data: Inputs) -> Any | None:
+    """Fetch the pull request for the approval gate.
+
+    Used when the display step returned nothing — most notably the
+    no-token branch, which returns early. Without this the gate would
+    fail open exactly when the environment is least well configured.
+    """
+    if not gh.pr_number:
+        return None
+    try:
+        token = getattr(data, "github_token", "") or os.getenv(
+            "GITHUB_TOKEN", ""
+        )
+        client = build_client(token)
+        repo = get_repo_from_env(client)
+        return get_pull(repo, int(gh.pr_number))
+    except Exception as exc:
+        log.debug("Could not resolve PR for the approval gate: %s", exc)
+        return None
+
+
+def _check_fork_approval(
+    pr_obj: Any | None,
+    gh: GitHubContext,
+    progress_tracker: Any = None,
+) -> bool:
+    """Report whether a fork pull request may transfer to Gerrit.
+
+    Same-repository pull requests are unaffected: their head branch
+    already implies write access. Fork pull requests require an
+    approving review from a trusted maintainer, bound to the current
+    head commit.
+
+    Runs before any fork content is fetched and before the Gerrit key
+    is materialised, so a blocked pull request never reaches either.
+
+    Returns:
+        ``True`` to continue, ``False`` to stop processing this pull
+        request. Blocking is not an error: the pull request is simply
+        waiting for a human, and a failed check would misrepresent
+        that.
+    """
+    if not gh.is_fork_pr:
+        return True
+
+    if pr_obj is None:
+        # Fail closed. Reaching here means the pull request could not
+        # be resolved, so approval cannot be established either way.
+        log.warning(
+            "🛑 Fork pull request #%s not transferred to Gerrit: the tool "
+            "could not resolve the pull request to check for approval",
+            gh.pr_number,
+        )
+        return False
+
+    head_sha = str(
+        getattr(getattr(pr_obj, "head", None), "sha", "") or ""
+    ).strip()
+    author = str(
+        getattr(getattr(pr_obj, "user", None), "login", "") or ""
+    ).strip()
+
+    status = evaluate_fork_approval(
+        pr_obj, head_sha=head_sha, author_login=author
+    )
+
+    if status.approved:
+        log.info(
+            "✅ Fork pull request #%s authorised: %s",
+            gh.pr_number,
+            status.reason,
+        )
+        return True
+
+    log.warning(
+        "🛑 Fork pull request #%s not transferred to Gerrit: %s. "
+        "Reviews count from: %s",
+        gh.pr_number,
+        status.reason,
+        describe_trust_policy(),
+    )
+    safe_console_print(
+        f"🛑 Awaiting maintainer approval: {status.reason}",
+        style="yellow",
+        progress_tracker=progress_tracker,
+    )
+
+    _post_fork_approval_notice(pr_obj, status, head_sha)
+    return False
+
+
+def _post_fork_approval_notice(
+    pr_obj: Any,
+    status: ApprovalStatus,
+    head_sha: str,
+) -> None:
+    """Explain the block on the pull request, editing any prior notice.
+
+    Best-effort throughout: a comment API failure must never turn a
+    block into a crash, nor a block into a pass.
+    """
+    if env_bool("CI_TESTING", False):
+        return
+
+    body = render_blocked_comment(status, head_sha=head_sha)
+
+    try:
+        issue = pr_obj.as_issue()
+        for comment in issue.get_comments():
+            existing = getattr(comment, "body", "") or ""
+            if APPROVAL_MARKER in existing:
+                if existing.strip() != body.strip():
+                    comment.edit(body)
+                return
+        create_pr_comment(pr_obj, body)
+    except Exception as exc:
+        log.debug("Could not post fork approval notice: %s", exc)
+
+
 def _extract_and_display_pr_info(
     gh: GitHubContext,
     data: Inputs,
     progress_tracker: Any = None,
-) -> None:
-    """Extract PR information and display it with Rich formatting."""
+) -> Any | None:
+    """Extract PR information and display it with Rich formatting.
+
+    Returns the pull request object when one was fetched, so callers
+    can reuse it instead of making a further API call.
+    """
     if not gh.pr_number:
-        return
+        return None
 
     try:
         # Get GitHub token from inputs if available, fallback to environment
@@ -250,7 +379,7 @@ def _extract_and_display_pr_info(
                 style="yellow",
                 progress_tracker=progress_tracker,
             )
-            return
+            return None
 
         client = build_client(token)
         repo = get_repo_from_env(client)
@@ -298,6 +427,9 @@ def _extract_and_display_pr_info(
             _exit_for_pr_not_found(gh.pr_number, gh.repository)
         else:
             _exit_for_pr_fetch_error(exc)
+    else:
+        return pr_obj
+    return None
 
 
 class ConfigurationError(Exception):
@@ -1574,6 +1706,10 @@ def _process_bulk_pr(
     except SystemExit:
         # PR was rejected and closed, skip processing
         log.debug("PR #%d rejected by automation_only check", pr_number)
+        return "skipped", None, None
+
+    # Fork PRs need a maintainer's approval before anything is fetched
+    if not _check_fork_approval(pr, per_ctx, progress_tracker):
         return "skipped", None, None
 
     skip_result = _check_bulk_pr_duplicates(
@@ -2934,7 +3070,16 @@ def _handle_single_pr(
 
     # Display PR information with Rich formatting
     if gh.pr_number:
-        _extract_and_display_pr_info(gh, data, progress_tracker)
+        pr_obj = _extract_and_display_pr_info(gh, data, progress_tracker)
+
+        # Fork PRs need a maintainer's approval before anything is
+        # fetched and before the Gerrit key is materialised. Resolve
+        # the PR here when the display step could not, so a missing
+        # token cannot skip the gate.
+        if pr_obj is None:
+            pr_obj = _resolve_pr_for_gate(gh, data)
+        if not _check_fork_approval(pr_obj, gh, progress_tracker):
+            sys.exit(int(ExitCode.SUCCESS))
 
     # Check for duplicates in single-PR mode (before workspace setup)
     if gh.pr_number and not env_bool("SYNC_ALL_OPEN_PRS", False):

@@ -1669,7 +1669,19 @@ class Orchestrator:
             )
             return True
 
-        # 2. Scan PR comments for the directive
+        # 2. A review is what unblocks a fork pull request, so a
+        #    review-triggered run may legitimately be the first one to
+        #    reach Gerrit. Treating a missing change as an error there
+        #    would fail every fork PR on its first approval.
+        if gh.event_name == "pull_request_review":
+            log.info(
+                "✅ Review-triggered run for PR #%s; authorising CREATE "
+                "fallback because no Gerrit change exists yet",
+                gh.pr_number,
+            )
+            return True
+
+        # 3. Scan PR comments for the directive
         if not gh.pr_number:
             return False
 

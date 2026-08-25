@@ -400,9 +400,61 @@ Same-repository pull requests keep their previous behaviour and still read
 
 ### Approval gating
 
-The tool does not yet require a maintainer approval before it transfers a fork
-pull request to Gerrit. Until it does, use `AUTOMATION_ONLY` (see above) to
-control which pull requests the tool accepts.
+A fork pull request does not transfer to Gerrit until a maintainer approves it.
+The check runs before the tool fetches anything from the pull request and before
+it unlocks the Gerrit SSH key, so a pull request awaiting review reaches
+neither.
+
+Same-repository pull requests skip the check entirely. Pushing a branch to the
+base repository already requires write access, and automation such as
+Dependabot, pre-commit.ci and Copilot works that way, so the gate never affects
+them.
+
+#### What counts as approval
+
+An approving review, where every one of the following holds:
+
+- the reviewer's `author_association` falls in the trusted set, the same one
+  used for [comment commands](#who-may-issue-commands);
+- the review targets the pull request's **current head commit**;
+- no trusted reviewer has since requested changes; and
+- the reviewer is not the pull request author.
+
+Binding to the head commit matters. GitHub keeps approvals across pushes unless
+branch protection dismisses them, so an approval that was not checked against a
+commit would let a contributor gain approval for one revision and then push a
+different one. The cost is that maintainers re-approve after each push, which is
+the correct trade.
+
+The author exclusion is belt and braces. GitHub already rejects approving your
+own pull request, and that guarantee is a large part of why the tool uses
+reviews rather than comment directives — on a Gerrit mirror the pull request
+author often holds the same organization membership as the reviewers.
+
+#### Enabling re-runs on approval
+
+`pull_request_target` carries no event for a submitted review, so approving a
+pull request does nothing unless the calling workflow listens for it:
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, closed]
+  pull_request_review:
+    types: [submitted, dismissed]
+```
+
+Without that trigger a maintainer must re-run the failed job by hand.
+
+#### When the gate blocks
+
+The run finishes successfully rather than failing. A pull request waiting for a
+human is not broken, and a red check would suggest otherwise.
+
+The tool posts one comment explaining what is missing, and edits that same
+comment on later runs rather than adding another. Where an approval exists but
+covers an earlier commit, the comment says so, so a maintainer who did approve
+is not told that nobody has.
 
 ## Duplicate Detection
 
