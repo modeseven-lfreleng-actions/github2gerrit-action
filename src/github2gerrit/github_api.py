@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Callable
 from collections.abc import Iterable
 from importlib import import_module
 from typing import Any
@@ -30,6 +31,7 @@ from .error_codes import GitHub2GerritError
 from .error_codes import is_github_api_permission_error
 from .external_api import ApiType
 from .external_api import external_api_call
+from .trust import is_trusted_association
 
 
 # Error message constants to comply with TRY003
@@ -74,8 +76,14 @@ else:
             raise RuntimeError(_MSG_PYGITHUB_REQUIRED)
 
 
+class GhUser(Protocol):
+    login: str
+
+
 class GhIssueComment(Protocol):
     body: str | None
+    author_association: str | None
+    user: GhUser | None
 
 
 class GhIssue(Protocol):
@@ -127,6 +135,7 @@ __all__ = [
     "get_pull",
     "get_recent_change_ids_from_comments",
     "get_repo_from_env",
+    "get_trusted_comment_bodies",
     "iter_open_pulls",
 ]
 
@@ -316,6 +325,57 @@ def get_recent_change_ids_from_comments(
             if cid:
                 found.append(cid)
     return found
+
+
+@external_api_call(ApiType.GITHUB, "get_trusted_comment_bodies")
+def get_trusted_comment_bodies(
+    pr: GhPullRequest,
+    *,
+    directive_detector: Callable[[str], bool] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split PR comments into trusted bodies and ignored directives.
+
+    Comments are only obeyed when their author's ``author_association``
+    is trusted (see :mod:`github2gerrit.trust`).  Without this, anyone
+    able to comment on a public mirror could direct the tool.
+
+    Args:
+      pr: Pull request.
+      directive_detector: Predicate deciding whether an untrusted
+        comment was *attempting* to direct the tool, and so is worth
+        reporting.  Supplied by the caller rather than matched here, so
+        that directive grammar stays owned by the command system and
+        cannot drift from it.  When ``None``, nothing is reported.
+
+    Returns:
+      A ``(trusted_bodies, ignored)`` pair, ordered oldest to newest.
+      ``ignored`` holds ``"login (ASSOCIATION)"`` descriptions for
+      untrusted comments that the detector accepted, so the caller can
+      explain the omission rather than failing silently.
+    """
+    issue = _get_issue(pr)
+
+    trusted_bodies: list[str] = []
+    ignored: list[str] = []
+
+    for comment in issue.get_comments():
+        body = getattr(comment, "body", "") or ""
+        if not body:
+            continue
+
+        association = str(getattr(comment, "author_association", "") or "")
+        if is_trusted_association(association):
+            trusted_bodies.append(body)
+            continue
+
+        if directive_detector is not None and directive_detector(body):
+            login = (
+                getattr(getattr(comment, "user", None), "login", "")
+                or "unknown"
+            )
+            ignored.append(f"{login} ({association or 'unknown'})")
+
+    return trusted_bodies, ignored
 
 
 @external_api_call(ApiType.GITHUB, "create_pr_comment")

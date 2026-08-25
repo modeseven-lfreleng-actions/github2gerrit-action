@@ -102,6 +102,57 @@ acts on it during the next workflow run.
 - When the same command appears in more than one comment, only the latest
   occurrence takes effect.
 - The tool logs unrecognized directives at debug level and ignores them.
+- Only comments from trusted authors count. See below.
+
+### Who May Issue Commands
+
+These repositories are public, so the tool checks who wrote a comment before
+acting on it. Without that check, any GitHub user able to leave a comment
+could direct the tool.
+
+A comment counts only when GitHub reports its author's `author_association`
+as one of:
+
+| Association    | Meaning                                    |
+| -------------- | ------------------------------------------ |
+| `OWNER`        | Owns the repository                        |
+| `MEMBER`       | Member of the owning organization          |
+| `COLLABORATOR` | Invited collaborator on the repository     |
+
+`CONTRIBUTOR` is **not** trusted. It means only that the author has had a
+pull request merged at some point, which any outside contributor can achieve
+and which carries no authority.
+
+The tool ignores directives from anyone else and logs a warning naming the
+author and their association, so a refused command is visible rather than
+silently dropped.
+
+#### For contributors adding commands
+
+Adding a `CommandDefinition` to the registry gives the new command the same
+authorisation as the existing one, so long as consumers reach it through
+`github2gerrit.pr_directives`, which fetches comments, discards untrusted
+authors and parses in a single step.
+
+The parsing module performs no authorisation of its own. Calling
+`parse_commands`, `find_command` or `has_command` with comments taken straight
+from the GitHub API skips the check and recreates the original defect.
+
+Override the trusted set with `G2G_TRUSTED_ASSOCIATIONS`, a comma-separated
+list. Setting it to `OWNER` alone is the strictest useful value:
+
+```yaml
+env:
+  G2G_TRUSTED_ASSOCIATIONS: "OWNER,MEMBER"
+```
+
+An empty or blank value keeps the default rather than trusting nobody or
+everyone.
+
+Note that `MEMBER` means organization member, which is not the same as write
+access to a given repository. On a Gerrit mirror that remains the only
+available signal, because the GitHub collaborator list holds infrastructure
+accounts rather than the project's reviewers.
 
 ### Available Commands
 

@@ -515,9 +515,13 @@ class TestShouldCreateMissing:
 
         mock_comment_1 = MagicMock()
         mock_comment_1.body = "CI is stuck, let me try this:"
+        mock_comment_1.author_association = "MEMBER"
 
         mock_comment_2 = MagicMock()
         mock_comment_2.body = "@github2gerrit create missing change"
+        # Directives are only obeyed from a trusted author; see
+        # tests/test_pr_command_authorisation.py.
+        mock_comment_2.author_association = "MEMBER"
 
         mock_issue = MagicMock()
         mock_issue.get_comments.return_value = [mock_comment_1, mock_comment_2]
@@ -578,6 +582,9 @@ class TestShouldCreateMissing:
 
         mock_comment = MagicMock()
         mock_comment.body = "@github2gerrit create-missing"
+        # Directives are only obeyed from a trusted author; see
+        # tests/test_pr_command_authorisation.py.
+        mock_comment.author_association = "MEMBER"
 
         mock_issue = MagicMock()
         mock_issue.get_comments.return_value = [mock_comment]
