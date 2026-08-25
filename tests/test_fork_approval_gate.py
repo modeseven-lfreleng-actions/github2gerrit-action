@@ -1,0 +1,679 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+"""Maintainer approval gate for fork pull requests.
+
+Transferring a fork pull request pushes someone else's code into Gerrit
+under the tool's SSH identity, where Gerrit CI executes it. These tests
+pin the conditions under which that is allowed.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+
+from github2gerrit.models import GitHubContext
+from github2gerrit.models import PROperationMode
+from github2gerrit.pr_approval import APPROVAL_MARKER
+from github2gerrit.pr_approval import ApprovalStatus
+from github2gerrit.pr_approval import evaluate_fork_approval
+from github2gerrit.pr_approval import render_blocked_comment
+from github2gerrit.pr_approval import render_cleared_comment
+
+
+BASE_REPO = "opendaylight/mdsal"
+FORK_REPO = "contributor/mdsal"
+HEAD_SHA = "0b2abdcf7bb2fb5ed6620f214968ae2b3c5e70e6"
+OLD_SHA = "1111111111111111111111111111111111111111"
+
+
+def _review(
+    state: str,
+    login: str,
+    association: str = "MEMBER",
+    commit_id: str = HEAD_SHA,
+) -> Any:
+    review = MagicMock()
+    review.state = state
+    review.commit_id = commit_id
+    review.author_association = association
+    review.user = MagicMock()
+    review.user.login = login
+    return review
+
+
+def _pr(reviews: list[Any], author: str = "contributor") -> Any:
+    pr = MagicMock()
+    pr.get_reviews.return_value = reviews
+    pr.user = MagicMock()
+    pr.user.login = author
+    pr.head = MagicMock()
+    pr.head.sha = HEAD_SHA
+    return pr
+
+
+def _evaluate(reviews: list[Any], author: str = "contributor"):
+    return evaluate_fork_approval(
+        _pr(reviews, author), head_sha=HEAD_SHA, author_login=author
+    )
+
+
+class TestApprovalEvaluation:
+    """Which reviews authorise a transfer."""
+
+    def test_no_reviews_blocks(self) -> None:
+        status = _evaluate([])
+        assert status.approved is False
+        assert "no maintainer has approved" in status.reason
+
+    @pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+    def test_trusted_approval_passes(self, association: str) -> None:
+        status = _evaluate([_review("APPROVED", "maintainer", association)])
+        assert status.approved is True
+        assert status.approvers == ["maintainer"]
+
+    @pytest.mark.parametrize(
+        "association", ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"]
+    )
+    def test_untrusted_approval_ignored(self, association: str) -> None:
+        status = _evaluate([_review("APPROVED", "outsider", association)])
+        assert status.approved is False
+
+    def test_missing_association_ignored(self) -> None:
+        status = _evaluate([_review("APPROVED", "ghost", "")])
+        assert status.approved is False
+
+
+class TestApprovalBindsToHeadSha:
+    """The approve-then-force-push bypass."""
+
+    def test_approval_of_older_commit_does_not_count(self) -> None:
+        """GitHub keeps approvals across pushes unless told otherwise."""
+        status = _evaluate(
+            [_review("APPROVED", "maintainer", commit_id=OLD_SHA)]
+        )
+        assert status.approved is False
+        assert status.stale_approvers == ["maintainer"]
+        assert "does not cover the current commit" in status.reason
+
+    def test_approval_without_commit_id_does_not_count(self) -> None:
+        """Absent SHA metadata cannot establish what was reviewed."""
+        status = _evaluate([_review("APPROVED", "maintainer", commit_id="")])
+        assert status.approved is False
+        assert status.stale_approvers == ["maintainer"]
+
+    def test_unknown_head_sha_blocks(self) -> None:
+        pr = _pr([_review("APPROVED", "maintainer")])
+        status = evaluate_fork_approval(
+            pr, head_sha="", author_login="contributor"
+        )
+        assert status.approved is False
+
+    def test_reapproval_after_push_counts(self) -> None:
+        status = _evaluate(
+            [
+                _review("APPROVED", "maintainer", commit_id=OLD_SHA),
+                _review("APPROVED", "maintainer", commit_id=HEAD_SHA),
+            ]
+        )
+        assert status.approved is True
+
+    def test_sha_comparison_is_case_insensitive(self) -> None:
+        status = _evaluate(
+            [_review("APPROVED", "maintainer", commit_id=HEAD_SHA.upper())]
+        )
+        assert status.approved is True
+
+
+class TestSelfApproval:
+    """GitHub forbids it; the tool does not rely on that alone."""
+
+    def test_author_cannot_approve_own_pr(self) -> None:
+        """Org membership is weak, so the author is excluded outright."""
+        status = _evaluate(
+            [_review("APPROVED", "contributor", "MEMBER")],
+            author="contributor",
+        )
+        assert status.approved is False
+
+    def test_author_exclusion_is_case_insensitive(self) -> None:
+        status = _evaluate(
+            [_review("APPROVED", "Contributor", "MEMBER")],
+            author="contributor",
+        )
+        assert status.approved is False
+
+    def test_other_member_still_counts(self) -> None:
+        status = _evaluate(
+            [
+                _review("APPROVED", "contributor", "MEMBER"),
+                _review("APPROVED", "maintainer", "MEMBER"),
+            ],
+            author="contributor",
+        )
+        assert status.approved is True
+        assert status.approvers == ["maintainer"]
+
+
+class TestReviewHistoryReduction:
+    """The endpoint returns history, not current state."""
+
+    def test_changes_requested_blocks(self) -> None:
+        status = _evaluate(
+            [
+                _review("APPROVED", "one"),
+                _review("CHANGES_REQUESTED", "two"),
+            ]
+        )
+        assert status.approved is False
+        assert status.blockers == ["two"]
+
+    def test_later_approval_supersedes_changes_requested(self) -> None:
+        status = _evaluate(
+            [
+                _review("CHANGES_REQUESTED", "maintainer"),
+                _review("APPROVED", "maintainer"),
+            ]
+        )
+        assert status.approved is True
+
+    def test_later_changes_requested_supersedes_approval(self) -> None:
+        status = _evaluate(
+            [
+                _review("APPROVED", "maintainer"),
+                _review("CHANGES_REQUESTED", "maintainer"),
+            ]
+        )
+        assert status.approved is False
+
+    def test_trailing_comment_does_not_erase_approval(self) -> None:
+        """COMMENTED expresses no position and must not displace one."""
+        status = _evaluate(
+            [
+                _review("APPROVED", "maintainer"),
+                _review("COMMENTED", "maintainer"),
+            ]
+        )
+        assert status.approved is True
+
+    def test_dismissed_approval_does_not_count(self) -> None:
+        status = _evaluate(
+            [
+                _review("APPROVED", "maintainer"),
+                _review("DISMISSED", "maintainer"),
+            ]
+        )
+        assert status.approved is False
+
+    def test_pending_review_does_not_count(self) -> None:
+        status = _evaluate([_review("PENDING", "maintainer")])
+        assert status.approved is False
+
+
+class TestEvaluationFailsClosed:
+    """An unreadable review list is not an approval."""
+
+    def test_api_failure_blocks(self) -> None:
+        pr = MagicMock()
+        pr.get_reviews.side_effect = RuntimeError("403")
+
+        status = evaluate_fork_approval(
+            pr, head_sha=HEAD_SHA, author_login="contributor"
+        )
+
+        assert status.approved is False
+        assert "could not read" in status.reason
+
+
+class TestBlockedComment:
+    """What the contributor is told."""
+
+    def test_carries_marker_for_idempotent_updates(self) -> None:
+        body = render_blocked_comment(
+            ApprovalStatus(approved=False, reason="no approval"),
+            head_sha=HEAD_SHA,
+        )
+        assert body.startswith(APPROVAL_MARKER)
+
+    def test_explains_stale_approval_distinctly(self) -> None:
+        """Being told 'no approval' when you approved is confusing."""
+        body = render_blocked_comment(
+            ApprovalStatus(
+                approved=False,
+                reason="the approval from maintainer does not cover it",
+                stale_approvers=["maintainer"],
+            ),
+            head_sha=HEAD_SHA,
+        )
+        assert "Re-approve" in body
+        assert HEAD_SHA[:7] in body
+
+    def test_names_the_trust_policy(self) -> None:
+        body = render_blocked_comment(
+            ApprovalStatus(approved=False, reason="no approval"),
+            head_sha=HEAD_SHA,
+        )
+        assert "MEMBER" in body
+        assert "cannot approve their own" in body
+
+
+def _ctx(
+    *,
+    head_repo: str = FORK_REPO,
+    event_name: str = "pull_request_target",
+    pr_number: int | None = 29,
+) -> GitHubContext:
+    return GitHubContext(
+        event_name=event_name,
+        event_action="opened",
+        event_path=None,
+        repository=BASE_REPO,
+        repository_owner="opendaylight",
+        server_url="https://github.com",
+        run_id="1",
+        sha=HEAD_SHA,
+        base_ref="master",
+        head_ref="topic/fix",
+        pr_number=pr_number,
+        head_repo=head_repo,
+    )
+
+
+class TestForkApprovalGate:
+    """The gate's decision at the CLI boundary."""
+
+    def _gate(self, ctx: GitHubContext, pr: Any) -> bool:
+        from github2gerrit.cli import _check_fork_approval
+
+        with (
+            patch("github2gerrit.cli._post_fork_approval_notice"),
+            patch(
+                "github2gerrit.cli._is_github_actions_context",
+                return_value=True,
+            ),
+        ):
+            return _check_fork_approval(pr, ctx)[0]
+
+    def test_direct_cli_invocation_is_not_gated(self) -> None:
+        """The operator running the CLI is already the authority.
+
+        The gate exists for the unattended path, where the tool acts on
+        a shared identity with nobody watching.
+        """
+        from github2gerrit.cli import _check_fork_approval
+
+        with (
+            patch("github2gerrit.cli._post_fork_approval_notice"),
+            patch(
+                "github2gerrit.cli._is_github_actions_context",
+                return_value=False,
+            ),
+        ):
+            assert _check_fork_approval(_pr([]), _ctx())[0] is True
+
+    def test_same_repo_pr_is_never_gated(self) -> None:
+        """A same-repo head branch already implies write access."""
+        pr = _pr([])
+        assert self._gate(_ctx(head_repo=BASE_REPO), pr) is True
+
+    def test_fork_without_approval_blocked(self) -> None:
+        assert self._gate(_ctx(), _pr([])) is False
+
+    def test_fork_with_approval_allowed(self) -> None:
+        pr = _pr([_review("APPROVED", "maintainer")])
+        assert self._gate(_ctx(), pr) is True
+
+    def test_unresolvable_pr_blocks(self) -> None:
+        """Fail closed: unknown provenance is not permission."""
+        assert self._gate(_ctx(), None) is False
+
+    def test_unresolvable_pr_on_same_repo_still_passes(self) -> None:
+        assert self._gate(_ctx(head_repo=BASE_REPO), None) is True
+
+    def test_unknown_provenance_is_gated(self) -> None:
+        """An absent signal is not an answer to a question of authority.
+
+        ``is_fork_pr`` reports ``False`` when provenance is unknown
+        because it states a fact. The gate uses ``head_is_trusted``
+        instead, which reports ``False`` in the same case, so a pull
+        request whose head could not be resolved is gated rather than
+        waved through.
+        """
+        assert self._gate(_ctx(head_repo=""), _pr([])) is False
+
+    def test_unknown_provenance_with_approval_passes(self) -> None:
+        pr = _pr([_review("APPROVED", "maintainer")])
+        assert self._gate(_ctx(head_repo=""), pr) is True
+
+
+class TestApprovalNoticeOwnership:
+    """The marker is not proof of authorship.
+
+    Anyone may paste it into a comment. Ownership is established by
+    attempting the edit, which the API refuses on another user's
+    comment.
+    """
+
+    def _post(self, comments: list[Any]) -> tuple[bool, list[Any]]:
+        from github2gerrit.cli import _post_fork_approval_notice
+
+        issue = MagicMock()
+        issue.get_comments.return_value = comments
+        pr = MagicMock()
+        pr.as_issue.return_value = issue
+
+        with (
+            patch("github2gerrit.cli.env_bool", return_value=False),
+            patch("github2gerrit.cli.create_pr_comment") as created,
+        ):
+            _post_fork_approval_notice(
+                pr,
+                ApprovalStatus(approved=False, reason="no approval"),
+                HEAD_SHA,
+            )
+        return created.called, comments
+
+    def _marker_comment(self, *, editable: bool) -> Any:
+        comment = MagicMock()
+        comment.body = f"{APPROVAL_MARKER}\nolder text"
+        if not editable:
+            comment.edit.side_effect = RuntimeError("403 Forbidden")
+        return comment
+
+    def test_own_notice_is_edited_not_duplicated(self) -> None:
+        own = self._marker_comment(editable=True)
+
+        created, _ = self._post([own])
+
+        own.edit.assert_called_once()
+        assert created is False
+
+    def test_planted_marker_does_not_suppress_the_notice(self) -> None:
+        """A comment we cannot edit is not ours; post our own."""
+        planted = self._marker_comment(editable=False)
+
+        created, _ = self._post([planted])
+
+        assert created is True
+
+    def test_planted_marker_alongside_our_own(self) -> None:
+        """Newest first, so our own notice is found and edited."""
+        planted = self._marker_comment(editable=False)
+        own = self._marker_comment(editable=True)
+
+        created, _ = self._post([planted, own])
+
+        own.edit.assert_called_once()
+        assert created is False
+
+    def test_no_prior_notice_creates_one(self) -> None:
+        other = MagicMock()
+        other.body = "unrelated chatter"
+
+        created, _ = self._post([other])
+
+        assert created is True
+
+    def test_comment_failure_does_not_raise(self) -> None:
+        """A block must never become a crash."""
+        pr = MagicMock()
+        pr.as_issue.side_effect = RuntimeError("boom")
+
+        from github2gerrit.cli import _post_fork_approval_notice
+
+        with (
+            patch("github2gerrit.cli.env_bool", return_value=False),
+            patch(
+                "github2gerrit.cli.create_pr_comment",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            _post_fork_approval_notice(
+                pr,
+                ApprovalStatus(approved=False, reason="no approval"),
+                HEAD_SHA,
+            )
+
+
+class TestApprovedHeadPinning:
+    """Closing the window between the check and the fetch.
+
+    ``refs/pull/<N>/head`` is mutable, so a contributor can push
+    between the gate reading the head SHA and the workspace fetch
+    reading the ref. The fetch compares what it got against what was
+    approved.
+    """
+
+    def _enforce(self, approved: str, fetched: str) -> None:
+        from github2gerrit.core import Orchestrator
+
+        orch = Orchestrator(
+            workspace=Path("/nonexistent"), approved_sha=approved
+        )
+
+        result = MagicMock()
+        result.stdout = fetched
+
+        with patch("github2gerrit.gitutils.run_cmd", return_value=result):
+            orch._enforce_approved_head(MagicMock())
+
+    def test_matching_head_passes(self) -> None:
+        self._enforce(HEAD_SHA, HEAD_SHA)
+
+    def test_comparison_is_case_insensitive(self) -> None:
+        self._enforce(HEAD_SHA, HEAD_SHA.upper())
+
+    def test_moved_head_refuses(self) -> None:
+        from github2gerrit.core import OrchestratorError
+
+        with pytest.raises(OrchestratorError, match="moved after approval"):
+            self._enforce(HEAD_SHA, OLD_SHA)
+
+    def test_no_recorded_approval_imposes_no_constraint(self) -> None:
+        """Same-repo PRs and CLI runs record nothing and are unaffected."""
+        self._enforce("", OLD_SHA)
+
+    def test_archive_fallback_is_also_checked(self) -> None:
+        """The archive path re-reads the PR's current head.
+
+        It must be checked before download: unlike the git path there
+        is no commit object left to compare afterwards.
+        """
+        from github2gerrit.core import Orchestrator
+        from github2gerrit.core import OrchestratorError
+
+        orch = Orchestrator(
+            workspace=Path("/nonexistent"), approved_sha=HEAD_SHA
+        )
+
+        orch._assert_archive_sha_approved(HEAD_SHA)
+        with pytest.raises(OrchestratorError, match="moved after approval"):
+            orch._assert_archive_sha_approved(OLD_SHA)
+
+    def test_archive_fallback_unconstrained_when_no_gate(self) -> None:
+        from github2gerrit.core import Orchestrator
+
+        orch = Orchestrator(workspace=Path("/nonexistent"))
+        orch._assert_archive_sha_approved(OLD_SHA)
+
+
+class TestApprovedShaIsPerPullRequest:
+    """Bulk runs process several pull requests concurrently.
+
+    The approved commit travels with the pull request rather than
+    through shared state, so one worker cannot clear or overwrite
+    another's constraint.
+    """
+
+    def _gate(self, ctx: GitHubContext, pr: Any) -> tuple[bool, str]:
+        from github2gerrit.cli import _check_fork_approval
+
+        with (
+            patch("github2gerrit.cli._post_fork_approval_notice"),
+            patch(
+                "github2gerrit.cli._is_github_actions_context",
+                return_value=True,
+            ),
+        ):
+            return _check_fork_approval(pr, ctx)
+
+    def test_approval_returns_the_head(self) -> None:
+        pr = _pr([_review("APPROVED", "maintainer")])
+        assert self._gate(_ctx(), pr) == (True, HEAD_SHA)
+
+    def test_block_returns_no_constraint(self) -> None:
+        assert self._gate(_ctx(), _pr([])) == (False, "")
+
+    def test_trusted_head_returns_no_constraint(self) -> None:
+        pr = _pr([])
+        assert self._gate(_ctx(head_repo=BASE_REPO), pr) == (True, "")
+
+    def test_nothing_is_written_to_the_environment(self) -> None:
+        """Shared state is what made concurrent runs unsafe."""
+        before = dict(os.environ)
+        self._gate(_ctx(), _pr([_review("APPROVED", "maintainer")]))
+        assert os.environ == before
+
+
+class TestApprovalNoticeRetraction:
+    """A lifted block must stop saying it is blocking."""
+
+    def _clear(self, comments: list[Any]) -> None:
+        from github2gerrit.cli import _clear_fork_approval_notice
+
+        issue = MagicMock()
+        issue.get_comments.return_value = comments
+        pr = MagicMock()
+        pr.as_issue.return_value = issue
+
+        with patch("github2gerrit.cli.env_bool", return_value=False):
+            _clear_fork_approval_notice(
+                pr,
+                ApprovalStatus(approved=True, reason="approved by maintainer"),
+                HEAD_SHA,
+            )
+
+    def test_existing_notice_is_retracted(self) -> None:
+        notice = MagicMock()
+        notice.body = f"{APPROVAL_MARKER}\nAwaiting maintainer approval"
+
+        self._clear([notice])
+
+        notice.edit.assert_called_once()
+        assert "Approved" in notice.edit.call_args[0][0]
+
+    def test_no_notice_creates_nothing(self) -> None:
+        """A PR that was never blocked has nothing to retract."""
+        other = MagicMock()
+        other.body = "unrelated chatter"
+
+        with patch("github2gerrit.cli.create_pr_comment") as created:
+            self._clear([other])
+
+        assert created.called is False
+
+    def test_planted_marker_is_not_edited(self) -> None:
+        planted = MagicMock()
+        planted.body = APPROVAL_MARKER
+        planted.edit.side_effect = RuntimeError("403 Forbidden")
+
+        self._clear([planted])
+
+    def test_cleared_body_warns_that_pushes_reset_approval(self) -> None:
+        body = render_cleared_comment(
+            ApprovalStatus(approved=True, reason="approved by maintainer"),
+            head_sha=HEAD_SHA,
+        )
+        assert body.startswith(APPROVAL_MARKER)
+        assert "fresh approval" in body
+
+
+class TestReviewEventOperationMode:
+    """A review must not create a sibling change."""
+
+    def test_review_event_maps_to_update(self) -> None:
+        ctx = _ctx(event_name="pull_request_review")
+        assert ctx.get_operation_mode() is PROperationMode.UPDATE
+
+    def test_pull_request_events_unchanged(self) -> None:
+        ctx = _ctx(event_name="pull_request_target")
+        assert ctx.get_operation_mode() is PROperationMode.CREATE
+
+
+class TestBlockedCommentWording:
+    """The notice must not assert more than the tool established."""
+
+    def test_does_not_claim_the_pr_is_from_a_fork(self) -> None:
+        """Unknown provenance is gated too, and is not known to be a fork."""
+        body = render_blocked_comment(
+            ApprovalStatus(approved=False, reason="no approval"),
+            head_sha=HEAD_SHA,
+        )
+        assert "comes from a fork" not in body
+        assert "could not establish" in body
+
+
+class TestReviewTriggersCreateMissing:
+    """First approval of a fork PR has no change to update."""
+
+    def _should_create(
+        self, event_name: str, head_repo: str = FORK_REPO
+    ) -> bool:
+        from github2gerrit.core import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        inputs = MagicMock()
+        inputs.create_missing = False
+        gh = _ctx(event_name=event_name, head_repo=head_repo)
+
+        with patch("github2gerrit.core.build_client", side_effect=OSError):
+            return orch._should_create_missing(inputs, gh)[0]
+
+    def test_review_event_authorises_create(self) -> None:
+        assert self._should_create("pull_request_review") is True
+
+    def test_reason_names_the_review(self) -> None:
+        """The notice must not claim a comment or flag triggered it."""
+        from github2gerrit.core import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        inputs = MagicMock()
+        inputs.create_missing = False
+
+        with patch("github2gerrit.core.build_client", side_effect=OSError):
+            _ok, reason = orch._should_create_missing(
+                inputs, _ctx(event_name="pull_request_review")
+            )
+
+        assert "approving review" in reason
+        assert "--create-missing" not in reason
+
+    def test_flag_reason_names_the_flag(self) -> None:
+        from github2gerrit.core import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        inputs = MagicMock()
+        inputs.create_missing = True
+
+        _ok, reason = orch._should_create_missing(inputs, _ctx())
+
+        assert "--create-missing" in reason
+
+    def test_synchronize_event_does_not(self) -> None:
+        assert self._should_create("pull_request_target") is False
+
+    def test_same_repo_review_does_not_override_policy(self) -> None:
+        """A same-repo PR was never gated, so a review is not consent.
+
+        Otherwise any review on any pull request would quietly defeat
+        ``CREATE_MISSING=false``.
+        """
+        assert (
+            self._should_create("pull_request_review", head_repo=BASE_REPO)
+            is False
+        )

@@ -46,7 +46,7 @@ class _DummyResult:
 
 
 class _DummyOrchestratorSingle:
-    def __init__(self, workspace: Any) -> None:
+    def __init__(self, workspace: Any, approved_sha: str = "") -> None:
         self.workspace = workspace
 
     def _prepare_workspace_checkout(self, *, inputs: Any, gh: Any) -> None:
@@ -69,7 +69,7 @@ class _DummyOrchestratorSingle:
 
 
 class _DummyOrchestratorMulti:
-    def __init__(self, workspace: Any) -> None:
+    def __init__(self, workspace: Any, approved_sha: str = "") -> None:
         self.workspace = workspace
 
     def _prepare_workspace_checkout(self, *, inputs: Any, gh: Any) -> None:
@@ -88,7 +88,16 @@ class _DummyOrchestratorMulti:
 
 def _base_env_with_event(tmp_path: Path) -> dict[str, str]:
     event_path = tmp_path / "event.json"
-    event = {"action": "opened", "pull_request": {"number": 77}}
+    # Real pull_request/pull_request_target payloads always carry the
+    # head repository, which the fork approval gate reads to tell a
+    # same-repository pull request from a fork.
+    event = {
+        "action": "opened",
+        "pull_request": {
+            "number": 77,
+            "head": {"repo": {"full_name": "example/repo"}},
+        },
+    }
     event_path.write_text(json.dumps(event), encoding="utf-8")
 
     # Start with a minimal clean environment to avoid pollution

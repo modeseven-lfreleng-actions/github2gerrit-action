@@ -80,6 +80,21 @@ class GhUser(Protocol):
     login: str
 
 
+class GhReview(Protocol):
+    """A submitted pull request review.
+
+    ``state`` is one of ``APPROVED``, ``CHANGES_REQUESTED``,
+    ``COMMENTED``, ``DISMISSED`` or ``PENDING``.  ``commit_id`` is the
+    head SHA the review was submitted against, which is what binds an
+    approval to the code that was actually reviewed.
+    """
+
+    state: str | None
+    commit_id: str | None
+    author_association: str | None
+    user: GhUser | None
+
+
 class GhIssueComment(Protocol):
     body: str | None
     author_association: str | None
@@ -102,6 +117,10 @@ class GhPullRequest(Protocol):
 
     def as_issue(self) -> GhIssue:
         """Return the issue view of this pull request."""
+        raise NotImplementedError
+
+    def get_reviews(self) -> Iterable[GhReview]:
+        """Return the reviews submitted on this pull request."""
         raise NotImplementedError
 
     def edit(self, *, state: str) -> None:
@@ -133,6 +152,7 @@ __all__ = [
     "create_pr_comment",
     "get_pr_title_body",
     "get_pull",
+    "get_pull_request_reviews",
     "get_recent_change_ids_from_comments",
     "get_repo_from_env",
     "get_trusted_comment_bodies",
@@ -325,6 +345,35 @@ def get_recent_change_ids_from_comments(
             if cid:
                 found.append(cid)
     return found
+
+
+@external_api_call(ApiType.GITHUB, "get_pull_request_reviews")
+def get_pull_request_reviews(pr: GhPullRequest) -> list[GhReview]:
+    """Return the reviews on a pull request, oldest first.
+
+    The endpoint returns the full review *history*, not current state:
+    one user may appear several times.  Callers must reduce to the
+    latest meaningful review per user themselves.
+    """
+    try:
+        reviews = list(pr.get_reviews())
+    except Exception as exc:
+        if is_github_api_permission_error(exc):
+            raise GitHub2GerritError(
+                ExitCode.GITHUB_API_ERROR,
+                message=(
+                    "❌ GitHub API query failed; cannot read reviews for "
+                    f"pull request #{pr.number}"
+                ),
+                details=(
+                    "GITHUB_TOKEN needs pull-requests read access to "
+                    "evaluate approvals"
+                ),
+                original_exception=exc,
+            ) from exc
+        raise
+    else:
+        return reviews
 
 
 @external_api_call(ApiType.GITHUB, "get_trusted_comment_bodies")

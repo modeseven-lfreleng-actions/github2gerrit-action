@@ -142,14 +142,26 @@ class GitHubContext:
     def get_operation_mode(self) -> PROperationMode:
         """Determine the operation mode based on event type and action.
 
-        Supports both ``pull_request`` and ``pull_request_target`` triggers.
-        Using ``pull_request`` is preferred for security (avoids granting
-        secrets to untrusted fork code), while ``pull_request_target`` is
-        accepted for backward compatibility.
+        Supports both ``pull_request`` and ``pull_request_target``
+        triggers.  Using ``pull_request`` is preferred for security
+        (avoids granting secrets to untrusted fork code), while
+        ``pull_request_target`` is accepted for backward compatibility.
+
+        ``pull_request_review`` maps to UPDATE.  A review changes no
+        code, so an existing Gerrit change should gain a patchset
+        rather than a sibling.  When the review is instead the event
+        that first unblocks a fork pull request, no change exists yet
+        and the create-missing fallback covers it — see
+        ``Orchestrator._should_create_missing``.  Choosing CREATE here
+        instead would raise a duplicate for the far commoner case of a
+        re-approval after a push.
 
         Returns:
             PROperationMode enum indicating the type of operation
         """
+        if self.event_name == "pull_request_review":
+            return PROperationMode.UPDATE
+
         if self.event_name not in ("pull_request", "pull_request_target"):
             return PROperationMode.UNKNOWN
 

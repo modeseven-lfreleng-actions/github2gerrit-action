@@ -89,9 +89,15 @@ jobs:
           DRY_RUN: 'true'
           AUTOMATION_ONLY: 'false'
 
-      # Failure testing is also important
+      # Failure testing is also important.
+      #
+      # Skipped for pull requests raised from a fork: the approval gate
+      # stops those before input validation is reached, so the step
+      # above exits successfully having transferred nothing. That is
+      # the gate working, not the failure case under test.
       - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+        # yamllint disable-line rule:line-length
+        if: steps.failure.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           # Error if step above did NOT fail
