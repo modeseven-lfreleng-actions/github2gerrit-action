@@ -12,8 +12,8 @@ recognised command phrase.
 Design principles
 ─────────────────
 - **Registry-based**: new commands are added by appending a
-  ``CommandDefinition`` to ``COMMAND_REGISTRY``; no other code changes
-  are required for recognition.
+  ``CommandDefinition`` to ``COMMAND_REGISTRY``; no change to this
+  module's parsing logic is required.
 - **Case-insensitive**: command matching ignores case so that
   ``@github2gerrit Create Missing Change`` works identically to
   ``@github2gerrit create missing change``.
@@ -24,6 +24,21 @@ Design principles
   deduplication purposes.
 - **Minimal coupling**: the module depends only on the standard library
   and exposes typed dataclasses consumed by the orchestrator.
+
+.. warning::
+
+   **This module performs no authorisation.** Every function here
+   assumes its input has already been filtered to comments from trusted
+   authors.  Passing raw comments straight from the GitHub API lets any
+   user of a public mirror direct the tool — the defect fixed in issue
+   #382.
+
+   Adding a command to ``COMMAND_REGISTRY`` requires no changes here,
+   but it does **not** grant that command a security gate on its own.
+   Consume commands through :mod:`github2gerrit.pr_directives`, which
+   fetches, authorises and parses in one step, rather than calling
+   :func:`parse_commands`, :func:`find_command` or :func:`has_command`
+   directly.
 
 Supported commands
 ──────────────────
@@ -48,6 +63,7 @@ __all__ = [
     "CommandDefinition",
     "CommandMatch",
     "CommandParseResult",
+    "contains_directive",
     "find_command",
     "has_command",
     "list_commands",
@@ -208,16 +224,52 @@ def _build_phrase_index() -> dict[str, str]:
 # ── Public API ──────────────────────────────────────────────────────
 
 
-def parse_commands(comment_bodies: list[str]) -> CommandParseResult:
-    """Scan PR comment bodies for ``@github2gerrit`` commands.
+def contains_directive(body: str) -> bool:
+    """Report whether *body* holds a syntactically valid directive.
+
+    Applies the same grammar as :func:`parse_commands`, so a bare
+    ``@github2gerrit`` mention is *not* a directive — consistent with
+    that function, which reports it as neither a match nor an
+    unrecognised directive.
+
+    A mention followed by whitespace alone is likewise not a directive.
+    The mention pattern's ``.`` matches spaces, so such text satisfies
+    the regex, but there is no command in it for anyone to act on.
+
+    Callers use this to distinguish an ordinary comment that happens to
+    mention the tool from one that attempts to direct it.
+
+    Args:
+        body: Comment body text.
+
+    Returns:
+        ``True`` when the mention is followed by non-whitespace text.
+    """
+    if not body:
+        return False
+    match = _MENTION_RE.search(body)
+    return match is not None and bool(match.group(1).strip())
+
+
+def parse_commands(
+    trusted_comment_bodies: list[str],
+) -> CommandParseResult:
+    """Scan trusted PR comment bodies for ``@github2gerrit`` commands.
 
     Comments are processed oldest-first.  When the same command appears
     in multiple comments the *latest* occurrence is kept (deduplication
     by canonical command name).
 
+    .. warning::
+
+       Performs no authorisation.  *trusted_comment_bodies* must
+       already exclude comments from untrusted authors; prefer
+       :func:`github2gerrit.pr_directives.scan_pr_directives`, which
+       does that for you.
+
     Args:
-        comment_bodies: Ordered list of comment body strings
-            (oldest → newest).
+        trusted_comment_bodies: Ordered list of comment body strings
+            (oldest → newest), already filtered by author trust.
 
     Returns:
         A ``CommandParseResult`` containing de-duplicated matches and
@@ -228,7 +280,7 @@ def parse_commands(comment_bodies: list[str]) -> CommandParseResult:
     seen: dict[str, CommandMatch] = {}
     unrecognised: list[str] = []
 
-    for idx, body in enumerate(comment_bodies):
+    for idx, body in enumerate(trusted_comment_bodies):
         if not body:
             continue
         for m in _MENTION_RE.finditer(body):
@@ -278,37 +330,49 @@ def parse_commands(comment_bodies: list[str]) -> CommandParseResult:
     return result
 
 
-def has_command(comment_bodies: list[str], command_name: str) -> bool:
-    """Check whether a specific command exists in the PR comments.
+def has_command(trusted_comment_bodies: list[str], command_name: str) -> bool:
+    """Check whether a specific command exists in trusted PR comments.
 
     This is a convenience wrapper around ``parse_commands`` for the
     common case where only one command matters.
 
+    .. warning::
+
+       Performs no authorisation; see :func:`parse_commands`.
+
     Args:
-        comment_bodies: Ordered list of comment body strings.
+        trusted_comment_bodies: Ordered list of comment body strings,
+            already filtered by author trust.
         command_name: Canonical command name to check for.
 
     Returns:
         ``True`` if the command was found in at least one comment.
     """
-    result = parse_commands(comment_bodies)
+    result = parse_commands(trusted_comment_bodies)
     return result.has(command_name)
 
 
 def find_command(
-    comment_bodies: list[str],
+    trusted_comment_bodies: list[str],
     command_name: str,
 ) -> CommandMatch | None:
-    """Find a specific command match in the PR comments.
+    """Find a specific command match in trusted PR comments.
+
+    .. warning::
+
+       Performs no authorisation.  Prefer
+       :func:`github2gerrit.pr_directives.find_pr_command`, which
+       filters by author trust first.
 
     Args:
-        comment_bodies: Ordered list of comment body strings.
+        trusted_comment_bodies: Ordered list of comment body strings,
+            already filtered by author trust.
         command_name: Canonical command name to search for.
 
     Returns:
         The ``CommandMatch`` if found, otherwise ``None``.
     """
-    result = parse_commands(comment_bodies)
+    result = parse_commands(trusted_comment_bodies)
     target = command_name.lower().strip()
     for m in result.matches:
         if m.command_name == target:

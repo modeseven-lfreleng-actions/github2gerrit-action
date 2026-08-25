@@ -1655,7 +1655,12 @@ class Orchestrator:
 
         Returns ``True`` when either the ``--create-missing`` CLI flag
         is active **or** a ``@github2gerrit create missing change``
-        comment is present on the PR.
+        comment is present on the PR *from a trusted author*.
+
+        Comment authorship is checked because these mirrors are public:
+        without it, anyone able to comment could force creation of a
+        Gerrit change that the UPDATE path deliberately declined to
+        make.
         """
         # 1. Explicit CLI / environment flag
         if inputs.create_missing:
@@ -1670,16 +1675,13 @@ class Orchestrator:
 
         try:
             from .pr_commands import CMD_CREATE_MISSING
-            from .pr_commands import find_command
+            from .pr_directives import find_pr_command
 
             client_gh = build_client()
             repo = get_repo_from_env(client_gh)
             pr_obj = get_pull(repo, int(gh.pr_number))
 
-            issue = pr_obj.as_issue()
-            comment_bodies = [c.body or "" for c in issue.get_comments()]
-
-            match = find_command(comment_bodies, CMD_CREATE_MISSING.name)
+            match = find_pr_command(pr_obj, CMD_CREATE_MISSING.name)
             if match is not None:
                 log.info(
                     "✅ Found '@github2gerrit %s' in PR #%s comment #%d; "
@@ -1692,7 +1694,7 @@ class Orchestrator:
 
             log.debug(
                 "No @github2gerrit create-missing command found in "
-                "PR #%s comments",
+                "PR #%s comments from trusted authors",
                 gh.pr_number,
             )
         except Exception as exc:

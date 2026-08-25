@@ -165,6 +165,7 @@ Some settings have no CLI flag and use environment variables:
 | `G2G_LOG_LEVEL`               | `WARNING`                                   | Logging level; set `DEBUG` for verbose output                                    |
 | `G2G_TOPIC_PREFIX`            | `GH`                                        | Prefix used when generating Gerrit topics                                        |
 | `G2G_SKIP_GERRIT_COMMENTS`    | `false`                                     | Skip posting back-reference comments on Gerrit changes                           |
+| `G2G_TRUSTED_ASSOCIATIONS`    | `OWNER,MEMBER,COLLABORATOR`                 | Author associations trusted to issue `@github2gerrit` comment directives         |
 | `G2G_ENABLE_DERIVATION`       | `true`                                      | Enable automatic derivation of Gerrit parameters from organization defaults      |
 | `G2G_AUTO_SAVE_CONFIG`        | context-dependent                           | Save derived parameters back to the configuration file                           |
 | `G2G_RESPECT_USER_SSH`        | `false` (`true` in direct URL mode)         | Use the local user's SSH configuration and keys instead of provided key material |
