@@ -232,6 +232,45 @@ def reset_gerrit_base_path_cache() -> Iterable[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_credential_caches() -> Iterable[None]:
+    """Clear the process-wide credential caches around every test.
+
+    ⚠️  IMPORTANT: autouse=True is REQUIRED for test suite stability
+
+    ``ssh_config_parser`` memoises four things for the lifetime of the
+    process, and every one of them derives its value from state that
+    tests routinely monkeypatch:
+
+    * ``_get_respect_user_ssh_setting`` — ``lru_cache(maxsize=1)`` over a
+      zero-argument function reading ``G2G_RESPECT_USER_SSH``.  With no
+      arguments there is a single cache slot, so *any* two tests collide
+      on it and the second receives the first one's environment.
+    * ``_get_cached_git_user_email`` — ``lru_cache(maxsize=1)`` over a
+      zero-argument function that shells out to ``git config``.  Same
+      single-slot collision, over the git identity that
+      ``isolate_git_environment`` takes care to control.
+    * ``derive_gerrit_credentials`` — ``lru_cache(maxsize=32)`` keyed on
+      ``(host, organization, port)``.  Tests share fixture hosts and
+      organisations, so the key collides while the answer depends on
+      the two caches above plus the SSH config on disk.
+    * ``_ssh_config_cache`` — keyed on ``~/.ssh/config`` as a path
+      string, never on that file's contents, so rewriting the file
+      under an unchanged ``HOME`` serves the previous parse.
+
+    ``clear_credential_cache()`` resets all four.  Two test modules call
+    it from ``setup_method``, which protects them on the way in but
+    leaves the caches populated for whatever runs next.  Doing it here
+    instead covers every test, and clearing on both sides stops a dirty
+    cache reaching a test as well as leaving one behind.
+    """
+    from github2gerrit.ssh_config_parser import clear_credential_cache
+
+    clear_credential_cache()
+    yield
+    clear_credential_cache()
+
+
+@pytest.fixture(autouse=True)
 def isolate_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Isolate git environment for each test to prevent cross-test contamination.
