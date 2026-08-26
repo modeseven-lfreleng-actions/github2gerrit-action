@@ -9,8 +9,11 @@ during orphan policy enforcement (abandon/comment operations).
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+from github2gerrit.gitreview import GerritInfo
 from github2gerrit.orchestrator.reconciliation import _abandon_orphan_changes
 from github2gerrit.orchestrator.reconciliation import _comment_orphan_changes
 
@@ -25,7 +28,7 @@ class MockGerritRestClient:
         # an authenticated client that can perform mutating REST calls.
         self.is_authenticated = True
 
-    def post(self, path: str, data: dict | None = None):
+    def post(self, path: str, data: dict[str, Any] | None = None):
         """Record POST calls and optionally simulate failures."""
         self.post_calls.append((path, data))
 
@@ -42,11 +45,9 @@ class MockGerritRestClient:
         self.should_fail[path] = error_msg
 
 
-class MockGerrit:
-    """Mock Gerrit info object."""
-
-    def __init__(self, host: str = "gerrit.example.org"):
-        self.host = host
+def _gerrit_info(host: str = "gerrit.example.org") -> GerritInfo:
+    """Build genuine Gerrit connection info (only ``host`` is read)."""
+    return GerritInfo(host=host)
 
 
 @pytest.fixture
@@ -57,8 +58,8 @@ def mock_client():
 
 @pytest.fixture
 def mock_gerrit():
-    """Provide a mock Gerrit info object."""
-    return MockGerrit()
+    """Provide Gerrit connection info."""
+    return _gerrit_info()
 
 
 def test_abandon_orphan_changes_success(mock_client, mock_gerrit, monkeypatch):
@@ -202,7 +203,7 @@ def test_comment_orphan_changes_failure(
 
 def test_abandon_orphan_changes_no_ids():
     """Test abandon with empty orphan list."""
-    result = _abandon_orphan_changes([], MockGerrit())
+    result = _abandon_orphan_changes([], _gerrit_info())
     assert result == []
 
 
@@ -216,7 +217,7 @@ def test_abandon_orphan_changes_no_gerrit():
 
 def test_comment_orphan_changes_no_ids():
     """Test comment with empty orphan list."""
-    result = _comment_orphan_changes([], MockGerrit())
+    result = _comment_orphan_changes([], _gerrit_info())
     assert result == []
 
 

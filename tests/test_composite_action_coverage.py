@@ -354,6 +354,9 @@ class TestEnvironmentMapping:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         github_vars = [
@@ -396,6 +399,9 @@ class TestIssueIdLookup:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
         issue_id_env = env_mapping.get("ISSUE_ID", "")
         issue_id_lookup_json_env = env_mapping.get("ISSUE_ID_LOOKUP_JSON", "")
@@ -642,6 +648,9 @@ class TestSecurityConsiderations:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
         assert env_mapping.get("GITHUB_TOKEN") == "${{ github.token }}"
 

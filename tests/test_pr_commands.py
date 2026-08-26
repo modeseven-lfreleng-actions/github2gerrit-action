@@ -414,7 +414,7 @@ class TestShouldCreateMissing:
         """Create a minimal Inputs object for testing."""
         from github2gerrit.models import Inputs
 
-        defaults = {
+        defaults: dict[str, Any] = {
             "submit_single_commits": False,
             "use_pr_as_commit": False,
             "fetch_depth": 10,
@@ -441,7 +441,7 @@ class TestShouldCreateMissing:
         defaults.update(kwargs)
         return Inputs(**defaults)
 
-    def _make_gh(self, pr_number: int = 42):
+    def _make_gh(self, pr_number: int | None = 42):
         """Create a minimal GitHubContext for testing."""
         from github2gerrit.models import GitHubContext
 

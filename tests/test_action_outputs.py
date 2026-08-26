@@ -119,6 +119,9 @@ class TestOutputCaptureStep:
             None,
         )
 
+        assert capture_step is not None, (
+            "No step whose name contains 'Capture outputs' in action.yaml"
+        )
         script = capture_step["run"]
 
         # Should use GitHub Actions multiline output format

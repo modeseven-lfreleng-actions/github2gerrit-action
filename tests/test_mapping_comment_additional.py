@@ -298,30 +298,45 @@ def test_reconciliation_all_new_ids_no_topic_no_comment(monkeypatch):
     is enabled, all commits receive brand new Change-Ids.
     """
     from types import SimpleNamespace
+    from typing import cast
 
+    from github2gerrit.gitreview import GerritInfo
+    from github2gerrit.models import GitHubContext
+    from github2gerrit.models import Inputs
     from github2gerrit.orchestrator import perform_reconciliation
     from github2gerrit.reconcile_matcher import LocalCommit
 
-    class GH:
-        server_url = "https://github.com"
-        repository = "org/repo"
-        repository_owner = "org"
-        pr_number = 9
-
-    class Gerrit:
-        host = "gerrit.example.org"
-        port = 29418
+    gh = GitHubContext(
+        event_name="pull_request_target",
+        event_action="opened",
+        event_path=None,
+        repository="org/repo",
+        repository_owner="org",
+        server_url="https://github.com",
+        run_id="1",
+        sha="deadbeef",
+        base_ref="master",
+        head_ref="feature",
+        pr_number=9,
+    )
+    gerrit = GerritInfo(host="gerrit.example.org", port=29418)
 
     # Force empty topic results
     from github2gerrit.orchestrator import reconciliation as rmod
 
     monkeypatch.setattr(rmod, "query_changes_by_topic", lambda *a, **k: [])
 
-    inputs = SimpleNamespace(
-        reuse_strategy="topic",
-        allow_orphan_changes=False,
-        similarity_subject=0.7,
-        log_reconcile_json=False,
+    # ``Inputs`` carries ~30 required fields; this stand-in supplies only
+    # the reconciliation switches that ``perform_reconciliation`` reads,
+    # so the cast records a deliberately partial implementation.
+    inputs = cast(
+        Inputs,
+        SimpleNamespace(
+            reuse_strategy="topic",
+            allow_orphan_changes=False,
+            similarity_subject=0.7,
+            log_reconcile_json=False,
+        ),
     )
     commits = [
         LocalCommit(
@@ -336,8 +351,8 @@ def test_reconciliation_all_new_ids_no_topic_no_comment(monkeypatch):
     ]
     result = perform_reconciliation(
         inputs=inputs,
-        gh=GH(),
-        gerrit=Gerrit(),
+        gh=gh,
+        gerrit=gerrit,
         local_commits=commits,
     )
     assert len(result) == 3
@@ -351,31 +366,43 @@ def test_reconciliation_topic_query_exception(monkeypatch):
     (fallback path).
     """
     from types import SimpleNamespace
+    from typing import cast
 
+    from github2gerrit.gitreview import GerritInfo
+    from github2gerrit.models import GitHubContext
+    from github2gerrit.models import Inputs
     from github2gerrit.orchestrator import perform_reconciliation
     from github2gerrit.orchestrator import reconciliation as rmod
     from github2gerrit.reconcile_matcher import LocalCommit
 
-    class GH:
-        server_url = "https://github.com"
-        repository = "org/repo"
-        repository_owner = "org"
-        pr_number = 11
-
-    class Gerrit:
-        host = "gerrit.example.org"
-        port = 29418
+    gh = GitHubContext(
+        event_name="pull_request_target",
+        event_action="opened",
+        event_path=None,
+        repository="org/repo",
+        repository_owner="org",
+        server_url="https://github.com",
+        run_id="1",
+        sha="deadbeef",
+        base_ref="master",
+        head_ref="feature",
+        pr_number=11,
+    )
+    gerrit = GerritInfo(host="gerrit.example.org", port=29418)
 
     def _boom(*_a, **_k):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(rmod, "query_changes_by_topic", _boom)
 
-    inputs = SimpleNamespace(
-        reuse_strategy="topic",
-        allow_orphan_changes=False,
-        similarity_subject=0.7,
-        log_reconcile_json=False,
+    inputs = cast(
+        Inputs,
+        SimpleNamespace(
+            reuse_strategy="topic",
+            allow_orphan_changes=False,
+            similarity_subject=0.7,
+            log_reconcile_json=False,
+        ),
     )
     commits = [
         LocalCommit(
@@ -389,8 +416,8 @@ def test_reconciliation_topic_query_exception(monkeypatch):
     ]
     result = perform_reconciliation(
         inputs=inputs,
-        gh=GH(),
-        gerrit=Gerrit(),
+        gh=gh,
+        gerrit=gerrit,
         local_commits=commits,
     )
     assert len(result) == 1

@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from github2gerrit.gerrit_query import GerritChange
+from github2gerrit.gitreview import GerritInfo
+from github2gerrit.models import GitHubContext
+from github2gerrit.models import Inputs
 from github2gerrit.orchestrator import perform_reconciliation
 from github2gerrit.orchestrator import reconciliation as recon_mod
 from github2gerrit.reconcile_matcher import LocalCommit
@@ -56,16 +60,24 @@ def _gerrit_change(
     )
 
 
-class _DummyGH:
-    server_url = "https://github.com"
-    repository = "org/repo"
-    repository_owner = "org"
-    pr_number = 5
+def _gh_context() -> GitHubContext:
+    return GitHubContext(
+        event_name="pull_request_target",
+        event_action="opened",
+        event_path=None,
+        repository="org/repo",
+        repository_owner="org",
+        server_url="https://github.com",
+        run_id="1",
+        sha="deadbeef",
+        base_ref="master",
+        head_ref="feature",
+        pr_number=5,
+    )
 
 
-class _DummyGerrit:
-    host = "gerrit.example.org"
-    port = 29418
+def _gerrit_info() -> GerritInfo:
+    return GerritInfo(host="gerrit.example.org", port=29418)
 
 
 def _inputs(
@@ -74,12 +86,18 @@ def _inputs(
     allow_orphan_changes: bool = False,
     similarity_subject: float = 0.7,
     log_reconcile_json: bool = False,
-):
-    return SimpleNamespace(
-        reuse_strategy=reuse_strategy,
-        allow_orphan_changes=allow_orphan_changes,
-        similarity_subject=similarity_subject,
-        log_reconcile_json=log_reconcile_json,
+) -> Inputs:
+    # ``Inputs`` carries ~30 required fields; this stand-in supplies only
+    # the reconciliation switches that ``perform_reconciliation`` reads,
+    # so the cast records a deliberately partial implementation.
+    return cast(
+        Inputs,
+        SimpleNamespace(
+            reuse_strategy=reuse_strategy,
+            allow_orphan_changes=allow_orphan_changes,
+            similarity_subject=similarity_subject,
+            log_reconcile_json=log_reconcile_json,
+        ),
     )
 
 
@@ -89,8 +107,8 @@ def _inputs(
 
 
 def test_reconciliation_strategy_none_returns_empty():
-    gh = _DummyGH()
-    gerrit = _DummyGerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     inputs = _inputs(reuse_strategy="none")
     local_commits = [_local_commit(0, "a1", "feat: one")]
     result = perform_reconciliation(
@@ -103,8 +121,8 @@ def test_reconciliation_strategy_none_returns_empty():
 
 
 def test_reconciliation_topic_reuse_path(monkeypatch: pytest.MonkeyPatch):
-    gh = _DummyGH()
-    gerrit = _DummyGerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     inputs = _inputs(reuse_strategy="topic")
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
     gh_hash = "abc123hash"
@@ -137,8 +155,8 @@ def test_reconciliation_queries_canonical_topic(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Topic discovery must query the topic format the push side uses."""
-    gh = _DummyGH()
-    gerrit = _DummyGerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     inputs = _inputs(reuse_strategy="topic")
     monkeypatch.delenv("G2G_TOPIC_PREFIX", raising=False)
 
@@ -183,8 +201,8 @@ def test_reconciliation_comment_fallback_extension(
     When topic path yields no changes and comment mapping exists with
     fewer entries than local commits, new IDs must extend mapping.
     """
-    gh = _DummyGH()
-    gerrit = _DummyGerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     inputs = _inputs(reuse_strategy="topic+comment")
 
     # Empty topic result
@@ -227,8 +245,8 @@ def test_reconciliation_json_summary_emitted(
     Enabling log_reconcile_json should emit a RECONCILE_SUMMARY log line.
     """
     caplog.set_level(logging.DEBUG)
-    gh = _DummyGH()
-    gerrit = _DummyGerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     inputs = _inputs(reuse_strategy="topic", log_reconcile_json=True)
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
     gh_hash = "def456hash"

@@ -18,11 +18,16 @@ from __future__ import annotations
 import json
 import re
 from types import SimpleNamespace
+from typing import Any
+from typing import cast
 
 # (removed unused List import)
 import pytest
 
 from github2gerrit.gerrit_query import GerritChange
+from github2gerrit.gitreview import GerritInfo
+from github2gerrit.models import GitHubContext
+from github2gerrit.models import Inputs
 from github2gerrit.orchestrator import reconciliation as recon_mod
 from github2gerrit.orchestrator.reconciliation import perform_reconciliation
 from github2gerrit.reconcile_matcher import LocalCommit
@@ -33,17 +38,24 @@ from github2gerrit.reconcile_matcher import LocalCommit
 # ---------------------------------------------------------------------------
 
 
-class _GH:
-    server_url = "https://github.com"
-    repository = "org/repo"
-    repository_owner = "org"
-    pr_number = 42
-    run_id = "99999"
+def _gh_context() -> GitHubContext:
+    return GitHubContext(
+        event_name="pull_request_target",
+        event_action="opened",
+        event_path=None,
+        repository="org/repo",
+        repository_owner="org",
+        server_url="https://github.com",
+        run_id="99999",
+        sha="deadbeef",
+        base_ref="master",
+        head_ref="feature",
+        pr_number=42,
+    )
 
 
-class _Gerrit:
-    host = "gerrit.example.org"
-    port = 29418
+def _gerrit_info() -> GerritInfo:
+    return GerritInfo(host="gerrit.example.org", port=29418)
 
 
 def _lc(idx: int, sha: str, subject: str, files: list[str]) -> LocalCommit:
@@ -80,16 +92,22 @@ def _inputs(
     log_reconcile_json: bool = True,
     orphan_policy: str = "comment",
     similarity_subject: float = 0.7,
-):
-    return SimpleNamespace(
-        reuse_strategy=reuse_strategy,
-        log_reconcile_json=log_reconcile_json,
-        orphan_policy=orphan_policy,
-        similarity_subject=similarity_subject,
+) -> Inputs:
+    # ``Inputs`` carries ~30 required fields; this stand-in supplies only
+    # the reconciliation switches that ``perform_reconciliation`` reads,
+    # so the cast records a deliberately partial implementation.
+    return cast(
+        Inputs,
+        SimpleNamespace(
+            reuse_strategy=reuse_strategy,
+            log_reconcile_json=log_reconcile_json,
+            orphan_policy=orphan_policy,
+            similarity_subject=similarity_subject,
+        ),
     )
 
 
-def _extract_summary(caplog) -> dict:
+def _extract_summary(caplog) -> dict[str, Any]:
     """
     Find and parse the most recent RECONCILE_SUMMARY json line.
     """
@@ -104,7 +122,7 @@ def _extract_summary(caplog) -> dict:
     return json.loads(m.group(1))
 
 
-def _extract_orphan_actions(caplog) -> dict | None:
+def _extract_orphan_actions(caplog) -> dict[str, Any] | None:
     lines = [r.message for r in caplog.records if "ORPHAN_ACTIONS" in r.message]
     if not lines:
         return None
@@ -127,8 +145,8 @@ def test_topic_reuse_and_orphan_policy_comment(
     Orphan policy 'comment' should log commented array with orphan id.
     """
     caplog.set_level("DEBUG")
-    gh = _GH()
-    gerrit = _Gerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
     gh_hash = "1234abcdhash"
     # Local commits -> only first Gerrit change reused.
@@ -205,8 +223,8 @@ def test_orphan_policy_variants(policy, expected_field, caplog, monkeypatch):
     Validate that the orphan action bucket changes with policy.
     """
     caplog.set_level("DEBUG")
-    gh = _GH()
-    # (removed unused variable; _Gerrit() passed inline)
+    gh = _gh_context()
+    # (removed unused variable; _gerrit_info() passed inline)
     pr_url = f"{gh.server_url}/{gh.repository}/pull/{gh.pr_number}"
     gh_hash = "abcd5678hash"
     local_commits = [_lc(0, "sha-x", "feat: one", ["x.py"])]
@@ -250,7 +268,7 @@ def test_orphan_policy_variants(policy, expected_field, caplog, monkeypatch):
     _ = perform_reconciliation(
         inputs=inputs,
         gh=gh,
-        gerrit=_Gerrit(),
+        gerrit=_gerrit_info(),
         local_commits=local_commits,
         expected_github_hash=gh_hash,
     )
@@ -269,8 +287,8 @@ def test_comment_based_reuse_extension_digest(caplog, monkeypatch):
     appended with new Change-Id; digest reflects both.
     """
     caplog.set_level("DEBUG")
-    gh = _GH()
-    gerrit = _Gerrit()
+    gh = _gh_context()
+    gerrit = _gerrit_info()
     existing_ids = ["I1234567890abcdef1234567890abcdef12345678"]
     # Force empty topic results.
     monkeypatch.setattr(recon_mod, "query_changes_by_topic", lambda *a, **k: [])
