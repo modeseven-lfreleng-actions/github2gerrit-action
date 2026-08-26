@@ -271,6 +271,35 @@ def reset_credential_caches() -> Iterable[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_derived_key_provenance() -> Iterable[None]:
+    """Clear the derived-config-key record around every test.
+
+    ⚠️  IMPORTANT: autouse=True is REQUIRED for test suite stability
+
+    ``config.mark_derived_keys`` records provenance in the
+    ``G2G_DERIVED_KEYS`` environment variable, and is deliberately
+    additive so repeated derivation passes accumulate.  Any test that
+    calls ``apply_parameter_derivation`` therefore leaves a record
+    behind, and it outlives ``monkeypatch`` teardown whenever the test
+    reached ``os.environ`` directly rather than through the fixture.
+
+    A stale record makes ``config.is_derived_key`` answer ``True`` for a
+    key a later test set explicitly, which is exactly the distinction
+    duplicate detection relies on -- so the leak would surface as a
+    short-circuit that silently stopped happening, in an unrelated
+    module, depending on test order.
+
+    Clearing on both sides keeps a dirty record from reaching a test and
+    stops one leaving a record behind.
+    """
+    from github2gerrit.config import DERIVED_KEYS_ENV
+
+    os.environ.pop(DERIVED_KEYS_ENV, None)
+    yield
+    os.environ.pop(DERIVED_KEYS_ENV, None)
+
+
+@pytest.fixture(autouse=True)
 def isolate_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Isolate git environment for each test to prevent cross-test contamination.

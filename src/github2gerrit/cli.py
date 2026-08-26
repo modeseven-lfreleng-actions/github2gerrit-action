@@ -762,10 +762,18 @@ def _save_derived_parameters_after_success(data: Inputs) -> None:
         cfg = load_org_config(org_for_cfg)
 
         # Apply derivation with saving enabled to capture newly derived
-        # parameters
+        # parameters.  The result is written to the configuration file
+        # only: this runs after submission and never calls
+        # apply_config_to_env, so nothing derived here reaches the
+        # process environment and recording it as derived provenance
+        # would describe environment values this call did not set.
         repository = os.getenv("GITHUB_REPOSITORY", "")
         apply_parameter_derivation(
-            cfg, org_for_cfg, repository=repository, save_to_config=True
+            cfg,
+            org_for_cfg,
+            repository=repository,
+            save_to_config=True,
+            mark_derived=False,
         )
 
         log.debug(

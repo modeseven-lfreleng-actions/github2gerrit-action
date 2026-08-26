@@ -3,6 +3,8 @@
 
 """Tests for duplicate change detection."""
 
+import os
+import re
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -10,15 +12,83 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 from unittest.mock import patch
+from urllib.error import URLError
+from urllib.parse import unquote
+from urllib.parse import urlsplit
 
 import pytest
 import responses
 
+from github2gerrit.config import apply_config_to_env
+from github2gerrit.config import apply_parameter_derivation
+from github2gerrit.config import mark_derived_keys
 from github2gerrit.duplicate_detection import ChangeFingerprint
 from github2gerrit.duplicate_detection import DuplicateChangeError
 from github2gerrit.duplicate_detection import DuplicateDetector
 from github2gerrit.duplicate_detection import check_for_duplicates
 from github2gerrit.models import GitHubContext
+
+
+def _gitreview_urlopen(content: bytes | None) -> Any:
+    """Build a ``urllib.request.urlopen`` side effect for tests.
+
+    Serves *content* only for an ``https://raw.githubusercontent.com``
+    origin and refuses everything else, so an unexpected network call
+    fails loudly rather than resolving through the real network.  The
+    origin is compared after parsing rather than by substring, since a
+    substring test would also accept
+    ``https://raw.githubusercontent.com.example.invalid/...`` or a URL
+    carrying the name only in its path or query string.  Pass ``None``
+    to make the ``.gitreview`` fetch itself unresolvable.
+    """
+
+    def _open(url: Any, *_args: Any, **_kwargs: Any) -> Any:
+        target = url if isinstance(url, str) else getattr(url, "full_url", "")
+        parsed = urlsplit(target)
+        from_raw_github = (
+            parsed.scheme == "https"
+            and parsed.netloc == "raw.githubusercontent.com"
+        )
+        if content is not None and from_raw_github:
+            response = Mock()
+            response.read.return_value = content
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=None)
+            return response
+        raise URLError(f"blocked in test: {target}")
+
+    return _open
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://raw.githubusercontent.com.example.invalid/o/r/b/.gitreview",
+        "https://example.invalid/?raw.githubusercontent.com",
+        "https://example.invalid/raw.githubusercontent.com/.gitreview",
+        "http://raw.githubusercontent.com/o/r/b/.gitreview",
+    ],
+)
+def test_gitreview_urlopen_rejects_lookalike_origins(url: str) -> None:
+    """The test guard matches the origin, not merely a substring.
+
+    A substring check would serve mocked content to a lookalike host, a
+    path segment or a query string, so a malformed or redirected fetch
+    URL could pass these tests silently.
+    """
+    opener = _gitreview_urlopen(b"[gerrit]\nhost=gerrit.example.org\n")
+
+    with pytest.raises(URLError):
+        opener(url)
+
+
+def test_gitreview_urlopen_accepts_expected_origin() -> None:
+    """The guard still serves the origin the fetcher actually uses."""
+    opener = _gitreview_urlopen(b"[gerrit]\nhost=gerrit.example.org\n")
+
+    response = opener("https://raw.githubusercontent.com/o/r/main/.gitreview")
+
+    assert b"gerrit.example.org" in response.read()
 
 
 class TestChangeFingerprint:
@@ -380,6 +450,391 @@ project=test/project.git
         with patch.dict("os.environ", {}, clear=True):
             result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
             assert result == ("gerrit.example.org", "test/project")
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_explicit_env_skips_gitreview(
+        self, mock_urlopen: Any
+    ) -> None:
+        """Explicit configuration short-circuits before any fetch.
+
+        Values the operator set deliberately outrank the pull request's
+        ``.gitreview``, and resolving them must cost no network I/O.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.wrong.org\nproject=wrong/project\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.example.org",
+                "GERRIT_PROJECT": "test/project",
+            },
+        ):
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.example.org", "test/project")
+        mock_urlopen.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_gitreview_outranks_derived_env(
+        self, mock_urlopen: Any
+    ) -> None:
+        """A derived environment pair loses to a resolvable .gitreview.
+
+        Derivation guesses the project from the GitHub repository name,
+        so the per-pull-request ``.gitreview`` is the better answer.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.real.org\nport=29418\n"
+            b"project=real/project.git\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.derived.org",
+                "GERRIT_PROJECT": "derived-project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.real.org", "real/project")
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_keeps_explicit_host_takes_project(
+        self, mock_urlopen: Any
+    ) -> None:
+        """A derived project must not drag an explicit host down with it.
+
+        Provenance is per field.  Treating the pair as a unit made one
+        derived key demote both, so ``.gitreview`` replaced a host the
+        operator had configured deliberately.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.gitreview.org\nport=29418\n"
+            b"project=gitreview/project.git\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.explicit.org",
+                "GERRIT_PROJECT": "derived-project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_PROJECT"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.explicit.org", "gitreview/project")
+
+    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+    @patch("urllib.request.urlopen")
+    def test_legacy_config_file_project_loses_to_gitreview(
+        self,
+        mock_urlopen: Any,
+        mock_derive_creds: Any,
+        mock_config_gitreview_host: Any,
+    ) -> None:
+        """The same outcome, reached through the configuration file.
+
+        The case above marks the project derived directly.  This one
+        earns the mark the way a real local CLI run does: releases that
+        auto-saved derived values put GERRIT_PROJECT in the
+        per-organization section, so load_org_config returns an old
+        repository-name guess, derivation finds the key already filled,
+        and without provenance duplicate detection would short-circuit
+        on it and query the wrong project.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context(
+            repository="onap/integration-distribution"
+        )
+
+        # Keep derivation off the SSH config and off the network.
+        mock_derive_creds.return_value = (None, None)
+        mock_config_gitreview_host.return_value = None
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.gitreview.org\nport=29418\n"
+            b"project=integration/distribution.git\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                # Set by the operator for this run.
+                "GERRIT_SERVER": "gerrit.explicit.org",
+                # Unset, as on a local CLI run that leans on the
+                # per-organization configuration file.
+                "GERRIT_PROJECT": "",
+            },
+        ):
+            cfg = apply_parameter_derivation(
+                # As load_org_config returns it from the stored section.
+                {"GERRIT_PROJECT": "integration-distribution"},
+                "onap",
+                repository=gh.repository,
+                save_to_config=False,
+            )
+            apply_config_to_env(cfg)
+
+            # The stale name is in play, alongside the explicit host.
+            assert os.environ["GERRIT_SERVER"] == "gerrit.explicit.org"
+            assert os.environ["GERRIT_PROJECT"] == "integration-distribution"
+
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.explicit.org", "integration/distribution")
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_keeps_explicit_project_takes_host(
+        self, mock_urlopen: Any
+    ) -> None:
+        """The mirror case: a derived host must not discard an explicit
+        project.
+
+        Only the field lacking operator intent may come from
+        ``.gitreview``.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.gitreview.org\nport=29418\n"
+            b"project=gitreview/project.git\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.derived.org",
+                "GERRIT_PROJECT": "explicit/project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_SERVER"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.gitreview.org", "explicit/project")
+
+    @patch("urllib.request.urlopen")
+    def test_host_only_gitreview_keeps_derived_project_in_query(
+        self, mock_urlopen: Any
+    ) -> None:
+        """A ``.gitreview`` without ``project=`` must not blank the
+        project.
+
+        ``parse_gitreview`` needs only ``host=``, so a host-only file
+        parses successfully and leaves ``info.project`` empty.  Taking
+        that empty string over the derived environment value drops the
+        ``project:`` qualifier from the Gerrit query, which then
+        searches every project on the server: an unrelated change that
+        happens to share a title would block a legitimate submission.
+        A derived project is a guess, but a scoped guess beats an
+        unscoped search.
+        """
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.gitreview.org\nport=29418\n"
+        )
+
+        responses.start()
+        try:
+            detector = DuplicateDetector(Mock())
+            gh = self._create_mock_github_context(
+                repository="org/derived-project"
+            )
+
+            target_pr = Mock()
+            target_pr.number = 123
+            target_pr.title = "Fix authentication"
+            target_pr.body = ""
+            target_pr.get_files.return_value = []
+
+            responses.add(
+                responses.GET,
+                re.compile(r"https://gerrit\.gitreview\.org/.*"),
+                json=[],
+                status=200,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    # As parameter derivation would leave them.
+                    "GERRIT_SERVER": "gerrit.derived.org",
+                    "GERRIT_PROJECT": "derived-project",
+                    # Pin the base path so no discovery probe runs.
+                    "GERRIT_HTTP_BASE_PATH": "r",
+                },
+            ):
+                mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+
+                resolved = detector._resolve_gerrit_info_from_env_or_gitreview(
+                    gh
+                )
+                assert resolved == (
+                    "gerrit.gitreview.org",
+                    "derived-project",
+                )
+
+                detector.check_for_duplicates(
+                    target_pr, allow_duplicates=False, gh=gh
+                )
+
+            queried = [
+                unquote(call.request.url or "") for call in responses.calls
+            ]
+            assert queried, "expected at least one Gerrit query"
+            assert all("project:derived-project " in url for url in queried), (
+                f"Gerrit query was not scoped to a project: {queried}"
+            )
+        finally:
+            responses.stop()
+            responses.reset()
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_falls_back_to_derived_env(
+        self, mock_urlopen: Any
+    ) -> None:
+        """An unresolvable .gitreview leaves the derived pair in play.
+
+        Returning None instead would turn a possibly-wrong query into no
+        duplicate detection at all, which is strictly worse.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(None)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.derived.org",
+                "GERRIT_PROJECT": "derived-project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.derived.org", "derived-project")
+
+    @patch("urllib.request.urlopen")
+    def test_resolve_gerrit_info_falls_back_without_repository(
+        self, mock_urlopen: Any
+    ) -> None:
+        """With no repository to fetch from, the derived pair still wins
+        over returning nothing."""
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context(repository="")
+
+        mock_urlopen.side_effect = _gitreview_urlopen(None)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GERRIT_SERVER": "gerrit.derived.org",
+                "GERRIT_PROJECT": "derived-project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.derived.org", "derived-project")
+        mock_urlopen.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_duplicate_query_uses_gitreview_path_not_derived_name(
+        self, mock_urlopen: Any
+    ) -> None:
+        """Acceptance criterion for a Gerrit project with a path separator.
+
+        ``opendaylight/integration-distribution`` derives the project
+        ``integration-distribution``, but Gerrit hosts it at
+        ``integration/distribution``.  Querying the derived name asks
+        about a project that does not exist, so every duplicate is
+        silently missed.  The ``.gitreview`` must win.
+        """
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.opendaylight.org\nport=29418\n"
+            b"project=integration/distribution.git\n"
+        )
+
+        responses.start()
+        try:
+            detector = DuplicateDetector(Mock())
+            gh = self._create_mock_github_context(
+                repository="opendaylight/integration-distribution"
+            )
+
+            target_pr = Mock()
+            target_pr.number = 123
+            target_pr.title = "Fix authentication"
+            target_pr.body = ""
+            target_pr.get_files.return_value = []
+
+            # Answer any query, so the only thing that can distinguish
+            # the two projects is the query Gerrit was actually asked.
+            responses.add(
+                responses.GET,
+                re.compile(r"https://gerrit\.opendaylight\.org/.*"),
+                json=[
+                    {
+                        "_number": 12345,
+                        "subject": "Fix authentication",
+                        "project": "integration/distribution",
+                        "current_revision": "abc123",
+                        "revisions": {
+                            "abc123": {
+                                "commit": {"message": "Fix authentication"},
+                                "files": {},
+                            }
+                        },
+                    }
+                ],
+                status=200,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    # As parameter derivation would leave them.
+                    "GERRIT_SERVER": "gerrit.opendaylight.org",
+                    "GERRIT_PROJECT": "integration-distribution",
+                    # Pin the base path so no discovery probe runs.
+                    "GERRIT_HTTP_BASE_PATH": "r",
+                },
+            ):
+                mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+
+                with pytest.raises(DuplicateChangeError):
+                    detector.check_for_duplicates(
+                        target_pr, allow_duplicates=False, gh=gh
+                    )
+
+            queried = [
+                unquote(call.request.url or "") for call in responses.calls
+            ]
+            assert queried, "expected at least one Gerrit query"
+            assert any(
+                "project:integration/distribution" in url for url in queried
+            ), f"Gerrit was not queried for the .gitreview project: {queried}"
+            assert not any(
+                "project:integration-distribution" in url for url in queried
+            ), f"Gerrit was queried for the derived project: {queried}"
+        finally:
+            responses.stop()
+            responses.reset()
 
     def test_check_for_duplicates_with_gerrit_duplicate(
         self,

@@ -22,7 +22,9 @@ from github2gerrit.config import apply_config_to_env
 from github2gerrit.config import apply_parameter_derivation
 from github2gerrit.config import derive_gerrit_parameters
 from github2gerrit.config import filter_known
+from github2gerrit.config import is_derived_key
 from github2gerrit.config import load_org_config
+from github2gerrit.config import mark_derived_keys
 from github2gerrit.config import overlay_missing
 
 
@@ -874,3 +876,327 @@ def test_sanitize_ssh_key_content_strips_embedded_whitespace() -> None:
     assert parts[1] == "b3BlbnNzaC1rZXktdjE"
     assert parts[2] == "AAAABBBBCCCC"
     assert parts[3] == "-----END OPENSSH PRIVATE KEY-----"
+
+
+def test_mark_derived_keys_round_trip() -> None:
+    """Marked keys report as derived; unmarked ones do not."""
+    assert not is_derived_key("GERRIT_PROJECT")
+
+    mark_derived_keys(["GERRIT_PROJECT"])
+
+    assert is_derived_key("GERRIT_PROJECT")
+    # Key names are normalised, so callers need not match case.
+    assert is_derived_key("gerrit_project")
+    assert is_derived_key("  GERRIT_PROJECT  ")
+    # An unrelated key is unaffected.
+    assert not is_derived_key("GERRIT_SERVER")
+
+
+def test_mark_derived_keys_is_additive() -> None:
+    """A second call must not discard the first call's record."""
+    mark_derived_keys(["GERRIT_SERVER"])
+    mark_derived_keys(["GERRIT_PROJECT"])
+
+    assert is_derived_key("GERRIT_SERVER")
+    assert is_derived_key("GERRIT_PROJECT")
+
+    # Empty and whitespace-only names are ignored rather than recorded.
+    mark_derived_keys(["", "   "])
+    assert is_derived_key("GERRIT_SERVER")
+    assert not is_derived_key("")
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_marks_only_unset_env_keys(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only keys that apply_config_to_env actually writes are marked.
+
+    apply_config_to_env skips keys whose environment value is already
+    non-empty, so such a key keeps its explicit value and must not be
+    described as derived.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    # Setting these through monkeypatch registers them for teardown even
+    # though apply_config_to_env writes os.environ directly.
+    monkeypatch.setenv("GERRIT_SERVER", "explicit.gerrit.example.org")
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+    monkeypatch.setenv("GERRIT_SSH_USER_G2G", "")
+    monkeypatch.setenv("GERRIT_SSH_USER_G2G_EMAIL", "")
+
+    cfg = apply_parameter_derivation(
+        {}, "onap", repository="onap/integration-distribution"
+    )
+    apply_config_to_env(cfg)
+
+    # Derivation supplied a host, but the environment already held one,
+    # so the explicit value survives and provenance stays explicit.
+    assert os.environ["GERRIT_SERVER"] == "explicit.gerrit.example.org"
+    assert not is_derived_key("GERRIT_SERVER")
+
+    # The project had no explicit value, so the guess landed and is
+    # recorded as derived.
+    assert os.environ["GERRIT_PROJECT"] == "integration-distribution"
+    assert is_derived_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_can_skip_marking(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mark_derived=False records nothing.
+
+    Used by call sites that only persist derived values to the
+    configuration file and never export them to the environment.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_SERVER", "")
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {},
+        "onap",
+        repository="onap/sandbox",
+        save_to_config=False,
+        mark_derived=False,
+    )
+
+    # Derivation still happened; only the provenance record is skipped.
+    assert result["GERRIT_PROJECT"] == "sandbox"
+    assert not is_derived_key("GERRIT_PROJECT")
+    assert not is_derived_key("GERRIT_SERVER")
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_marks_config_file_project(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GERRIT_PROJECT already in cfg is a fallback, not intent.
+
+    Releases that auto-saved derived values wrote them to the
+    configuration file, whose sections are per-organization while a
+    project name is per-repository.  On a later run load_org_config
+    hands that name back in cfg, so it is never missing, never enters
+    newly_derived, and nothing above records it -- leaving an old
+    repository-name guess indistinguishable from operator intent.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/integration-distribution",
+        save_to_config=False,
+    )
+
+    assert is_derived_key("GERRIT_PROJECT")
+
+    # Demoted, not discarded: a misscoped project still scopes the
+    # Gerrit query, which beats searching every project on the server
+    # whenever no .gitreview resolves.
+    assert result["GERRIT_PROJECT"] == "stale-org-project"
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_project_marked_when_derivation_disabled(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G2G_ENABLE_DERIVATION=false must not skip the provenance record.
+
+    Recording that a config-file project is a fallback describes what
+    cfg already carries, so it cannot depend on whether new derivation
+    runs.  Turning derivation off returns early, and apply_config_to_env
+    still exports the value, so marking it after that return left the
+    old repository-name guess looking like operator intent for a
+    documented, supported setting.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+    monkeypatch.setenv("G2G_ENABLE_DERIVATION", "false")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/integration-distribution",
+        save_to_config=False,
+    )
+
+    assert is_derived_key("GERRIT_PROJECT")
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_project_marked_without_organization(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent organization must not skip the provenance record.
+
+    The second early return, for the same reason as the one above: cfg
+    still reaches apply_config_to_env, so the value still lands in the
+    environment and still needs to be distinguishable from intent.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "",
+        repository="onap/integration-distribution",
+        save_to_config=False,
+    )
+
+    assert is_derived_key("GERRIT_PROJECT")
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_keeps_explicit_env_project(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An environment GERRIT_PROJECT keeps its explicit provenance.
+
+    Unlike the per-organization file, the environment is scoped to this
+    run, so an operator naming a project there means it for this
+    repository.  apply_config_to_env leaves such a value untouched, and
+    the provenance record must agree with what it actually wrote.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_PROJECT", "operator/project")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/integration-distribution",
+        save_to_config=False,
+    )
+    apply_config_to_env(result)
+
+    assert os.environ["GERRIT_PROJECT"] == "operator/project"
+    assert not is_derived_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_apply_parameter_derivation_config_project_opt_out(
+    mock_derive_creds,
+    mock_gitreview_host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mark_derived=False covers the configuration-file project too.
+
+    The opt-out serves call sites that never follow up with
+    apply_config_to_env, so no key they handle may be described as
+    holding a derived value there -- whatever its source.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview_host.return_value = None
+
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/integration-distribution",
+        save_to_config=False,
+        mark_derived=False,
+    )
+
+    assert result["GERRIT_PROJECT"] == "stale-org-project"
+    assert not is_derived_key("GERRIT_PROJECT")
+
+
+def test_save_derived_parameters_omits_per_repository_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GERRIT_PROJECT never reaches the per-organization section.
+
+    The section is shared by every repository in the organization, so
+    persisting one repository's project name would misroute all the
+    others.  It would also return on the next run indistinguishable
+    from operator intent, defeating the provenance tracking that lets
+    duplicate detection prefer a per-pull-request .gitreview.
+    """
+    from github2gerrit.config import save_derived_parameters_to_config
+
+    config_file = tmp_path / "config.txt"
+    config_file.write_text(
+        '[default]\nGERRIT_HTTP_USER = "existing_user"\n', encoding="utf-8"
+    )
+
+    monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    save_derived_parameters_to_config(
+        "onap",
+        {
+            "GERRIT_SERVER": "gerrit.onap.org",
+            "GERRIT_PROJECT": "integration/distribution",
+            "GERRIT_SSH_USER_G2G": "onap.gh2gerrit",
+        },
+    )
+
+    updated_content = config_file.read_text(encoding="utf-8")
+    assert 'GERRIT_SERVER = "gerrit.onap.org"' in updated_content
+    assert 'GERRIT_SSH_USER_G2G = "onap.gh2gerrit"' in updated_content
+    assert "GERRIT_PROJECT" not in updated_content
+    assert "integration/distribution" not in updated_content
+
+
+def test_save_derived_parameters_project_only_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filtering out the only parameter must leave the file untouched.
+
+    The file has to exist for this to prove anything: the function
+    already returns early when it does not, so a missing file would
+    make the assertion pass for the wrong reason.
+    """
+    from github2gerrit.config import save_derived_parameters_to_config
+
+    config_file = tmp_path / "config.txt"
+    original_content = '[default]\nGERRIT_HTTP_USER = "existing_user"\n'
+    config_file.write_text(original_content, encoding="utf-8")
+
+    monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    save_derived_parameters_to_config(
+        "onap", {"GERRIT_PROJECT": "integration/distribution"}
+    )
+
+    assert config_file.read_text(encoding="utf-8") == original_content

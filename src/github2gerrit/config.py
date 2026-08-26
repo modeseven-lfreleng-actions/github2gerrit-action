@@ -49,6 +49,7 @@ import configparser
 import logging
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from typing import cast
@@ -476,6 +477,59 @@ def apply_config_to_env(cfg: dict[str, str]) -> None:
             os.environ[k] = v
 
 
+# Provenance for configuration values.
+#
+# Several Gerrit parameters are *derived* when nothing configures them:
+# the host from a `gerrit.[org].org` heuristic, the project from the
+# GitHub repository name.  Once `apply_config_to_env` exports them they
+# are indistinguishable from values an operator set deliberately, so a
+# consumer with a better answer of its own (duplicate detection reads
+# the pull request's `.gitreview`) cannot tell whether overriding the
+# environment would be correcting a guess or discarding intent.
+#
+# Recording the derived keys answers that question.  The record lives in
+# an environment variable because it describes *process-scoped
+# configuration*, established once in `_load_effective_inputs` before
+# the bulk `ThreadPoolExecutor` starts and identical for every pull
+# request the process handles.  That is the opposite of per-pull-request
+# state such as the approved SHA, which `cli.py` deliberately threads
+# through return values precisely because concurrent workers would
+# otherwise overwrite one another's values.
+DERIVED_KEYS_ENV = "G2G_DERIVED_KEYS"
+
+
+def _derived_keys() -> set[str]:
+    """Return the set of config keys currently recorded as derived."""
+    raw = os.getenv(DERIVED_KEYS_ENV, "")
+    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+
+def mark_derived_keys(keys: Iterable[str]) -> None:
+    """Record which config keys hold derived fallbacks rather than
+    operator intent.
+
+    Additive: keys already recorded stay recorded, so several derivation
+    passes accumulate rather than the last one winning.
+
+    Args:
+        keys: Config key names (case-insensitive).  Empty names are
+            ignored.
+    """
+    incoming = {k.strip().upper() for k in keys if k and k.strip()}
+    if not incoming:
+        return
+    os.environ[DERIVED_KEYS_ENV] = ",".join(sorted(_derived_keys() | incoming))
+
+
+def is_derived_key(key: str) -> bool:
+    """Return ``True`` when ``key``'s current value came from derivation.
+
+    A ``False`` answer covers both "explicitly configured" and "not set
+    at all", so callers should test the value's presence separately.
+    """
+    return key.strip().upper() in _derived_keys()
+
+
 def filter_known(
     cfg: dict[str, str],
     include_extra: bool = True,
@@ -666,6 +720,8 @@ def apply_parameter_derivation(
     organization: str | None = None,
     repository: str | None = None,
     save_to_config: bool = True,
+    *,
+    mark_derived: bool = True,
 ) -> dict[str, str]:
     """Apply dynamic parameter derivation for missing Gerrit parameters.
 
@@ -689,10 +745,36 @@ def apply_parameter_derivation(
         organization: GitHub organization name for derivation
         repository: GitHub repository in owner/repo format (optional)
         save_to_config: Whether to save derived parameters to config file
+        mark_derived: Whether to record the derived keys as provenance
+            (see :func:`mark_derived_keys`).  Pass ``False`` from call
+            sites that do not follow up with :func:`apply_config_to_env`,
+            since a key that never reaches the environment must not be
+            described as holding a derived value there.
 
     Returns:
         Configuration dictionary with derived values for missing parameters
     """
+    # A GERRIT_PROJECT arriving from the configuration file is a
+    # fallback, never intent for this specific repository: the file is
+    # sectioned per-organization, so one project name there is wrong for
+    # every repository in the org but one. That covers entries auto-saved
+    # by releases before such writes stopped, and hand-written ones,
+    # which are equally misscoped. Marking it derived keeps it usable as
+    # a last resort while letting the per-pull-request .gitreview
+    # outrank it.
+    #
+    # Recorded ahead of the early returns below, because this describes
+    # what cfg already carries rather than anything derivation adds.
+    # Neither a missing organization nor G2G_ENABLE_DERIVATION=false
+    # makes a config-file project any more like operator intent, and
+    # apply_config_to_env still exports it in both cases.
+    if (
+        mark_derived
+        and cfg.get("GERRIT_PROJECT", "").strip()
+        and (os.getenv("GERRIT_PROJECT") or "").strip() == ""
+    ):
+        mark_derived_keys(["GERRIT_PROJECT"])
+
     if not organization:
         return cfg
 
@@ -737,6 +819,20 @@ def apply_parameter_derivation(
             "GitHub Actions" if is_github_actions else "Local CLI",
             ", ".join(f"{k}={v}" for k, v in newly_derived.items()),
         )
+        if mark_derived:
+            # `newly_derived` records what derivation *supplied*, not
+            # what will end up in the environment.  `apply_config_to_env`
+            # writes a key only when its environment value is currently
+            # empty, so a key derived here can still be shadowed by an
+            # explicit environment value and must not be recorded as
+            # derived.  Apply the same emptiness test the caller will
+            # apply moments later; the two must agree.
+            mark_derived_keys(
+                key
+                for key in newly_derived
+                if (os.getenv(key) or "").strip() == ""
+            )
+
     # Save newly derived parameters to configuration file for future use
     # Default to true for local CLI, false for GitHub Actions
     default_auto_save = "false" if _is_github_actions_context() else "true"
@@ -787,6 +883,18 @@ def save_derived_parameters_to_config(
         log.debug("Skipping config file write in dry-run mode")
         return
     if not organization or not derived_params:
+        return
+
+    # GERRIT_PROJECT is per-repository, but this file section is
+    # per-organization: persisting it would hand every other repository
+    # in the org one repository's project name, and would additionally
+    # come back on the next run as configuration indistinguishable from
+    # operator intent, defeating the provenance tracking that lets
+    # duplicate detection prefer a per-pull-request .gitreview.
+    derived_params = {
+        k: v for k, v in derived_params.items() if k != "GERRIT_PROJECT"
+    }
+    if not derived_params:
         return
 
     if config_path is None:
