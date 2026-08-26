@@ -173,6 +173,7 @@ class TestParsePrUrl:
 
         result = parse_pr_url(url)
 
+        assert result is not None, "Expected a parsed (owner, repo, num)"
         assert result == ("test", "test", 99999)
         assert isinstance(result[2], int)
 

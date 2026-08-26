@@ -14,23 +14,15 @@ from typer.testing import CliRunner
 from github2gerrit.cli import app
 
 
-# Try to use mix_stderr=False for better error separation, but fall back to default
-# if the parameter is not supported in this version of typer.
-# The mix_stderr parameter was added in typer 0.9.0+ (requires click 8.1+).
-# Older versions of typer/click will raise TypeError for unknown parameters.
-try:
-    runner = CliRunner(mix_stderr=False)
-except TypeError:
-    runner = CliRunner()
+# The test suite requires click >= 8.2, pinned in the dev extra, where
+# CliRunner always captures stderr separately and the mix_stderr
+# parameter no longer exists.
+runner = CliRunner()
 
 
 def _get_combined_output(result: Any) -> str:
-    """Get combined stdout and stderr, handling version differences."""
-    try:
-        return result.stdout + (result.stderr or "")
-    except ValueError:
-        # stderr not separately captured, use stdout only
-        return result.stdout
+    """Get combined stdout and stderr from an invocation result."""
+    return result.stdout + result.stderr
 
 
 def test_conflicting_options_error_message_in_stderr(tmp_path: Path) -> None:

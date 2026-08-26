@@ -81,6 +81,9 @@ class TestActionEnvironmentMapping:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Test GitHub context mappings
@@ -113,6 +116,9 @@ class TestActionEnvironmentMapping:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # These are computed by the upstream "Extract PR number" step and
@@ -135,6 +141,9 @@ class TestActionEnvironmentMapping:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
         issue_id_env = env_mapping.get("ISSUE_ID", "")
 
@@ -149,6 +158,9 @@ class TestActionEnvironmentMapping:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # G2G_TEST_MODE should be explicitly set to false in production
@@ -296,6 +308,9 @@ class TestEnvironmentValidation:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Essential variables that must be present
@@ -320,6 +335,9 @@ class TestEnvironmentValidation:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Boolean input variables
@@ -348,6 +366,9 @@ class TestEnvironmentValidation:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Optional variables that may be empty
@@ -442,6 +463,9 @@ class TestEnvironmentSecrets:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Secret variables that should reference inputs or context
@@ -463,6 +487,9 @@ class TestEnvironmentSecrets:
                 cli_step = step
                 break
 
+        assert cli_step is not None, (
+            "No step named 'Run github2gerrit Python CLI' in action.yaml"
+        )
         env_mapping = cli_step.get("env", {})
 
         # Check that no environment values contain hardcoded secrets

@@ -64,14 +64,13 @@ def test_idempotent_backref_skip_and_force(
     the back-reference for that commit should be skipped unless forced.
     """
     # Prepare orchestrator with minimal required attributes
-    orch = Orchestrator(workspace=str(tmp_path))
-    orch.workspace = str(tmp_path)
+    orch = Orchestrator(workspace=tmp_path)
 
     # Fake GitHub context
     gh = GitHubContext(
         event_name="pull_request_target",
         event_action="synchronize",
-        event_path="",
+        event_path=None,
         repository="org/repo",
         repository_owner="org",
         server_url="https://github.com",

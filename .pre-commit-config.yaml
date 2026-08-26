@@ -67,10 +67,10 @@ repos:
     rev: aab412d509121cb5f7533134b7e67f9fab59c682  # frozen: v0.16.4
     hooks:
       - id: ruff
-        files: ^(src|scripts|tests)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
-        files: ^(src|scripts|tests)/.+\.py$
+        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: 7ff8d35ae36a7d2b968f2f90b4c723e292e594ee  # frozen: v2.3.1
@@ -123,7 +123,9 @@ repos:
     rev: 3c94d276aa3005fa1f5a977946c9dc106135c083  # frozen: 1.39.10
     hooks:
       - id: basedpyright
-        files: ^src/.+\.py$
+        # Every Python path in the repository. Keep in sync with the
+        # `include` list under [tool.pyright] in pyproject.toml.
+        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
 
   - repo: https://github.com/lfreleng-actions/gha-workflow-linter
     rev: 42aa4db931ab4c9da0930ae5ca2259ab08da79cb  # frozen: v1.5.2

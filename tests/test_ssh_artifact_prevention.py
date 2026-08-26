@@ -151,6 +151,13 @@ def test_ssh_files_use_secure_location(
         orch1._setup_ssh(mock_inputs, mock_gerrit_info)
         orch2._setup_ssh(mock_inputs, mock_gerrit_info)
 
+        assert orch1._ssh_temp_dir is not None, (
+            "_setup_ssh should have created an SSH temp dir on orch1"
+        )
+        assert orch2._ssh_temp_dir is not None, (
+            "_setup_ssh should have created an SSH temp dir on orch2"
+        )
+
         # Verify different secure paths are used
         assert orch1._ssh_temp_dir != orch2._ssh_temp_dir
         assert "g2g_ssh_" in str(orch1._ssh_temp_dir)
@@ -176,6 +183,9 @@ def test_ssh_cleanup_removes_temp_directory(
         orch._setup_ssh(mock_inputs, mock_gerrit_info)
         ssh_temp_dir = orch._ssh_temp_dir
 
+        assert ssh_temp_dir is not None, (
+            "_setup_ssh should have created an SSH temp dir to clean up"
+        )
         assert ssh_temp_dir.exists()
 
         # Cleanup SSH

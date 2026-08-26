@@ -87,16 +87,9 @@ def _run_git(
     )
     if check and proc.returncode != 0:
         cmd_str = " ".join(full_cmd)
-        stderr = (
-            proc.stderr.decode("utf-8", errors="replace")
-            if proc.stderr is not None and isinstance(proc.stderr, bytes)
-            else proc.stderr
-        )
-        stdout = (
-            proc.stdout.decode("utf-8", errors="replace")
-            if proc.stdout is not None and isinstance(proc.stdout, bytes)
-            else proc.stdout
-        )
+        # capture_output=True with text=False always yields bytes.
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        stdout = proc.stdout.decode("utf-8", errors="replace")
         raise RuntimeError(
             f"Git command failed: {cmd_str}\n"
             f"Return code: {proc.returncode}\n"
