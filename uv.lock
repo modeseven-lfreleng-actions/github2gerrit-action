@@ -395,6 +395,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "click" },
     { name = "coverage", extra = ["toml"] },
     { name = "mypy" },
     { name = "pytest" },
@@ -408,6 +409,7 @@ dev = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "github2gerrit", extra = ["dev"] },
     { name = "hatch-vcs" },
     { name = "hatchling" },
 ]
@@ -415,6 +417,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1.7" },
+    { name = "click", marker = "extra == 'dev'", specifier = ">=8.2" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7.10.6" },
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "git-review", specifier = ">=2.5.0" },
@@ -438,6 +441,7 @@ provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "github2gerrit", extras = ["dev"] },
     { name = "hatch-vcs", specifier = ">=0.5.0" },
     { name = "hatchling", specifier = ">=1.28.0" },
 ]

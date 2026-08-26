@@ -107,6 +107,12 @@ dev = [
   "coverage[toml]>=7.10.6",
   "responses>=0.25.8",
 
+  # Several tests read CliRunner's result.stderr, which click only
+  # captures separately from 8.2 onward; before that it raises
+  # ValueError. This is a test-only requirement, so the runtime floor
+  # above stays where it is: the package itself still works on 8.1.7.
+  "click>=8.2",
+
   # Lint/format
   "ruff>=0.6.3",
   "mypy>=1.17.1",
@@ -254,7 +260,10 @@ markers = [
 
 [tool.pyright]
 pythonVersion = "3.11"
-include = ["src"]
+# Every Python path in the repository, so an editor's language server and
+# the pre-commit hook agree on the checked set. Keep in sync with the
+# basedpyright hook's `files` pattern in .pre-commit-config.yaml.
+include = ["src", "tests", "scripts", "sitecustomize.py"]
 typeCheckingMode = "strict"
 reportMissingImports = "none"
 reportMissingTypeStubs = "none"
@@ -278,6 +287,21 @@ reportIncompatibleVariableOverride = "error"
 reportOverlappingOverload = "error"
 reportUnsupportedDunderAll = "error"
 
+# Test code is held to the same correctness rules as src/, but not to the
+# same annotation rules. This mirrors the mypy stance above, where tests
+# set disallow_untyped_defs = false.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+# pytest resolves fixtures by parameter name at collection time, so
+# annotating every `monkeypatch`, `tmp_path` and `mock_*` parameter adds
+# no checking that the collection step does not already perform.
+reportMissingParameterType = "none"
+# @pytest.fixture and @pytest.mark.* read as untyped whenever pytest is
+# not importable. The pre-commit hook runs basedpyright without a project
+# virtualenv, so this fires there but not locally. The same tolerance is
+# already applied repository-wide via reportMissingImports = "none".
+reportUntypedFunctionDecorator = "none"
+
 
 [tool.uv]
 # uv will manage installation based on this pyproject and lockfile.
@@ -289,4 +313,11 @@ managed = true
 dev = [
     "hatch-vcs>=0.5.0",
     "hatchling>=1.28.0",
+    # Pull in the dev extra defined above. uv installs the `dev` group by
+    # default, so a bare `uv sync` provisions pytest and friends; without
+    # this, `uv run pytest` silently falls through to whatever pytest sits
+    # on PATH. Declared by reference rather than duplicated because CI
+    # installs the extra directly (`uv pip install ./[test,dev]`) and
+    # cannot see dependency groups.
+    "github2gerrit[dev]",
 ]
