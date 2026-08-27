@@ -6,10 +6,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 import pytest
 from typer.testing import CliRunner
+from typer.testing import Result
 
 from github2gerrit.cli import app
 
@@ -20,7 +20,7 @@ from github2gerrit.cli import app
 runner = CliRunner()
 
 
-def _get_combined_output(result: Any) -> str:
+def _get_combined_output(result: Result) -> str:
     """Get combined stdout and stderr from an invocation result."""
     return result.stdout + result.stderr
 
@@ -384,7 +384,7 @@ def test_validation_local_cli_with_derivation_enabled(
 
 @pytest.mark.parametrize(
     "exception_class", [RuntimeError, ValueError, TypeError]
-)  # type: ignore[misc]  # mypy cannot infer the type of exception_class in parametrize when using exception classes
+)
 def test_unexpected_exception_exits_with_code_1(
     tmp_path: Path, exception_class: type[Exception]
 ) -> None:

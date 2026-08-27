@@ -76,8 +76,26 @@ repos:
     rev: 7ff8d35ae36a7d2b968f2f90b4c723e292e594ee  # frozen: v2.3.1
     hooks:
       - id: mypy
-        files: ^src/.+\.py$
+        # Every Python path in the repository, matching the ruff and
+        # basedpyright hooks above and below so the three cannot drift.
+        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
+        # mypy runs in an isolated virtualenv that holds only what is
+        # listed here, so anything the checked files import has to be
+        # present or mypy draws conclusions the project never would. With
+        # pytest absent, for instance, @pytest.fixture reads as an untyped
+        # decorator and pytest.raises stops telling mypy the block can
+        # swallow the exception, which turns every statement after a
+        # `with pytest.raises(...)` into dead code. Installing the real
+        # packages removes that whole class of environment-only findings;
+        # keep this list in step with the imports under src/ and tests/.
+        # pygerrit2 is deliberately absent: it is an optional runtime
+        # dependency and pyproject.toml already gives it
+        # ignore_missing_imports.
         additional_dependencies:
+          - click>=8.2
+          - pytest
+          - responses
+          - typer
           - types-PyYAML
           - types-requests
 

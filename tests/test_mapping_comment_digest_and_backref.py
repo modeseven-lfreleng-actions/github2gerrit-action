@@ -150,7 +150,7 @@ def test_idempotent_backref_skip_and_force(
     )
 
     # Invoke back-reference logic
-    orch._add_backref_comment_in_gerrit(  # type: ignore[attr-defined]
+    orch._add_backref_comment_in_gerrit(
         gerrit=gerrit,
         repo=repo_names,
         branch="main",

@@ -119,7 +119,8 @@ def _extract_summary(caplog) -> dict[str, Any]:
     # Expect pattern: RECONCILE_SUMMARY json={...}
     m = re.search(r"RECONCILE_SUMMARY json=(\{.*\})", last)
     assert m, f"Could not parse summary JSON: {last}"
-    return json.loads(m.group(1))
+    summary: dict[str, Any] = json.loads(m.group(1))
+    return summary
 
 
 def _extract_orphan_actions(caplog) -> dict[str, Any] | None:
@@ -129,7 +130,8 @@ def _extract_orphan_actions(caplog) -> dict[str, Any] | None:
     m = re.search(r"ORPHAN_ACTIONS json=(\{.*\})", lines[-1])
     if not m:
         return None
-    return json.loads(m.group(1))
+    actions: dict[str, Any] = json.loads(m.group(1))
+    return actions
 
 
 # ---------------------------------------------------------------------------

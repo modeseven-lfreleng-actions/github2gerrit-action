@@ -29,16 +29,27 @@ class TestExitCode:
 
     def test_exit_codes_are_integers(self):
         """Test that exit codes are valid integers."""
-        assert ExitCode.SUCCESS == 0
-        assert ExitCode.GENERAL_ERROR == 1
-        assert ExitCode.CONFIGURATION_ERROR == 2
-        assert ExitCode.DUPLICATE_ERROR == 3
-        assert ExitCode.GITHUB_API_ERROR == 4
-        assert ExitCode.GERRIT_CONNECTION_ERROR == 5
-        assert ExitCode.NETWORK_ERROR == 6
-        assert ExitCode.REPOSITORY_ERROR == 7
-        assert ExitCode.PR_STATE_ERROR == 8
-        assert ExitCode.VALIDATION_ERROR == 9
+        # Driven from a list rather than written as ten literal
+        # assertions. ExitCode is an IntEnum, so every comparison below
+        # holds at runtime, but mypy narrows a bare ``ExitCode.SUCCESS``
+        # to Literal[ExitCode.SUCCESS] and then reports comparison-overlap
+        # against Literal[0]. Binding each member to an ExitCode-typed
+        # variable keeps the identical ``==`` checks while leaving mypy
+        # the declared type, which does overlap with int.
+        expected: list[tuple[ExitCode, int]] = [
+            (ExitCode.SUCCESS, 0),
+            (ExitCode.GENERAL_ERROR, 1),
+            (ExitCode.CONFIGURATION_ERROR, 2),
+            (ExitCode.DUPLICATE_ERROR, 3),
+            (ExitCode.GITHUB_API_ERROR, 4),
+            (ExitCode.GERRIT_CONNECTION_ERROR, 5),
+            (ExitCode.NETWORK_ERROR, 6),
+            (ExitCode.REPOSITORY_ERROR, 7),
+            (ExitCode.PR_STATE_ERROR, 8),
+            (ExitCode.VALIDATION_ERROR, 9),
+        ]
+        for code, value in expected:
+            assert code == value
 
     def test_all_exit_codes_have_messages(self):
         """Test that all exit codes have corresponding error messages."""

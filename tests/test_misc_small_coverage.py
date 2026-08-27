@@ -37,7 +37,7 @@ def _capture_logger() -> tuple[logging.Logger, io.StringIO]:
     return logger, stream
 
 
-@pytest.mark.parametrize("verbose_env", ["", "false", "true"])  # type: ignore[misc]
+@pytest.mark.parametrize("verbose_env", ["", "false", "true"])
 def test_log_exception_conditionally_toggle(
     monkeypatch: pytest.MonkeyPatch, verbose_env: str
 ) -> None:

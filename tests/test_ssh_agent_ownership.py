@@ -14,6 +14,27 @@ import pytest
 from github2gerrit.ssh_agent_setup import SSHAgentManager
 
 
+def _simulate_agent_state(
+    manager: SSHAgentManager,
+    *,
+    pid: int | None,
+    sock: str | None,
+    owned: bool,
+) -> None:
+    """Put *manager* into a known agent state before exercising cleanup.
+
+    Setting the attributes through declared-Optional parameters rather
+    than inline in the test body also keeps mypy from drawing the wrong
+    conclusion: mypy narrows ``manager.agent_pid`` to ``int`` on a direct
+    ``manager.agent_pid = 12345`` and never widens it again, not even
+    across the ``cleanup()`` call that resets it, so the following
+    ``assert manager.agent_pid is None`` is reported as unreachable.
+    """
+    manager.agent_pid = pid
+    manager.auth_sock = sock
+    manager._agent_owned_by_us = owned
+
+
 class TestSSHAgentOwnership:
     """Test SSH agent ownership tracking to prevent killing borrowed agents."""
 
@@ -134,9 +155,12 @@ class TestSSHAgentOwnership:
             manager = SSHAgentManager(workspace=Path(tmp_dir))
 
             # Simulate owned agent
-            manager.agent_pid = 12345
-            manager.auth_sock = f"{tmp_dir}/ssh-agent.sock"
-            manager._agent_owned_by_us = True
+            _simulate_agent_state(
+                manager,
+                pid=12345,
+                sock=f"{tmp_dir}/ssh-agent.sock",
+                owned=True,
+            )
 
             manager.cleanup()
 
@@ -157,9 +181,12 @@ class TestSSHAgentOwnership:
             manager = SSHAgentManager(workspace=Path(tmp_dir))
 
             # Simulate borrowed agent
-            manager.agent_pid = 54321
-            manager.auth_sock = f"{tmp_dir}/existing-agent.sock"
-            manager._agent_owned_by_us = False
+            _simulate_agent_state(
+                manager,
+                pid=54321,
+                sock=f"{tmp_dir}/existing-agent.sock",
+                owned=False,
+            )
 
             manager.cleanup()
 
@@ -178,9 +205,12 @@ class TestSSHAgentOwnership:
             manager = SSHAgentManager(workspace=Path(tmp_dir))
 
             # Simulate owned agent
-            manager.agent_pid = 12345
-            manager.auth_sock = f"{tmp_dir}/ssh-agent.sock"
-            manager._agent_owned_by_us = True
+            _simulate_agent_state(
+                manager,
+                pid=12345,
+                sock=f"{tmp_dir}/ssh-agent.sock",
+                owned=True,
+            )
 
             # Mock kill failure
             mock_run_cmd.side_effect = Exception("Process not found")

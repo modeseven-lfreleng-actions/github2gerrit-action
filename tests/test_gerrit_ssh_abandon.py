@@ -67,9 +67,8 @@ class TestAbandonChangeViaSsh:
     def test_mkdtemp_failure_returns_false(self):
         # Honor the "never raises" contract: a temp-dir failure must result
         # in a clean False so the caller can fall back to REST.
-        with patch.object(
-            gerrit_ssh.tempfile,
-            "mkdtemp",
+        with patch(
+            "github2gerrit.gerrit_ssh.tempfile.mkdtemp",
             side_effect=OSError("disk full"),
         ):
             result = gerrit_ssh.abandon_change_via_ssh(

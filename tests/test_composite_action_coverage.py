@@ -239,7 +239,7 @@ class TestPRNumberHandling:
         self, action_tester, default_inputs, default_github_context
     ):
         """Test workflow_dispatch with PR_NUMBER=0 enables bulk mode."""
-        env_vars = {}
+        env_vars: dict[str, str] = {}
         inputs = default_inputs.copy()
         inputs["PR_NUMBER"] = "0"
         github_context = default_github_context.copy()
@@ -261,7 +261,7 @@ class TestPRNumberHandling:
         self, action_tester, default_inputs, default_github_context
     ):
         """Test workflow_dispatch with specific PR number."""
-        env_vars = {}
+        env_vars: dict[str, str] = {}
         inputs = default_inputs.copy()
         inputs["PR_NUMBER"] = "42"
         github_context = default_github_context.copy()
@@ -282,7 +282,7 @@ class TestPRNumberHandling:
         self, action_tester, default_inputs, default_github_context
     ):
         """Test workflow_dispatch with invalid PR number."""
-        env_vars = {}
+        env_vars: dict[str, str] = {}
         inputs = default_inputs.copy()
         inputs["PR_NUMBER"] = "abc"
         github_context = default_github_context.copy()
@@ -302,7 +302,7 @@ class TestPRNumberHandling:
         self, action_tester, default_inputs, default_github_context
     ):
         """Test that non-dispatch events reject explicit PR_NUMBER."""
-        env_vars = {}
+        env_vars: dict[str, str] = {}
         inputs = default_inputs.copy()
         inputs["PR_NUMBER"] = "42"
         github_context = default_github_context.copy()
@@ -580,7 +580,7 @@ class TestErrorHandling:
     ):
         """Test that validation steps return appropriate exit codes."""
         # Test invalid PR number scenario
-        env_vars = {}
+        env_vars: dict[str, str] = {}
         inputs = default_inputs.copy()
         inputs["PR_NUMBER"] = "invalid"
         github_context = default_github_context.copy()
