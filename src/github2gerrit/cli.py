@@ -30,7 +30,6 @@ from typing import cast
 from urllib.parse import urlparse
 
 import click
-import click.core
 import typer
 
 from . import models
@@ -818,7 +817,13 @@ def _resolve_bool_override(
     provided on the command line, so CLI flags always take precedence.
     """
     source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
-    if source == click.core.ParameterSource.COMMANDLINE:  # pyright: ignore[reportAttributeAccessIssue, reportUnnecessaryComparison]
+    # Compare by member name rather than by identity with a ParameterSource
+    # member. typer >= 0.20 ships its own copy of click under typer._click,
+    # so ctx.get_parameter_source returns a
+    # typer._click.core.ParameterSource member, which never compares equal
+    # to the click.core.ParameterSource member of the same name. Matching
+    # on .name is correct whichever copy typer hands back.
+    if source is not None and source.name == "COMMANDLINE":
         return current
     env_val = os.getenv(env_var)
     if env_val is not None:

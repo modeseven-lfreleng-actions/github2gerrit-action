@@ -7,11 +7,14 @@ import json
 from pathlib import Path
 
 import pytest
+import typer
 from pytest import mark
+from typer.testing import CliRunner
 
 from github2gerrit.cli import _extract_pr_number
 from github2gerrit.cli import _mask_secret
 from github2gerrit.cli import _read_github_context
+from github2gerrit.cli import _resolve_bool_override
 
 
 parametrize = mark.parametrize
@@ -169,3 +172,74 @@ def test_read_github_context_handles_missing_event_file(
     assert ctx.base_ref == ""
     assert ctx.head_ref == ""
     assert ctx.pr_number is None
+
+
+# ---------------------------------------
+# Tests for _resolve_bool_override
+# ---------------------------------------
+
+
+def _run_override(
+    argv: list[str],
+    env_value: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> bool:
+    """Invoke a one-option app and report what the override resolved to.
+
+    A real Typer invocation is the only way to exercise this: the
+    function asks Click which *source* supplied the parameter, and that
+    is only populated by genuine argument parsing.
+    """
+    if env_value is None:
+        monkeypatch.delenv("G2G_TEST_FLAG", raising=False)
+    else:
+        monkeypatch.setenv("G2G_TEST_FLAG", env_value)
+
+    seen: dict[str, bool] = {}
+    app = typer.Typer()
+
+    @app.command()
+    def _cmd(
+        ctx: typer.Context,
+        flag: bool = typer.Option(False, "--flag/--no-flag"),
+    ) -> None:
+        seen["value"] = _resolve_bool_override(
+            ctx, "flag", "G2G_TEST_FLAG", flag
+        )
+
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    return seen["value"]
+
+
+@parametrize(
+    "argv,env_value,expected",
+    [
+        # An explicit flag outranks the environment, in both directions.
+        (["--flag"], "false", True),
+        (["--no-flag"], "true", False),
+        # Without an explicit flag the environment decides. This is the
+        # case that matters under GitHub Actions, which passes the
+        # string "false"; Click treats any non-empty string as truthy,
+        # so the value has to be parsed rather than coerced.
+        ([], "false", False),
+        ([], "true", True),
+        # No flag and no environment variable leaves the default alone.
+        ([], None, False),
+    ],
+)
+def test_resolve_bool_override_precedence(
+    argv: list[str],
+    env_value: str | None,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit CLI flag beats the environment variable behind it.
+
+    Regression test. The check for an explicit flag compared a
+    ``ParameterSource`` member against ``click.core.ParameterSource``,
+    but typer >= 0.20 vendors its own copy of click, so the two enum
+    classes differ and the comparison was never true. Every explicit
+    flag silently lost to its environment variable.
+    """
+    assert _run_override(argv, env_value, monkeypatch) is expected
