@@ -28,14 +28,15 @@ classifiers = [
 ]
 dependencies = [
   # CLI framework (Typer)
+  #
+  # typer vendors its own copy of click from 0.26 onward (typer._click)
+  # and depends on the installed click below that, so both regimes fall
+  # inside this floor. Nothing here imports click directly, so click is
+  # deliberately not a dependency: taking a symbol from click that typer
+  # also exposes gives two distinct objects under the vendored regime,
+  # which fails silently. See the dev extra for the one place the
+  # installed click still matters.
   "typer>=0.20.1",
-
-  # Imported directly by the CLI (click.Group subclass for custom usage
-  # formatting; click.core.ParameterSource to detect explicit CLI flags)
-  # rather than only transitively via typer. Declared as a direct
-  # dependency so our import contract doesn't depend on typer's internal
-  # dependency choices.
-  "click>=8.1.7",
 
   # Rich formatting for CLI output
   "rich>=14.2.0",
@@ -107,10 +108,12 @@ dev = [
   "coverage[toml]>=7.10.6",
   "responses>=0.25.8",
 
-  # Several tests read CliRunner's result.stderr, which click only
-  # captures separately from 8.2 onward; before that it raises
-  # ValueError. This is a test-only requirement, so the runtime floor
-  # above stays where it is: the package itself still works on 8.1.7.
+  # typer.testing.CliRunner subclasses click.testing.CliRunner up to
+  # typer 0.25, so under that half of the supported range result.stderr
+  # comes from the installed click, which only captures it separately
+  # from 8.2 onward and raises ValueError before that. typer 0.26 and
+  # later vendor their own copy and are unaffected. Test-only: no
+  # runtime code imports click.
   "click>=8.2",
 
   # Lint/format
