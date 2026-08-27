@@ -15,7 +15,6 @@ from unittest import mock
 import pytest
 
 from github2gerrit.ssh_config_parser import SSHConfig
-from github2gerrit.ssh_config_parser import clear_credential_cache
 from github2gerrit.ssh_config_parser import derive_gerrit_credentials
 from github2gerrit.ssh_config_parser import get_git_user_email
 from github2gerrit.ssh_config_parser import get_ssh_user_for_gerrit
@@ -23,10 +22,6 @@ from github2gerrit.ssh_config_parser import get_ssh_user_for_gerrit
 
 class TestSSHConfig:
     """Test cases for SSH configuration parsing."""
-
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
 
     def test_empty_config(self, tmp_path):
         """Test handling of empty SSH config file."""
@@ -303,10 +298,6 @@ HOST gerrit.example.com
 class TestConvenienceFunctions:
     """Test cases for convenience functions."""
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
-
     def test_get_ssh_user_for_gerrit(self, tmp_path):
         """Test the convenience function for getting Gerrit SSH user."""
         config_content = """
@@ -498,10 +489,6 @@ Host gerrit.*
 class TestCredentialDerivation:
     """Test cases for credential derivation logic."""
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
-
     @mock.patch("github2gerrit.ssh_config_parser.get_git_user_email")
     @mock.patch("github2gerrit.ssh_config_parser.get_ssh_user_for_gerrit")
     @mock.patch.dict("os.environ", {"G2G_RESPECT_USER_SSH": "true"})
@@ -590,10 +577,6 @@ class TestCredentialDerivation:
 
 class TestPatternMatching:
     """Test cases for SSH host pattern matching."""
-
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
 
     def test_pattern_matching_exact(self):
         """Test exact host pattern matching."""
@@ -691,10 +674,6 @@ class TestPatternMatching:
 class TestConfigLineHandling:
     """Test cases for SSH config line parsing."""
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
-
     def test_split_config_line_basic(self):
         """Test basic config line splitting."""
         ssh_config = SSHConfig()
@@ -768,10 +747,6 @@ Host *
 class TestIntegration:
     """Integration tests using realistic configurations."""
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
-
     @mock.patch.dict("os.environ", {"G2G_RESPECT_USER_SSH": "true"})
     def test_lfit_organization_config(self, tmp_path, sample_ssh_config):
         """Test credential derivation for lfit organization with real SSH config."""
@@ -829,19 +804,24 @@ class TestIntegration:
 
 
 class TestCaching:
-    """Test cases for caching behavior in SSH config parsing and credential derivation."""
+    """Test cases proving credential derivation caches nothing.
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
+    The module holds no process-wide state, so each derivation and each
+    reading of ``G2G_RESPECT_USER_SSH`` consults its source afresh.
+    """
 
     @mock.patch("github2gerrit.ssh_config_parser.get_git_user_email")
     @mock.patch("github2gerrit.ssh_config_parser.get_ssh_user_for_gerrit")
     @mock.patch("github2gerrit.ssh_config_parser._get_respect_user_ssh_setting")
-    def test_derive_gerrit_credentials_caching(
+    def test_derive_gerrit_credentials_rereads_its_sources(
         self, mock_respect_ssh, mock_ssh_user, mock_git_email
     ):
-        """Test that derive_gerrit_credentials caches results to avoid repeated calls."""
+        """Repeated derivation re-reads its sources rather than memoising.
+
+        The result depends on the SSH config and the git identity, and
+        neither is an argument, so a memo keyed on the arguments could
+        serve an answer computed from state that has since changed.
+        """
         # Set up mocks to enable SSH config usage
         mock_respect_ssh.return_value = True
         mock_ssh_user.return_value = "sshuser"
@@ -859,17 +839,15 @@ class TestCaching:
         assert user1 == user2 == "sshuser"
         assert email1 == email2 == "user@example.com"
 
-        # The underlying functions should only be called once due to caching
-        # Note: mock_respect_ssh will be called twice because it's also cached separately
-        assert mock_ssh_user.call_count == 1
-        assert mock_git_email.call_count == 1
+        # Both underlying sources are consulted on both calls
+        assert mock_ssh_user.call_count == 2
+        assert mock_git_email.call_count == 2
 
     @mock.patch("github2gerrit.ssh_config_parser.env_bool")
-    def test_respect_user_ssh_setting_caching(self, mock_env_bool):
-        """Test that G2G_RESPECT_USER_SSH environment variable is cached."""
+    def test_respect_user_ssh_setting_reads_env_every_call(self, mock_env_bool):
+        """G2G_RESPECT_USER_SSH is read on every call."""
         mock_env_bool.return_value = True
 
-        # Import the cached function
         from github2gerrit.ssh_config_parser import (
             _get_respect_user_ssh_setting,
         )
@@ -882,41 +860,150 @@ class TestCaching:
         # All should return the same value
         assert result1 == result2 == result3 is True
 
-        # env_bool should only be called once due to caching
-        assert mock_env_bool.call_count == 1
+        # The environment is consulted afresh on each call, so that a
+        # later assignment to the variable is not masked by a memo.
+        assert mock_env_bool.call_count == 3
 
-    def test_clear_credential_cache_functionality(self):
-        """Test that clear_credential_cache properly clears all caches."""
-        # Import the cache clearing function and cached functions
-        from github2gerrit.ssh_config_parser import _get_cached_git_user_email
-        from github2gerrit.ssh_config_parser import (
-            _get_respect_user_ssh_setting,
-        )
-        from github2gerrit.ssh_config_parser import clear_credential_cache
 
-        # Call functions to populate caches (using mocks to avoid actual system calls)
-        with mock.patch(
-            "github2gerrit.ssh_config_parser.env_bool"
-        ) as mock_env_bool:
-            mock_env_bool.return_value = True
-            _get_respect_user_ssh_setting()
+_HOST = "gerrit.example.com"
+_ORG = "testorg"
+_FALLBACK = (
+    "testorg.gh2gerrit",
+    "releng+testorg-gh2gerrit@linuxfoundation.org",
+)
 
-        with mock.patch(
-            "github2gerrit.ssh_config_parser.get_git_user_email"
-        ) as mock_git_email:
-            mock_git_email.return_value = "test@example.com"
-            _get_cached_git_user_email()
 
-        with mock.patch(
-            "github2gerrit.ssh_config_parser.get_ssh_user_for_gerrit"
-        ) as mock_ssh_user:
-            mock_ssh_user.return_value = "testuser"
-            derive_gerrit_credentials("gerrit.example.com", "testorg")
+class TestDerivationReflectsItsInputs:
+    """Regression tests for issue #394.
 
-        # Clear all caches
-        clear_credential_cache()
+    ``derive_gerrit_credentials`` reads three things that are not among
+    its arguments: ``G2G_RESPECT_USER_SSH``, ``~/.ssh/config`` and the
+    git identity.  Each test below changes one of them and asserts the
+    derived credentials change with it.
 
-        # Verify caches are cleared by checking cache info
-        assert _get_respect_user_ssh_setting.cache_info().currsize == 0
-        assert _get_cached_git_user_email.cache_info().currsize == 0
-        assert derive_gerrit_credentials.cache_info().currsize == 0
+    These tests deliberately clear nothing between the two derivations
+    within a test.  That is the property under test: derivation is sound
+    because it re-reads its inputs, not because something sweeps up
+    after it.
+    """
+
+    def test_respect_user_ssh_flag_change_switches_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Flipping the flag switches between SSH identity and fallback.
+
+        Same host, organisation and port for both derivations, so a memo
+        keyed on those would return the personal SSH identity for the
+        second call -- the exact wrong-credentials failure of #394.
+        """
+        with (
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_ssh_user_for_gerrit",
+                return_value="sshuser",
+            ),
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_git_user_email",
+                return_value="dev@example.org",
+            ),
+        ):
+            monkeypatch.setenv("G2G_RESPECT_USER_SSH", "true")
+            respected = derive_gerrit_credentials(_HOST, _ORG)
+
+            monkeypatch.setenv("G2G_RESPECT_USER_SSH", "false")
+            ignored = derive_gerrit_credentials(_HOST, _ORG)
+
+        assert respected == ("sshuser", "dev@example.org")
+        assert ignored == _FALLBACK
+
+    def test_git_email_change_changes_derived_email(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A change of git user.email reaches the derived credentials."""
+        monkeypatch.setenv("G2G_RESPECT_USER_SSH", "true")
+        emails = iter(["first@example.org", "second@example.org"])
+
+        with (
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_ssh_user_for_gerrit",
+                return_value="sshuser",
+            ),
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_git_user_email",
+                side_effect=lambda: next(emails),
+            ),
+        ):
+            first = derive_gerrit_credentials(_HOST, _ORG)
+            second = derive_gerrit_credentials(_HOST, _ORG)
+
+        assert first == ("sshuser", "first@example.org")
+        assert second == ("sshuser", "second@example.org")
+
+    def test_ssh_config_rewrite_changes_derived_user(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        """Rewriting ~/.ssh/config under an unchanged HOME is noticed.
+
+        ``get_ssh_user_for_gerrit`` is left unmocked so the real parse
+        is exercised.  Nothing about the rewrite is visible in the
+        path, which is all the second call has to go on before it opens
+        the file, so the new user name can only reach the caller if the
+        file is read again.
+        """
+        monkeypatch.setenv("G2G_RESPECT_USER_SSH", "true")
+        ssh_dir = tmp_path / "home" / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        config_file = ssh_dir / "config"
+
+        with (
+            mock.patch(
+                "github2gerrit.ssh_config_parser.Path.home"
+            ) as mock_home,
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_git_user_email",
+                return_value="dev@example.org",
+            ),
+        ):
+            mock_home.return_value = tmp_path / "home"
+
+            config_file.write_text(f"Host {_HOST}\n    User firstuser\n")
+            first = derive_gerrit_credentials(_HOST, _ORG)
+
+            config_file.write_text(f"Host {_HOST}\n    User second_user\n")
+            second = derive_gerrit_credentials(_HOST, _ORG)
+
+        assert first == ("firstuser", "dev@example.org")
+        assert second == ("second_user", "dev@example.org")
+
+    def test_ssh_config_appearing_later_is_picked_up(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        """A config file created after a first miss is still parsed.
+
+        A missing file is an ordinary state, not an error, so the first
+        derivation falls back silently.  That silence must not become
+        permanent: the second call has to look for the file again
+        rather than assume the first answer still holds.
+        """
+        monkeypatch.setenv("G2G_RESPECT_USER_SSH", "true")
+        ssh_dir = tmp_path / "home" / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        config_file = ssh_dir / "config"
+
+        with (
+            mock.patch(
+                "github2gerrit.ssh_config_parser.Path.home"
+            ) as mock_home,
+            mock.patch(
+                "github2gerrit.ssh_config_parser.get_git_user_email",
+                return_value="dev@example.org",
+            ),
+        ):
+            mock_home.return_value = tmp_path / "home"
+
+            missing = derive_gerrit_credentials(_HOST, _ORG)
+
+            config_file.write_text(f"Host {_HOST}\n    User lateuser\n")
+            present = derive_gerrit_credentials(_HOST, _ORG)
+
+        assert missing == (_FALLBACK[0], "dev@example.org")
+        assert present == ("lateuser", "dev@example.org")

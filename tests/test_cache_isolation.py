@@ -3,23 +3,23 @@
 
 """Regression tests for process-wide cache isolation between tests.
 
-Several modules memoise expensive lookups in module-level state that
-outlives an individual test: ``gerrit_urls._BASE_PATH_CACHE`` and the
-four caches in ``ssh_config_parser``.  ``tests/conftest.py`` clears all
-of them around every test via the ``reset_gerrit_base_path_cache`` and
-``reset_credential_caches`` autouse fixtures.
+``gerrit_urls._BASE_PATH_CACHE`` memoises expensive lookups in
+module-level state that outlives an individual test, and
+``tests/conftest.py`` clears it around every test via the
+``reset_gerrit_base_path_cache`` autouse fixture.
 
-Each pair below is a polluter followed by a victim.  The polluter
-populates a cache with a value the victim must not see; the victim then
-asserts the answer it would get from a clean process.  Tests within a
-module run in definition order, so the pairing is deterministic.  Remove
-either autouse fixture and the corresponding victim fails.
+``ssh_config_parser`` needs no such fixture.  It keeps no process-wide
+state at all: credential derivation reads ``G2G_RESPECT_USER_SSH``, the
+SSH config and the git identity on every call.  The pairs below hold
+that to account: each polluter populates whatever state exists with a
+value the victim must not see, and each victim asserts the answer it
+would get from a clean process.  Tests within a module run in
+definition order, so the pairing is deterministic.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,7 +27,6 @@ import pytest
 from github2gerrit import gerrit_urls as urls_mod
 from github2gerrit import ssh_config_parser as ssh_mod
 from github2gerrit.gerrit_urls import create_gerrit_url_builder
-from github2gerrit.ssh_config_parser import SSHConfig
 
 
 # The fixture host shared by roughly twenty test modules, and therefore
@@ -131,7 +130,7 @@ def test_base_path_cache_does_not_leak_into_later_test(
 def test_credential_cache_polluter_records_ssh_derived_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Populate the credential caches from a user-SSH-respecting run."""
+    """Derive credentials from a user-SSH-respecting environment."""
     monkeypatch.setenv("G2G_RESPECT_USER_SSH", "true")
     monkeypatch.setattr(
         ssh_mod,
@@ -156,12 +155,13 @@ def test_credential_cache_polluter_records_ssh_derived_identity(
 def test_respect_user_ssh_setting_does_not_leak_into_later_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The env-var cache reflects this test's environment, not the last.
+    """The setting reflects this test's environment, not the last one.
 
-    ``_get_respect_user_ssh_setting`` takes no arguments, so its
-    ``lru_cache(maxsize=1)`` has exactly one slot that every test in the
-    suite collides on, over an environment variable tests monkeypatch
-    freely.
+    ``_get_respect_user_ssh_setting`` takes no arguments, so any memo
+    over it would have exactly one slot that every test in the suite
+    collides on, over an environment variable tests monkeypatch freely.
+    It reads the environment on every call instead, so the answer here
+    is this test's own -- with no fixture clearing anything in between.
     """
     monkeypatch.delenv("G2G_RESPECT_USER_SSH", raising=False)
 
@@ -171,13 +171,14 @@ def test_respect_user_ssh_setting_does_not_leak_into_later_test(
 def test_git_user_email_cache_does_not_leak_into_later_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The git-email cache reflects this test's git identity.
+    """The git email reflects this test's git identity.
 
-    ``_get_cached_git_user_email`` is the same shape as
-    ``_get_respect_user_ssh_setting``: zero arguments, one cache slot,
-    shared by the whole suite.  What it memoises is the output of
-    ``git config user.email``, which ``isolate_git_environment`` and
-    individual tests both take pains to control.
+    ``_read_git_user_email`` is the same shape as
+    ``_get_respect_user_ssh_setting``: zero arguments, so a memo would
+    give the whole suite a single shared slot.  What it reads is the
+    output of ``git config user.email``, which ``isolate_git_environment``
+    and individual tests both take pains to control, so it is read on
+    every call and the polluter above cannot reach this test.
     """
     monkeypatch.setattr(
         ssh_mod,
@@ -186,7 +187,7 @@ def test_git_user_email_cache_does_not_leak_into_later_test(
         raising=True,
     )
 
-    assert ssh_mod._get_cached_git_user_email() == "victim@example.org"
+    assert ssh_mod._read_git_user_email() == "victim@example.org"
 
 
 def test_credential_cache_does_not_leak_into_later_test(
@@ -194,10 +195,12 @@ def test_credential_cache_does_not_leak_into_later_test(
 ) -> None:
     """The same host and organisation derive fallback credentials.
 
-    ``derive_gerrit_credentials`` is keyed only on host, organisation
-    and port.  The polluter above used the same key, so without the
-    reset its answer is replayed here even though it was computed from
-    an environment and an SSH config this test does not share.
+    The polluter above derived personal credentials for this very host,
+    organisation and port.  Were the derivation memoised on those three
+    arguments its answer would be replayed here, even though it was
+    computed from an environment this test does not share.  Deriving
+    afresh, this test sees its own empty environment and falls back to
+    the organisation service account -- no cache clearing required.
     """
     monkeypatch.delenv("G2G_RESPECT_USER_SSH", raising=False)
 
@@ -205,46 +208,3 @@ def test_credential_cache_does_not_leak_into_later_test(
 
     assert user == "leakorg.gh2gerrit"
     assert email == "releng+leakorg-gh2gerrit@linuxfoundation.org"
-
-
-def _install_ssh_config(
-    monkeypatch: pytest.MonkeyPatch, config_path: Path, user: str
-) -> None:
-    """Point ``SSHConfig()`` at a config file naming ``user``.
-
-    ``get_ssh_user_for_gerrit`` keys its cache on ``~/.ssh/config`` as a
-    path string, so the key is the same for both tests below regardless
-    of where the file they parse actually lives.
-    """
-    config_path.write_text(
-        f"Host {_SHARED_HOST}\n    User {user}\n", encoding="utf-8"
-    )
-
-    def _factory() -> SSHConfig:
-        return SSHConfig(config_path=config_path)
-
-    monkeypatch.setattr(ssh_mod, "SSHConfig", _factory, raising=True)
-
-
-def test_ssh_config_cache_polluter_parses_a_config_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Parse and cache an SSH config naming a distinctive user."""
-    _install_ssh_config(monkeypatch, tmp_path / "config", "polluter")
-
-    assert ssh_mod.get_ssh_user_for_gerrit(_SHARED_HOST) == "polluter"
-    assert ssh_mod._ssh_config_cache
-
-
-def test_ssh_config_cache_does_not_leak_into_later_test(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A later test parses its own config rather than the cached one.
-
-    The cache is keyed on the config path and never on that file's
-    contents, so without the reset the previous test's parsed instance
-    is returned and this test never sees its own config at all.
-    """
-    _install_ssh_config(monkeypatch, tmp_path / "config", "victim")
-
-    assert ssh_mod.get_ssh_user_for_gerrit(_SHARED_HOST) == "victim"
