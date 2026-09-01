@@ -223,16 +223,24 @@ class DuplicateDetector:
         :mod:`github2gerrit.gitreview` module which consolidates parsing,
         URL-encoding, branch deduplication, and URL validation.
 
+        Explicit configuration outranks the per-pull-request
+        ``.gitreview`` field by field, since derivation guesses
+        ``GERRIT_PROJECT`` from the repository name. A derived pair is
+        the last resort: a possibly-wrong project beats no query.
+
         Returns:
             Tuple of (host, project) if found, None otherwise
         """
+        from .config import is_derived_key
         from .gitreview import fetch_gitreview_raw
 
-        # First try environment variables (same as core module)
         gerrit_host = os.getenv("GERRIT_SERVER", "").strip()
         gerrit_project = os.getenv("GERRIT_PROJECT", "").strip()
 
-        if gerrit_host and gerrit_project:
+        env_ok = bool(gerrit_host and gerrit_project)
+        host_ok = bool(gerrit_host) and not is_derived_key("GERRIT_SERVER")
+        proj_ok = bool(gerrit_project) and not is_derived_key("GERRIT_PROJECT")
+        if host_ok and proj_ok:
             return (gerrit_host, gerrit_project)
 
         # Skip local .gitreview check in composite action context.
@@ -243,7 +251,7 @@ class DuplicateDetector:
 
         repo_full = gh.repository.strip() if gh.repository else ""
         if not repo_full:
-            return None
+            return (gerrit_host, gerrit_project) if env_ok else None
 
         # Collect branch hints from the GitHub context. A fork may name
         # its branch after one that exists in the base repository, so an
@@ -269,9 +277,13 @@ class DuplicateDetector:
             default_branches=default_branches,
         )
         if info:
-            return (info.host, info.project)
+            # .gitreview fills non-explicit fields, where it has one.
+            host = gerrit_host if host_ok else info.host or gerrit_host
+            proj = gerrit_project if proj_ok else info.project or gerrit_project
+            if host and proj:
+                return (host, proj)
 
-        return None
+        return (gerrit_host, gerrit_project) if env_ok else None
 
     def _build_gerrit_rest_client(self, gerrit_host: str) -> Any | None:
         """Build a Gerrit REST API client using centralized framework.

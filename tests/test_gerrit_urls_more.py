@@ -12,17 +12,6 @@ from github2gerrit.gerrit_urls import GerritUrlBuilder
 from github2gerrit.gerrit_urls import create_gerrit_url_builder
 
 
-@pytest.fixture(autouse=True)
-def clear_cache_between_tests() -> None:
-    """Clear the base path cache between tests to prevent pollution."""
-    _clear_builder_cache()
-
-
-def _clear_builder_cache() -> None:
-    # Ensure base-path discovery cache does not bleed across tests
-    urls_mod._BASE_PATH_CACHE.clear()  # pyright: ignore[reportPrivateUsage]
-
-
 class _FakeResp:
     def __init__(
         self, code: int, headers: dict[str, str] | None = None
@@ -206,9 +195,13 @@ def test_discover_base_path_3xx_location_relative_and_absolute(
     assert b1.base_path == "r"
     assert b1.web_url("dashboard").startswith("https://gerrit.example.org/r/")
 
-    # Now simulate absolute URL in Location header
-    # Cache is cleared automatically by the autouse fixture between test sections
-    # when we create a new builder
+    # Now simulate absolute URL in Location header.  This clear is
+    # deliberate and mid-test: the first half cached 'r' for this host,
+    # and without discarding it the second builder would short-circuit
+    # on the cache and never reach decide_abs, leaving the
+    # absolute-Location branch untested and the assertions below
+    # vacuously true.  The autouse reset in conftest.py runs around the
+    # test, not inside it, so it cannot do this.
     urls_mod._BASE_PATH_CACHE.clear()  # pyright: ignore[reportPrivateUsage]
 
     def decide_abs(url: str) -> _FakeResp | BaseException:
