@@ -14,16 +14,14 @@ Key features:
 - Resolves canonical hostnames
 - Extracts User directives for specific hosts
 - Thread-safe operation
-- Caching to prevent repeated expensive operations
 
-Performance optimizations:
-- SSH config files are cached to avoid re-parsing
-- Environment variable lookups are cached
-- Git email lookups are cached to prevent repeated subprocess calls
-- Credential derivation results are cached per host/organization
-
-The caching helps reduce SSH agent prompts and improves performance when
-the same credentials are needed multiple times during execution.
+Nothing here is cached. Everything credential derivation depends on --
+the G2G_RESPECT_USER_SSH environment variable, the SSH config on disk
+and the git identity -- is read afresh on every call, because each of
+them can change during a single process (cli._load_effective_inputs
+sets the environment variable at runtime). Holding no process-wide
+state is also what makes the "thread-safe operation" claim above true
+rather than aspirational.
 """
 
 from __future__ import annotations
@@ -31,7 +29,6 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -276,18 +273,19 @@ class SSHConfig:
             return False
 
 
-# Global cache for SSH config instances to avoid re-parsing
-_ssh_config_cache: dict[str, SSHConfig] = {}
-
-
 def get_ssh_user_for_gerrit(
     gerrit_host: str, gerrit_port: int = 29418
 ) -> str | None:
     """Get SSH user for Gerrit host from SSH configuration.
 
-    Convenience function to extract SSH user for a Gerrit server
-    from the user's SSH configuration. Uses caching to avoid
-    repeatedly parsing the same SSH config file.
+    Convenience function to extract SSH user for a Gerrit server from
+    the user's SSH configuration.  The file is parsed on every call.
+    Caching the parse was tried and removed: keying on the path served a
+    stale parse once the file was rewritten, and keying on stat metadata
+    still collides when an in-place rewrite preserves size and inode on
+    a filesystem with coarse timestamps.  A correct key means hashing
+    the contents, which costs more than the parse it saves -- around
+    0.2ms for a fifty-host config, once or twice per process.
 
     Args:
         gerrit_host: Gerrit server hostname
@@ -296,45 +294,17 @@ def get_ssh_user_for_gerrit(
     Returns:
         SSH username if found in config, None otherwise
     """
-    # Use default SSH config path as cache key
-    default_config_path = Path.home() / ".ssh" / "config"
-    cache_key = str(default_config_path)
-
-    if cache_key not in _ssh_config_cache:
-        _ssh_config_cache[cache_key] = SSHConfig()
-
-    config = _ssh_config_cache[cache_key]
-    return config.get_user_for_host(gerrit_host, gerrit_port)
+    return SSHConfig().get_user_for_host(gerrit_host, gerrit_port)
 
 
-def clear_ssh_config_cache() -> None:
-    """Clear the SSH config cache.
-
-    This function is useful for testing or when SSH configuration
-    files have been modified during runtime.
-    """
-    _ssh_config_cache.clear()
-
-
-def clear_credential_cache() -> None:
-    """Clear all credential-related caches.
-
-    This function clears both the SSH config cache and the LRU caches
-    for environment settings and git email lookups. Useful for testing
-    or when configuration changes during runtime.
-    """
-    clear_ssh_config_cache()
-    _get_respect_user_ssh_setting.cache_clear()
-    _get_cached_git_user_email.cache_clear()
-    derive_gerrit_credentials.cache_clear()
-
-
-@lru_cache(maxsize=1)
 def _get_respect_user_ssh_setting() -> bool:
-    """Cache the G2G_RESPECT_USER_SSH environment variable setting.
+    """Read the G2G_RESPECT_USER_SSH environment variable.
 
-    This prevents repeated environment variable lookups and ensures
-    consistent behavior throughout the application lifecycle.
+    Read on every call rather than memoised: cli._load_effective_inputs
+    sets this variable at runtime when it detects local execution, so a
+    value captured earlier in the process can disagree with the
+    environment.  The flag selects between two entirely different
+    credential sources, which makes a stale read a wrong-identity bug.
 
     Returns:
         Boolean value of G2G_RESPECT_USER_SSH environment variable
@@ -342,12 +312,14 @@ def _get_respect_user_ssh_setting() -> bool:
     return env_bool("G2G_RESPECT_USER_SSH")
 
 
-@lru_cache(maxsize=1)
-def _get_cached_git_user_email() -> str | None:
-    """Cache git user email lookup to avoid repeated subprocess calls.
+def _read_git_user_email() -> str | None:
+    """Read the configured git user email.
+
+    Read on every call rather than memoised, so that a change of git
+    identity or working directory is reflected in derived credentials.
 
     Returns:
-        Cached git user email if configured, None otherwise
+        Git user email if configured, None otherwise
     """
     return get_git_user_email()
 
@@ -440,7 +412,6 @@ def get_git_user_email() -> str | None:
         return None
 
 
-@lru_cache(maxsize=32)
 def derive_gerrit_credentials(
     gerrit_host: str, organization: str, gerrit_port: int = 29418
 ) -> tuple[str | None, str | None]:
@@ -451,6 +422,12 @@ def derive_gerrit_credentials(
     1. SSH config user for the specific Gerrit host
     2. Git user email from local git configuration
     3. Fallback to organization-based derivation
+
+    Deliberately not memoised.  The result depends on
+    G2G_RESPECT_USER_SSH, on ~/.ssh/config and on the git identity, none
+    of which are arguments, so a cache keyed on the arguments alone
+    could serve a personal identity where the organization service
+    account was asked for.
 
     Args:
         gerrit_host: Gerrit server hostname
@@ -469,7 +446,6 @@ def derive_gerrit_credentials(
     )
 
     # Check if we should respect user SSH config (local mode)
-    # Use cached environment variable to prevent repeated lookups
     respect_user_ssh = _get_respect_user_ssh_setting()
 
     ssh_user = None
@@ -478,8 +454,8 @@ def derive_gerrit_credentials(
     if respect_user_ssh:
         # Try SSH config first
         ssh_user = get_ssh_user_for_gerrit(gerrit_host, gerrit_port)
-        # Try git config for email (cached to prevent repeated subprocess calls)
-        git_email = _get_cached_git_user_email()
+        # Try git config for email
+        git_email = _read_git_user_email()
         log.debug(
             "Local mode: using SSH config user=%s, git email=%s",
             ssh_user,

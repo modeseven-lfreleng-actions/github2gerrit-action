@@ -18,15 +18,10 @@ import pytest
 
 from github2gerrit.config import apply_parameter_derivation
 from github2gerrit.config import derive_gerrit_parameters
-from github2gerrit.ssh_config_parser import clear_credential_cache
 
 
 class TestDeriveGerritParameters:
     """Test cases for derive_gerrit_parameters function."""
-
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
 
     def test_no_organization(self):
         """Test behavior when no organization is provided."""
@@ -163,10 +158,6 @@ class TestDeriveGerritParameters:
 class TestApplyParameterDerivation:
     """Test cases for apply_parameter_derivation function."""
 
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
-
     def test_no_organization(self):
         """Test that no derivation occurs without organization."""
         cfg = {"EXISTING_KEY": "existing_value"}
@@ -263,10 +254,6 @@ class TestApplyParameterDerivation:
 
 class TestConfigIntegration:
     """Integration tests for configuration with SSH config parsing."""
-
-    def setup_method(self):
-        """Clear caches before each test to ensure isolation."""
-        clear_credential_cache()
 
     def test_real_world_lfit_scenario(self, tmp_path):
         """Test real-world scenario with lfit organization configuration."""
