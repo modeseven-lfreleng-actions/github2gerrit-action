@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from github2gerrit.config import DERIVED_KEYS_ENV
 from github2gerrit.config import _coerce_value
 from github2gerrit.config import _expand_env_refs
 from github2gerrit.config import _normalize_bool_like
@@ -1200,3 +1203,55 @@ def test_save_derived_parameters_project_only_writes_nothing(
     )
 
     assert config_file.read_text(encoding="utf-8") == original_content
+
+
+def test_mark_derived_keys_accumulates_across_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent marking must not lose keys (issue #410).
+
+    ``mark_derived_keys`` reads the recorded set, unions, and writes it
+    back.  Without serialisation two threads both read the old value and
+    the second write discards the first's contribution.  The window
+    between read and write is narrow in practice, so this widens it
+    deliberately rather than relying on chance: the lock is what makes
+    the union atomic, and with it every key survives however the threads
+    interleave.
+
+    A lost key would silently turn a derived value back into apparent
+    operator intent, which is the bug #386 fixed.
+    """
+    import github2gerrit.config as config_mod
+
+    original = config_mod._derived_keys
+
+    def slow_read() -> set[str]:
+        value = original()
+        time.sleep(0.02)
+        return value
+
+    monkeypatch.setattr(config_mod, "_derived_keys", slow_read)
+    monkeypatch.delenv(DERIVED_KEYS_ENV, raising=False)
+
+    expected = {f"DERIVED_KEY_{i}" for i in range(8)}
+    workers = [
+        threading.Thread(target=mark_derived_keys, args=([key],))
+        for key in sorted(expected)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    monkeypatch.setattr(config_mod, "_derived_keys", original)
+    recorded = {
+        part.strip()
+        for part in os.environ.get(DERIVED_KEYS_ENV, "").split(",")
+        if part.strip()
+    }
+
+    assert recorded == expected, (
+        f"lost {sorted(expected - recorded)} to interleaved updates"
+    )
+    for key in sorted(expected):
+        assert is_derived_key(key)
