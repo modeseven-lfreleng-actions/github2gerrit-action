@@ -119,6 +119,7 @@ dev = [
 
   # Type checking helpers
   "pytest-mock>=3.15.1",
+  "types-PyYAML>=6.0.12",
   "types-requests>=2.31.0",
   "types-urllib3>=1.26.25.14",
 ]
@@ -166,40 +167,49 @@ warn_unreachable = true
 warn_unused_ignores = true
 disallow_any_generics = true
 disallow_subclassing_any = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-disallow_untyped_calls = true
-no_implicit_optional = true
-show_error_codes = true
-pretty = true
-exclude = [
-  "build/",
-  "dist/",
-  "docs/",
-  "scripts/",
-  "tests/fixtures/",
-  "tests/test_composite_action_coverage.py",
-  "tests/test_action_environment_mapping.py",
-  "tests/test_action_step_validation.py",
-  "tests/test_action_outputs.py",
-  "tests/test_trailers_additional.py",
-]
-
-[[tool.mypy.overrides]]
-module = [
-    "tests.test_composite_action_coverage",
-    "tests.test_action_environment_mapping",
-    "tests.test_action_step_validation",
-    "tests.test_action_outputs",
-    "tests.test_trailers_additional",
-]
+# Annotation rules are relaxed here and switched back on for the shipped
+# package by the github2gerrit.* override below. The obvious shape --
+# global strictness plus a tests.* relaxation -- cannot work, because
+# neither half of it matches:
+#
+#   * tests/ has no __init__.py, so mypy names its modules test_cli,
+#     conftest and so on, never tests.test_cli.
+#   * A pattern cannot recover the real names either. mypy accepts "*"
+#     only as a whole dotted component, so "test_*" is rejected outright
+#     ("Patterns must be fully-qualified module names, optionally with
+#     '*' in some components") and the section is discarded in silence.
+#
+# Inverting the default is the only form that both applies and keeps
+# applying when test files are added. It also suits scripts/, which is
+# unannotated by design.
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 disallow_untyped_calls = false
-check_untyped_defs = false
+no_implicit_optional = true
+show_error_codes = true
+pretty = true
+# exclude skips directory discovery only; files named explicitly on the
+# command line are still checked. The pre-commit hook passes filenames,
+# so anything listed here would be checked there regardless -- keep this
+# to paths that hold no first-party Python.
+exclude = ["build/", "dist/", "docs/"]
+
+# The shipped package is held to full strict-mode annotation rules.
+# Everything else -- tests/, scripts/, sitecustomize.py -- keeps every
+# correctness check (check_untyped_defs, warn_unreachable,
+# strict_equality, no_implicit_reexport) but is not required to annotate
+# signatures. This mirrors the basedpyright stance recorded in
+# [[tool.pyright.executionEnvironments]] below, where #392 disabled
+# reportMissingParameterType for tests/ because pytest already resolves
+# fixtures by parameter name.
+[[tool.mypy.overrides]]
+module = ["github2gerrit.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
 
 [[tool.mypy.overrides]]
-module = ["pygerrit2", "pygerrit2.*"]
+module = ["pygerrit2"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -211,19 +221,10 @@ module = ["typer", "typer.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["pytest", "pytest.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = ["github2gerrit.rich_display"]
 disallow_untyped_defs = false
 disallow_untyped_calls = false
 check_untyped_defs = false
-
-[[tool.mypy.overrides]]
-module = ["tests.*"]
-disallow_untyped_defs = false
-disallow_untyped_calls = false
 
 [tool.coverage.run]
 branch = true

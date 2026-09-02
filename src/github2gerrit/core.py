@@ -63,7 +63,7 @@ from .github_api import get_pull
 from .github_api import get_recent_change_ids_from_comments
 from .github_api import get_repo_from_env
 from .github_api import iter_open_pulls
-from .gitreview import GerritInfo
+from .gitreview import GerritInfo as GerritInfo
 from .gitreview import fetch_gitreview
 from .gitreview import make_gitreview_info
 from .gitutils import CommandError
@@ -273,8 +273,9 @@ def _is_valid_change_id(value: str) -> bool:
 # GerritInfo is imported from .gitreview (aliased from GitReviewInfo).
 # It retains the same frozen-dataclass interface (host, port, project) plus
 # an additional optional ``base_path`` field (default ``None``).
-# The top-level import is sufficient for ``from github2gerrit.core import
-# GerritInfo`` to keep working — no explicit re-export needed.
+# The top-level import uses the redundant ``as GerritInfo`` form so that
+# ``from github2gerrit.core import GerritInfo`` keeps working under
+# no_implicit_reexport, which strict type checking enables.
 
 
 @dataclass(frozen=True)

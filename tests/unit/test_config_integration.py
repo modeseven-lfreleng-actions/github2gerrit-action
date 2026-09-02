@@ -173,7 +173,7 @@ class TestApplyParameterDerivation:
         mock_is_actions.return_value = False
 
         with mock.patch.dict(os.environ, {"G2G_ENABLE_DERIVATION": "false"}):
-            cfg = {}
+            cfg: dict[str, str] = {}
             result = apply_parameter_derivation(cfg, "testorg")
 
             assert result == cfg
@@ -189,7 +189,7 @@ class TestApplyParameterDerivation:
             "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
         }
 
-        cfg = {}
+        cfg: dict[str, str] = {}
         result = apply_parameter_derivation(
             cfg, "testorg", save_to_config=False
         )
@@ -302,7 +302,7 @@ GERRIT_SERVER = "gerrit.example.org"
                 mock_git.return_value = "user@example.org"
 
                 # Test the full integration
-                cfg = {}
+                cfg: dict[str, str] = {}
                 result = apply_parameter_derivation(
                     cfg, "exampleorg", save_to_config=False
                 )
@@ -333,7 +333,7 @@ GERRIT_SERVER = "gerrit.example.org"
             ) as mock_git:
                 mock_git.return_value = None
 
-                cfg = {}
+                cfg: dict[str, str] = {}
                 result = apply_parameter_derivation(
                     cfg, "unknownorg", save_to_config=False
                 )
@@ -390,7 +390,7 @@ GERRIT_SERVER = "gerrit.custom.org"
             ) as mock_git:
                 mock_git.return_value = "user@custom.org"
 
-                cfg = {}
+                cfg: dict[str, str] = {}
                 result = apply_parameter_derivation(
                     cfg, "testorg", save_to_config=False
                 )
@@ -442,7 +442,7 @@ class TestConfigurationPrecedence:
         }
         mock_derive.return_value = ("customuser", "custom@example.com")
 
-        cfg = {}
+        cfg: dict[str, str] = {}
         result = apply_parameter_derivation(
             cfg, "testorg", save_to_config=False
         )
