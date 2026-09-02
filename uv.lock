@@ -381,7 +381,6 @@ wheels = [
 name = "github2gerrit"
 source = { editable = "." }
 dependencies = [
-    { name = "click" },
     { name = "cryptography" },
     { name = "git-review" },
     { name = "pygerrit2" },
@@ -417,7 +416,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "click", specifier = ">=8.1.7" },
     { name = "click", marker = "extra == 'dev'", specifier = ">=8.2" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7.10.6" },
     { name = "cryptography", specifier = ">=48.0.1" },

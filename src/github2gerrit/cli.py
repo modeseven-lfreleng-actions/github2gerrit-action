@@ -24,12 +24,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import NoReturn
-from typing import Protocol
 from typing import TypeVar
 from typing import cast
 from urllib.parse import urlparse
 
-import click
 import typer
 
 from . import models
@@ -594,33 +592,6 @@ def _parse_github_target(url: str) -> GitHubPRTarget | GitHubRepoTarget:
 
 APP_NAME = "github2gerrit"
 
-if TYPE_CHECKING:
-    BaseGroup = object
-else:
-    BaseGroup = click.Group
-
-
-class _FormatterProto(Protocol):
-    def write_usage(self, prog: str, args: str, prefix: str = ...) -> None:
-        """Write the program usage line."""
-
-
-class _ContextProto(Protocol):
-    @property
-    def command_path(self) -> str:
-        """Return the full command path."""
-        raise NotImplementedError
-
-
-class _SingleUsageGroup(BaseGroup):
-    def format_usage(
-        self, ctx: _ContextProto, formatter: _FormatterProto
-    ) -> None:
-        # Force a simplified usage line without COMMAND [ARGS]...
-        formatter.write_usage(
-            ctx.command_path, "[OPTIONS] TARGET_URL", prefix="Usage: "
-        )
-
 
 # Error message constants to comply with TRY003
 _MSG_MISSING_REQUIRED_INPUT = "Missing required input: {field_name}"
@@ -711,7 +682,6 @@ if "--help" in sys.argv or _is_github_actions_context():
 app: typer.Typer = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
-    cls=cast(Any, _SingleUsageGroup),
     rich_markup_mode="rich",
     help=(
         "Tool to convert GitHub pull requests into Gerrit changes "
@@ -817,12 +787,14 @@ def _resolve_bool_override(
     provided on the command line, so CLI flags always take precedence.
     """
     source = ctx.get_parameter_source(param_name)  # pyright: ignore[reportAttributeAccessIssue]
-    # Compare by member name rather than by identity with a ParameterSource
-    # member. typer >= 0.20 ships its own copy of click under typer._click,
-    # so ctx.get_parameter_source returns a
-    # typer._click.core.ParameterSource member, which never compares equal
-    # to the click.core.ParameterSource member of the same name. Matching
-    # on .name is correct whichever copy typer hands back.
+    # Compare by member name rather than by identity with a
+    # ParameterSource member. typer vendors its own copy of click under
+    # typer._click from 0.26 onward, so there ctx.get_parameter_source
+    # returns a typer._click.core.ParameterSource member, which never
+    # compares equal to the click.core.ParameterSource member of the
+    # same name. Below 0.26 typer uses the installed click and the two
+    # do match, which is why this arrived as a typer upgrade rather than
+    # a code change. Matching on .name is correct under both.
     if source is not None and source.name == "COMMANDLINE":
         return current
     env_val = os.getenv(env_var)

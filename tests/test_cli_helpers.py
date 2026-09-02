@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from github2gerrit.cli import _extract_pr_number
 from github2gerrit.cli import _mask_secret
 from github2gerrit.cli import _read_github_context
 from github2gerrit.cli import _resolve_bool_override
+from github2gerrit.cli import app
 
 
 parametrize = mark.parametrize
@@ -237,9 +239,73 @@ def test_resolve_bool_override_precedence(
     """An explicit CLI flag beats the environment variable behind it.
 
     Regression test. The check for an explicit flag compared a
-    ``ParameterSource`` member against ``click.core.ParameterSource``,
-    but typer >= 0.20 vendors its own copy of click, so the two enum
-    classes differ and the comparison was never true. Every explicit
-    flag silently lost to its environment variable.
+    ``ParameterSource`` member against ``click.core.ParameterSource``.
+    typer vendors its own copy of click from 0.26 onward, so from there
+    the two enum classes differ, the comparison was never true, and
+    every explicit flag silently lost to its environment variable.
+    Below 0.26 typer uses the installed click and the comparison held,
+    which is why the bug arrived with a typer upgrade rather than with
+    a change to this file.
     """
     assert _run_override(argv, env_value, monkeypatch) is expected
+
+
+# ---------------------------------------------------
+# Guards for the typer/click split (issue #398)
+# ---------------------------------------------------
+
+
+def test_help_usage_line_is_stable() -> None:
+    """The usage line is what we intend, and is asserted somewhere.
+
+    A ``click.Group`` subclass used to be passed as the app's ``cls`` to
+    force this line. It was never instantiated -- typer builds a
+    ``TyperCommand`` for a single-command app -- so the line came from
+    typer's default all along and the override was dead code. Nothing
+    asserted on the output, so neither the intent nor the reality was
+    ever checked.
+    """
+    result = CliRunner().invoke(app, ["--help"], prog_name="github2gerrit")
+
+    assert result.exit_code == 0, result.output
+    assert "Usage: github2gerrit [OPTIONS] [TARGET_URL]" in result.output
+
+
+def test_typer_and_click_symbols_are_not_interchangeable() -> None:
+    """Record that typer may vendor its own click, executably.
+
+    From typer 0.26 onward ``typer._click`` is a complete private copy,
+    so a symbol taken from ``click`` is a different object from typer's
+    namesake and every identity, isinstance and except relationship
+    between them silently fails to hold. Two live bugs came from that.
+
+    Below typer 0.26 the two are the same object and the assertion
+    would be false, so this only asserts under the vendored regime --
+    detected by the presence of ``typer._click`` rather than by version
+    arithmetic. Should typer stop vendoring, this stops asserting rather
+    than failing spuriously.
+    """
+    if importlib.util.find_spec("typer._click") is None:
+        pytest.skip("typer below 0.26 uses the installed click")
+
+    import click.exceptions
+
+    # Asserted as behaviour, not as identity or module paths. An
+    # ``is not`` comparison gets folded by a type checker into a
+    # non-overlapping identity check, and the module a symbol lives in
+    # moves even between patch releases: typer.Exit was
+    # typer._click.exceptions.Exit in 0.27.1 and typer.exceptions.Exit
+    # in 0.27.2. What holds across both is the consequence -- an except
+    # clause naming the wrong copy never fires, so the exception
+    # escapes it in silence.
+    def _raise_typer_exit() -> None:
+        raise typer.Exit(3)
+
+    caught_by_click = False
+    try:
+        _raise_typer_exit()
+    except click.exceptions.Exit:
+        caught_by_click = True
+    except typer.Exit:
+        pass
+    assert not caught_by_click
