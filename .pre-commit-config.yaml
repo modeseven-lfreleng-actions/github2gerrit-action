@@ -91,13 +91,45 @@ repos:
         # pygerrit2 is deliberately absent: it is an optional runtime
         # dependency and pyproject.toml already gives it
         # ignore_missing_imports.
+        #
+        # The pins below are exact (==) rather than floors. This
+        # environment is resolved from PyPI at install time, not from
+        # uv.lock, so a >= constraint would still pick up whatever is
+        # newest whenever pre-commit.ci happens to rebuild the
+        # environment, and the hook would then report on a dependency set
+        # nobody runs locally. That drift is not theoretical: CI once
+        # resolved typer 0.27.2 against a lockfile holding 0.27.1, and the
+        # two disagreed about which module typer.Exit lives in.
+        # Every version here must equal the one uv.lock records for that
+        # package, so update both together (after `uv lock --upgrade`, for
+        # instance). tests/test_precommit_mypy_pins.py compares the two
+        # files and fails if they diverge in either direction.
+        #
+        # These pins do not freeze the whole resolved closure: pip still
+        # picks transitive versions at build time, and listing every
+        # package uv.lock records would duplicate the lockfile here. They
+        # do not need to. mypy's verdict can only turn on a package whose
+        # types it reads, which means one the checked files import, so the
+        # list covers exactly that set -- rich is here because src/ imports
+        # it, not because typer happens to pull it in. The same test asserts
+        # the list stays complete against those imports.
+        #
+        # mypy itself is pinned here as well as coming from the mirror's
+        # rev above. That is not redundant: the rev decides which mypy
+        # runs, and nothing otherwise ties it to the locked one, so an
+        # autoupdate of the mirror or a lockfile-only mypy upgrade would
+        # leave the hook running a different checker in silence. With the
+        # pin present, the test compares it against uv.lock, and a mirror
+        # whose rev disagrees fails to install rather than quietly winning.
         additional_dependencies:
-          - click>=8.2
-          - pytest
-          - responses
-          - typer
-          - types-PyYAML
-          - types-requests
+          - mypy==2.3.1
+          - click==8.4.2
+          - pytest==9.1.1
+          - responses==0.26.2
+          - rich==15.0.0
+          - typer==0.27.1
+          - types-PyYAML==6.0.12.20260815
+          - types-requests==2.33.0.20260712
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
