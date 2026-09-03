@@ -402,6 +402,15 @@ class TestReusableWorkflowConcurrency:
             "github.repository" in condition
         )
 
+    def test_keyless_modes_survive_the_fork_exclusion(self, reusable_workflow):
+        # G2G_NO_GERRIT and DRY_RUN never reach Gerrit, and this
+        # repository's own testing workflow calls this one with
+        # G2G_NO_GERRIT on every trigger. Excluding fork pull_request
+        # unconditionally would drop that coverage entirely.
+        condition = self._job(reusable_workflow)["if"]
+        assert "inputs.G2G_NO_GERRIT" in condition
+        assert "inputs.DRY_RUN" in condition
+
     def test_fork_pull_request_target_is_still_admitted(
         self, reusable_workflow
     ):

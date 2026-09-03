@@ -294,6 +294,16 @@ jobs:
     # A run that can do no useful work must not be able to evict a
     # re-check that can.
     #
+    # pull_request on a fork head is excluded for the same reason,
+    # since GitHub denies it secrets — except in the keyless modes.
+    # G2G_NO_GERRIT and DRY_RUN both run the pipeline without ever
+    # reaching Gerrit, _skip_unprivileged_fork_run exempts them, and
+    # this repository's own testing workflow calls this one with
+    # G2G_NO_GERRIT on every trigger. Excluding them unconditionally
+    # would skip that coverage on any fork pull request. They cannot
+    # transfer, so the slot they take is the accepted cost of testing
+    # the path consumers actually use.
+    #
     # pull_request_target on a fork head is deliberately kept: it runs
     # from the default branch, holds the credentials, and is the
     # trigger that applies the approval gate.
@@ -322,7 +332,7 @@ jobs:
     # is guarded by tests/test_action_step_validation.py, which
     # requires every phrase of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || inputs.G2G_NO_GERRIT || inputs.DRY_RUN || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

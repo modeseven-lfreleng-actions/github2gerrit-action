@@ -19,8 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
-from github2gerrit.cli import _provenance_from_pull_request
 from github2gerrit.cli import _recheck_has_nothing_to_unblock
+from github2gerrit.cli import _recover_pr_metadata
 from github2gerrit.cli import _skip_unrequested_comment_run
 from github2gerrit.models import RECHECK_EVENTS
 from github2gerrit.models import GitHubContext
@@ -842,62 +842,84 @@ class TestRecheckNeedsAGateToLift:
         assert _recheck_has_nothing_to_unblock(ctx) is False
 
 
-class TestProvenanceFromFetchedPullRequest:
-    """A second chance at provenance the payload did not carry.
+class TestPullRequestMetadataRecovery:
+    """A second chance at metadata the payload did not carry.
 
-    An ``issue_comment`` payload has no head repository, so the first
-    provenance check depends on an API call that swallows its own
-    failures. The pull request fetched moments later is a separate
-    call, and one transient failure must not leave a same-repository
-    pull request looking gated — an approval on one would then let any
-    commenter resubmit its unchanged head.
+    An ``issue_comment`` payload has none of it, so the first attempt
+    depends on an API call that swallows its own failures. The pull
+    request fetched moments later is a separate call, and one transient
+    failure must not leave a same-repository pull request looking gated
+    — nor leave the base ref empty for a transfer that follows.
     """
 
-    def _pr(self, full_name: str) -> Any:
+    def _pr(
+        self,
+        full_name: str | None,
+        *,
+        base_ref: str = "stable/scandium",
+        head_ref: str = "topic",
+        head_sha: str = HEAD_SHA,
+    ) -> Any:
         pr = MagicMock()
         pr.head.repo.full_name = full_name
+        pr.base.ref = base_ref
+        pr.head.ref = head_ref
+        pr.head.sha = head_sha
         return pr
 
     @pytest.fixture(autouse=True)
     def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("PR_HEAD_REPO", "")
+        for var in (
+            "PR_HEAD_REPO",
+            "GITHUB_BASE_REF",
+            "GITHUB_HEAD_REF",
+            "GITHUB_SHA",
+        ):
+            monkeypatch.setenv(var, "")
+        monkeypatch.setenv("GITHUB_REPOSITORY", BASE_REPO)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
+        monkeypatch.setenv("PR_NUMBER", "29")
 
-    def test_unresolved_head_is_filled_from_the_pull_request(self) -> None:
-        ctx = _ctx(event_name="issue_comment", head_repo="")
-        assert ctx.head_is_trusted is False
+    def _recover(self, head_repo: str, pr: Any) -> Any:
+        ctx = _ctx(event_name="issue_comment", head_repo=head_repo)
+        ctx = dataclasses.replace(ctx, base_ref="", head_ref="")
+        return _recover_pr_metadata(ctx, pr)
 
-        resolved = _provenance_from_pull_request(ctx, self._pr(BASE_REPO))
+    def test_provenance_is_recovered(self) -> None:
+        recovered = self._recover("", self._pr(BASE_REPO))
+        assert recovered.head_repo == BASE_REPO
+        assert recovered.head_is_trusted is True
+        assert _recheck_has_nothing_to_unblock(recovered) is True
 
-        assert resolved.head_repo == BASE_REPO
-        assert resolved.head_is_trusted is True
-        assert _recheck_has_nothing_to_unblock(resolved) is True
+    def test_refs_are_recovered_alongside_provenance(self) -> None:
+        # Recovering only the head repository would answer whether to
+        # proceed while leaving where to push unresolved, and an empty
+        # base ref lets target resolution fall back to a default
+        # branch.
+        recovered = self._recover("", self._pr(FORK_REPO))
+        assert recovered.base_ref == "stable/scandium"
+        assert recovered.head_ref == "topic"
+        assert recovered.sha == HEAD_SHA
 
     def test_a_fork_head_still_proceeds(self) -> None:
-        ctx = _ctx(event_name="issue_comment", head_repo="")
-        resolved = _provenance_from_pull_request(ctx, self._pr(FORK_REPO))
-        assert resolved.head_repo == FORK_REPO
-        assert _recheck_has_nothing_to_unblock(resolved) is False
+        recovered = self._recover("", self._pr(FORK_REPO))
+        assert recovered.head_repo == FORK_REPO
+        assert _recheck_has_nothing_to_unblock(recovered) is False
 
     def test_known_provenance_is_never_overwritten(self) -> None:
         # A head already resolved came from the event payload or an
         # earlier API call, and must not be replaced by a value taken
         # from an object the caller supplied.
-        ctx = _ctx(event_name="issue_comment", head_repo=FORK_REPO)
-        resolved = _provenance_from_pull_request(ctx, self._pr(BASE_REPO))
-        assert resolved.head_repo == FORK_REPO
+        recovered = self._recover(FORK_REPO, self._pr(BASE_REPO))
+        assert recovered.head_repo == FORK_REPO
 
-    @pytest.mark.parametrize("full_name", ["", None])
-    def test_a_pull_request_that_cannot_answer_changes_nothing(
-        self, full_name: str | None
-    ) -> None:
-        ctx = _ctx(event_name="issue_comment", head_repo="")
-        pr = MagicMock()
-        pr.head.repo.full_name = full_name
-        assert _provenance_from_pull_request(ctx, pr).head_repo == ""
+    def test_a_pull_request_that_cannot_answer_changes_nothing(self) -> None:
+        recovered = self._recover("", self._pr(""))
+        assert recovered.head_repo == ""
+        assert recovered.base_ref == ""
 
     def test_no_pull_request_changes_nothing(self) -> None:
-        ctx = _ctx(event_name="issue_comment", head_repo="")
-        assert _provenance_from_pull_request(ctx, None).head_repo == ""
+        assert self._recover("", None).head_repo == ""
 
 
 class TestBlockedCommentWording:

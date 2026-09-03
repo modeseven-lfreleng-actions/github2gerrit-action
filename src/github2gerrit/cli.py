@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import os
@@ -419,45 +418,70 @@ def _skip_unrequested_comment_run(gh: GitHubContext) -> bool:
     return True
 
 
-def _provenance_from_pull_request(
+def _recover_pr_metadata(
     gh: GitHubContext, pr_obj: Any | None
 ) -> GitHubContext:
-    """Fill in an unresolved head repository from a fetched pull request.
+    """Recover pull request metadata from an already-fetched object.
 
-    Provenance decides whether the approval gate applies, so leaving it
-    unresolved when the answer is available costs a same-repository
-    pull request an unnecessary gate, and — worse — leaves a re-check
-    able to resubmit it.
+    A second chance at what :func:`_augment_pr_refs_if_needed` tries
+    first. That helper swallows its own failures and returns the
+    context unresolved, while the pull request fetched moments later is
+    a separate call that may well have succeeded — so the answer can be
+    in hand and unused.
 
-    Only fills a *blank* head repository. A value already present came
-    from the event payload or an earlier API call, and must not be
-    replaced by one taken from an object a caller supplied.
+    Recovering only the provenance would be worse than recovering
+    nothing, because it would resolve the question that decides whether
+    to proceed while leaving the refs that decide *where*: an empty
+    ``base_ref`` lets target-branch resolution fall back to a default
+    branch, preparing a change against the wrong base. So this fills
+    everything the object can answer, exactly as the first attempt
+    does.
 
-    Returns *gh* unchanged when provenance is already known or the
-    pull request cannot supply it.
+    Keyed on an unresolved head repository, which is the marker that
+    the first attempt did not succeed. Refs already present are left
+    alone; the head SHA is replaced, because the event's own value is
+    the merge or default-branch commit rather than the pull request
+    head.
+
+    Returns *gh* unchanged when provenance is already known or the pull
+    request cannot supply it.
     """
     if gh.head_repo or pr_obj is None:
         return gh
 
-    resolved = str(
-        getattr(
-            getattr(getattr(pr_obj, "head", None), "repo", None),
-            "full_name",
-            "",
-        )
-        or ""
-    ).strip()
-    if not resolved:
+    head_repo = _head_repo_for_pr(pr_obj)
+    if not head_repo:
         return gh
 
+    # The orchestrator and the context reader both take these from the
+    # environment, so writing them there is what makes the recovery
+    # visible to everything downstream.
+    os.environ["PR_HEAD_REPO"] = head_repo
     log.debug(
-        "Resolved PR #%s head repository as %s from the fetched pull request",
+        "Recovered PR #%s head repository from the fetched pull request: %s",
         gh.pr_number,
-        resolved,
+        head_repo,
     )
-    # The orchestrator reads this back out of the environment.
-    os.environ["PR_HEAD_REPO"] = resolved
-    return dataclasses.replace(gh, head_repo=resolved)
+
+    if not gh.base_ref:
+        base_ref = _ref_for_pr(pr_obj, "base")
+        if base_ref:
+            os.environ["GITHUB_BASE_REF"] = base_ref
+            log.debug("Recovered base_ref: %s", base_ref)
+    if not gh.head_ref:
+        head_ref = _ref_for_pr(pr_obj, "head")
+        if head_ref:
+            os.environ["GITHUB_HEAD_REF"] = head_ref
+            log.debug("Recovered head_ref: %s", head_ref)
+
+    head_sha = str(
+        getattr(getattr(pr_obj, "head", object()), "sha", "") or ""
+    ).strip()
+    if head_sha:
+        os.environ["GITHUB_SHA"] = head_sha
+        log.debug("Recovered head sha: %s", head_sha)
+
+    return _read_github_context()
 
 
 def _recheck_has_nothing_to_unblock(gh: GitHubContext) -> bool:
@@ -3407,16 +3431,18 @@ def _handle_single_pr(
         if pr_obj is None:
             pr_obj = _resolve_pr_for_gate(gh, data)
 
-        # Second chance at provenance, and a second look at the
-        # short-circuit above. An issue_comment payload carries no head
-        # repository, so the check before this depended on
-        # _augment_pr_refs_if_needed's API call; that helper swallows a
-        # failure and returns the context unresolved, while the fetch
-        # just above is a separate call that may well have succeeded.
-        # Without this, one transient failure would let a commenter
-        # resubmit an unchanged same-repository pull request — exactly
-        # what the short-circuit exists to prevent.
-        gh = _provenance_from_pull_request(gh, pr_obj)
+        # Second chance at the pull request's own metadata, and a
+        # second look at the short-circuit above. An issue_comment
+        # payload carries none of it, so the check before this
+        # depended on _augment_pr_refs_if_needed's API call; that
+        # helper swallows a failure and returns the context
+        # unresolved, while the fetch just above is a separate call
+        # that may well have succeeded. Without this, one transient
+        # failure would let a commenter resubmit an unchanged
+        # same-repository pull request — exactly what the
+        # short-circuit exists to prevent — and would leave the base
+        # ref empty for the transfer that followed.
+        gh = _recover_pr_metadata(gh, pr_obj)
         if _recheck_has_nothing_to_unblock(gh):
             log.info(
                 "Re-check (%s) for PR #%s, whose head is in this "
