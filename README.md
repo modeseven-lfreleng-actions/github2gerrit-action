@@ -93,9 +93,14 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-runs when a maintainer approves a fork pull request
-  pull_request_review:
-    types: [submitted, dismissed]
+  # Re-examines open PRs, which is how an approved fork PR is
+  # transferred. A review cannot do it: GitHub withholds secrets
+  # from pull_request_review runs on fork PRs.
+  schedule:
+    - cron: "*/30 * * * *"
+  # Lets anyone post '@github2gerrit check' to re-examine one PR now
+  issue_comment:
+    types: [created]
   push:
     branches: [main, master]
   workflow_dispatch:
@@ -126,10 +131,15 @@ jobs:
 ```
 
 The `push` trigger enables closing PRs whose Gerrit changes have
-merged; `workflow_dispatch` enables manual processing. Repositories
-using the Gerrit-side dispatch integration should also declare
-`GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH` as
-dispatch inputs and forward them the same way.
+merged; `workflow_dispatch` enables manual processing. The `schedule`
+and `issue_comment` triggers exist for pull requests raised from
+forks, which need a maintainer's approval and a *privileged* run to
+act on it — see
+[fork pull requests](docs/features.md#which-triggers-can-lift-the-gate).
+Omit both if the repository only ever receives automation PRs.
+Repositories using the Gerrit-side dispatch integration should also
+declare `GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH`
+as dispatch inputs and forward them the same way.
 
 Pin `@main` to a release tag or commit SHA for production use.
 
@@ -143,9 +153,14 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-runs when a maintainer approves a fork pull request
-  pull_request_review:
-    types: [submitted, dismissed]
+  # Re-examines open PRs, which is how an approved fork PR is
+  # transferred. A review cannot do it: GitHub withholds secrets
+  # from pull_request_review runs on fork PRs.
+  schedule:
+    - cron: "*/30 * * * *"
+  # Lets anyone post '@github2gerrit check' to re-examine one PR now
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 
 permissions:

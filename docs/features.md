@@ -441,21 +441,87 @@ own pull request, and that guarantee is a large part of why the tool uses
 reviews rather than comment directives — on a Gerrit mirror the pull request
 author often holds the same organization membership as the reviewers.
 
-#### Enabling re-runs on approval
+#### Which triggers can lift the gate
 
-`pull_request_target` carries no event for a submitted review, so approving a
-pull request does nothing unless the calling workflow listens for it:
+Only a **privileged** run can transfer an approved fork pull request, because
+only a privileged run receives `GERRIT_SSH_PRIVKEY_G2G`. GitHub withholds
+repository secrets from a workflow whose file comes from the fork, and that
+distinction follows the trigger:
+
+| Trigger               | Runs from             | Secrets on a fork PR |
+| --------------------- | --------------------- | -------------------- |
+| `pull_request_target` | Default branch        | Yes                  |
+| `issue_comment`       | Default branch        | Yes                  |
+| `schedule`            | Default branch        | Yes                  |
+| `pull_request`        | `refs/pull/<N>/merge` | No                   |
+| `pull_request_review` | `refs/pull/<N>/merge` | No                   |
+
+**A review cannot lift the gate by itself.** The run it starts has
+no Gerrit key, so it stops immediately and says so rather than failing. This
+is a property of GitHub's trigger model, not of this tool, and no
+configuration changes it.
+
+The tool separates the two roles this confuses. A trigger decides *when* to
+look again; it needs no trust, because looking again is harmless. Approval
+decides *whether* to proceed, and the tool always re-reads it from the pull
+request's reviews. So no trigger, and nobody who fires one, can grant
+anything.
+
+Two privileged triggers act on an approval.
+
+**A scheduled sweep** re-examines every open pull request, and needs nothing
+from the maintainer beyond the approval itself:
 
 ```yaml
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  pull_request_review:
-    types: [submitted, dismissed]
+  schedule:
+    - cron: "*/30 * * * *"
 ```
 
-Without that trigger the tool only reconsiders a pull request on its next
-push, or when a maintainer dispatches the workflow by hand.
+Each pull request still passes through the gate with its own provenance, so
+scheduling changes what the tool looks at and never what it permits.
+
+**A comment** does the same immediately, for when the sweep interval is longer
+than the wait is worth:
+
+```yaml
+on:
+  issue_comment:
+    types: [created]
+```
+
+Anyone may then post `@github2gerrit check` to force a re-evaluation. The
+directive keeps ordinary conversation from starting a run, and performs no
+permission check. It grants nothing, because the answer still comes from
+re-reading the reviews.
+
+Approving and then pushing also works with no extra trigger, since
+`pull_request_target` already listens for `synchronize`.
+
+Keeping `pull_request_review` remains useful for **same-repository** pull
+requests, which carry no fork restriction and so run privileged. It costs
+nothing on fork pull requests beyond a run that stops straight away.
+
+#### Naming approvers directly
+
+Where the people who review the code hold no GitHub standing on the mirror,
+no review can ever clear the gate. Two opt-in sources address that, both off
+by default because each widens who counts as a maintainer:
+
+- `G2G_APPROVER_LOGINS` — a comma-separated list of GitHub logins.
+- `G2G_APPROVERS_FROM_INFO_YAML` — read the project lead and committers from
+  the **base** repository's `INFO.yaml`, at the pull request's base ref. A
+  fork's copy is never consulted, for the same reason its `.gitreview` is not.
+
+`INFO.yaml` matches on `github_id`. Its `id` field holds an LFID, not a GitHub
+login, so matching on it lets whoever registers that username on GitHub
+inherit committer authority; `G2G_INFO_YAML_MATCH_LFID` enables that
+separately, and a project should turn it on only knowing the trade.
+
+A named approver gains standing and nothing else. The head-commit binding, the
+changes-requested block and the author exclusion all still apply.
 
 #### When the gate blocks
 
