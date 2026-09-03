@@ -469,16 +469,29 @@ anything.
 
 Two privileged triggers act on an approval.
 
-**A scheduled sweep** re-examines every open pull request, and needs nothing
-from the maintainer beyond the approval itself:
+**A scheduled sweep** re-examines the pull requests the gate can block, and
+needs nothing from the maintainer beyond the approval itself:
 
 ```yaml
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "17 * * * *"
 ```
+
+The sweep considers only pull requests whose head is **not known to be in the
+base repository** — the same predicate the gate itself uses, so a pull request
+with unresolved provenance is still visited rather than left stuck. A
+same-repository pull request never passed through the gate, so the sweep has
+nothing to notice about it, and re-running the pipeline for every open pull
+request each hour would push to Gerrit repeatedly — duplicate detection would
+not prevent it, because `ALLOW_DUPLICATES` defaults to `true` and merely logs.
+A dispatched sweep still processes everything, since somebody asked for it.
+
+The same reasoning applies to the comment directive below: on a
+same-repository pull request it stops without transferring, so nobody can
+force repeated submissions with a comment.
 
 Each pull request still passes through the gate with its own provenance, so
 scheduling changes what the tool looks at and never what it permits.
@@ -497,12 +510,18 @@ directive keeps ordinary conversation from starting a run, and performs no
 permission check. It grants nothing, because the answer still comes from
 re-reading the reviews.
 
+Both triggers need `AUTOMATION_ONLY: false`. It defaults to `true` and closes
+a human-authored pull request before the gate sees it, which would leave
+nothing for either trigger to unblock.
+
 Approving and then pushing also works with no extra trigger, since
 `pull_request_target` already listens for `synchronize`.
 
-Keeping `pull_request_review` remains useful for **same-repository** pull
-requests, which carry no fork restriction and so run privileged. It costs
-nothing on fork pull requests beyond a run that stops straight away.
+`pull_request_review` needs no place in either list. On a fork pull request
+it runs unprivileged, and on a same-repository one the tool exits without
+transferring anyway, because re-submitting an unchanged commit every time
+somebody reviews it would add a patchset for nothing. Keeping the trigger is
+harmless, but it does no work.
 
 #### Naming approvers directly
 
@@ -513,12 +532,19 @@ by default because each widens who counts as a maintainer:
 - `G2G_APPROVER_LOGINS` — a comma-separated list of GitHub logins.
 - `G2G_APPROVERS_FROM_INFO_YAML` — read the project lead and committers from
   the **base** repository's `INFO.yaml`, at the pull request's base ref. A
-  fork's copy is never consulted, for the same reason its `.gitreview` is not.
+  fork's copy is never consulted, for the same reason its `.gitreview` is not,
+  and an unknown base ref declines the read rather than falling back to the
+  default branch. The tool skips `primary_contact`: it names whoever
+  fields questions about the project, which is not the same as who may
+  authorise.
+
+Both are action inputs, and the reusable workflow forwards them.
 
 `INFO.yaml` matches on `github_id`. Its `id` field holds an LFID, not a GitHub
 login, so matching on it lets whoever registers that username on GitHub
 inherit committer authority; `G2G_INFO_YAML_MATCH_LFID` enables that
-separately, and a project should turn it on only knowing the trade.
+separately, and a project should turn it on only knowing the trade. Where a
+person carries a `github_id`, their `id` is never also admitted.
 
 A named approver gains standing and nothing else. The head-commit binding, the
 changes-requested block and the author exclusion all still apply.

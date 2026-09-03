@@ -103,9 +103,10 @@ class CommandDefinition:
             user-facing documentation helpers.
         requires_trust: Whether the command may only be obeyed when a
             trusted author issued it.  Defaults to ``True``, so a new
-            command is authorised unless it deliberately opts out.
-            Only a command that *grants nothing* may set this
-            ``False`` — see :func:`find_open_command`.
+            command is restricted to trusted authors unless it
+            deliberately opts out.  Only a command that *grants
+            nothing* may set this ``False`` — see
+            :func:`find_open_command`.
     """
 
     name: str

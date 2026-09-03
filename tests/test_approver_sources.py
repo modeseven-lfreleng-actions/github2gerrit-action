@@ -12,6 +12,7 @@ from __future__ import annotations
 import textwrap
 from typing import Any
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -23,6 +24,8 @@ from github2gerrit.approvers import describe_additional_sources
 from github2gerrit.approvers import explicit_approvers
 from github2gerrit.approvers import parse_info_yaml
 from github2gerrit.approvers import resolve_additional_approvers
+from github2gerrit.cli import _check_fork_approval
+from github2gerrit.models import GitHubContext
 from github2gerrit.pr_approval import evaluate_fork_approval
 
 
@@ -132,6 +135,21 @@ class TestInfoYamlParsing:
             {"lead-github", "committer-github"}
         )
 
+    def test_primary_contact_carries_no_authority(self) -> None:
+        # It names whoever should be contacted about the project, which
+        # is not the same as who may authorise a transfer.
+        contact_only = textwrap.dedent("""
+            ---
+            project: "example"
+            primary_contact:
+              name: "Ops"
+              github_id: "ops-account"
+            committers:
+              - name: "Committer"
+                github_id: "committer-github"
+        """).strip()
+        assert parse_info_yaml(contact_only) == frozenset({"committer-github"})
+
     @pytest.mark.parametrize(
         "text", ["", "not: [a, mapping", "- a\n- list", "just a string"]
     )
@@ -155,6 +173,32 @@ class TestInfoYamlProvenance:
 
         repo.get_contents.assert_called_once_with(INFO_YAML_PATH, ref="master")
         assert "rovarga" in logins
+
+    def test_unknown_base_ref_declines_the_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Falling back to the default branch would authorise from a
+        # roster the pull request does not target. .gitreview fails
+        # closed in the same situation.
+        monkeypatch.setenv(USE_INFO_YAML_ENV, "true")
+        monkeypatch.setenv(INFO_YAML_LFID_ENV, "true")
+        repo = _repo_returning(MDSAL_INFO_YAML)
+
+        logins = resolve_additional_approvers(base_repo=repo, base_ref="  ")
+
+        assert logins == frozenset()
+        repo.get_contents.assert_not_called()
+
+    def test_explicit_list_survives_a_declined_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The sources are independent; one failing closed must not
+        # silently discard the other.
+        monkeypatch.setenv(APPROVER_LOGINS_ENV, "named-reviewer")
+        monkeypatch.setenv(USE_INFO_YAML_ENV, "true")
+        assert resolve_additional_approvers(base_ref="") == frozenset(
+            {"named-reviewer"}
+        )
 
     def test_missing_file_names_nobody(
         self, monkeypatch: pytest.MonkeyPatch
@@ -258,6 +302,100 @@ class TestGateGuaranteesSurviveWidening:
         )
         assert status.approved is False
         assert status.blockers == ["gerrit-reviewer"]
+
+
+class TestAuthorityComesFromTheBaseRepository:
+    """The gate must read `INFO.yaml` from the base side only.
+
+    The resolver tests above prove only that it reads whichever object
+    it is handed. This covers the wiring that chooses which object —
+    the part that would let a fork nominate its own approvers if it
+    picked `pr.head.repo`.
+    """
+
+    FORK_INFO_YAML = textwrap.dedent("""
+        ---
+        project: "mdsal"
+        project_lead:
+          name: "Attacker"
+          github_id: "attacker"
+        committers:
+          - name: "Attacker"
+            github_id: "attacker"
+    """).strip()
+
+    def _pull_request(self) -> Any:
+        """A PR whose fork tampers with `INFO.yaml` to name itself."""
+        pr = MagicMock()
+        pr.user.login = "contributor"
+        pr.head.sha = HEAD_SHA
+        pr.head.ref = "topic"
+        pr.head.repo = _repo_returning(self.FORK_INFO_YAML)
+        pr.head.repo.full_name = "contributor/mdsal"
+        pr.base.ref = "master"
+        pr.base.repo = _repo_returning(MDSAL_INFO_YAML)
+        pr.base.repo.full_name = "opendaylight/mdsal"
+
+        approval = MagicMock()
+        approval.state = "APPROVED"
+        approval.user.login = "attacker"
+        approval.author_association = "NONE"
+        approval.commit_id = HEAD_SHA
+        pr.get_reviews.return_value = [approval]
+        return pr
+
+    def _gate(self, pr: Any) -> tuple[bool, str]:
+        gh = GitHubContext(
+            event_name="issue_comment",
+            event_action="created",
+            event_path=None,
+            repository="opendaylight/mdsal",
+            repository_owner="opendaylight",
+            server_url="https://github.com",
+            run_id="1",
+            sha=HEAD_SHA,
+            base_ref="master",
+            head_ref="topic",
+            pr_number=29,
+            head_repo="contributor/mdsal",
+        )
+        with patch(
+            "github2gerrit.cli._is_github_actions_context", return_value=True
+        ):
+            return _check_fork_approval(pr, gh)
+
+    def test_tampered_fork_copy_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(USE_INFO_YAML_ENV, "true")
+        monkeypatch.setenv(INFO_YAML_LFID_ENV, "true")
+        monkeypatch.setenv("CI_TESTING", "true")
+        pr = self._pull_request()
+
+        allowed, _sha = self._gate(pr)
+
+        # The fork's copy names "attacker" as lead and committer. Were
+        # it consulted, the approval above would clear the gate.
+        assert allowed is False
+        pr.head.repo.get_contents.assert_not_called()
+
+    def test_base_copy_supplies_authority(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(USE_INFO_YAML_ENV, "true")
+        monkeypatch.setenv(INFO_YAML_LFID_ENV, "true")
+        monkeypatch.setenv("CI_TESTING", "true")
+        pr = self._pull_request()
+        # tpantelis is a committer in the base repository's copy.
+        pr.get_reviews.return_value[0].user.login = "tpantelis"
+
+        allowed, sha = self._gate(pr)
+
+        assert allowed is True
+        assert sha == HEAD_SHA
+        pr.base.repo.get_contents.assert_called_once_with(
+            INFO_YAML_PATH, ref="master"
+        )
 
 
 class TestPolicyDescription:

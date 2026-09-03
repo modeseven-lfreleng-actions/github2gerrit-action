@@ -26,7 +26,9 @@ request's **base ref**, for the same reason ``.gitreview`` is (see
 ``Orchestrator._read_gitreview``): a fork must never supply the file
 that decides who may authorise the fork's own transfer.  Both operands
 come from GitHub's own metadata for the base side of the pull request,
-which the head cannot influence.
+which the head cannot influence.  Where the base ref is unknown the
+read is declined rather than falling back to the default branch, which
+would answer with a roster the pull request does not target.
 
 The ``id`` field is not a GitHub login
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -83,8 +85,14 @@ authority.
 INFO_YAML_PATH = "INFO.yaml"
 """Path of the file within the base repository."""
 
-_PERSON_KEYS = ("project_lead", "primary_contact")
-"""Top-level keys holding a single person."""
+_PERSON_KEYS = ("project_lead",)
+"""Top-level keys holding a single authority-bearing person.
+
+``primary_contact`` is deliberately absent.  It names whoever should be
+contacted about the project, which is often the lead but may be a
+separate operational or administrative contact.  Admitting it would
+grant that account approval authority the file never claimed for it.
+"""
 
 _ROSTER_KEYS = ("committers",)
 """Top-level keys holding a list of people."""
@@ -137,9 +145,12 @@ def _logins_from_person(person: Any, *, match_lfid: bool) -> Iterable[str]:
 def parse_info_yaml(text: str, *, match_lfid: bool = False) -> frozenset[str]:
     """Extract approver logins from ``INFO.yaml`` content.
 
-    Reads the project lead, the primary contact and the committer
-    roster.  YAML anchors and merge keys are resolved by the parser, so
-    a committer written as ``<<: *project_lead`` is understood, and
+    Reads the project lead and the committer roster, and nothing else.
+    ``primary_contact`` is deliberately excluded; see
+    :data:`_PERSON_KEYS`.
+
+    YAML anchors and merge keys are resolved by the parser, so a
+    committer written as ``<<: *project_lead`` is understood, and
     duplicates collapse into the returned set.
 
     Args:
@@ -186,11 +197,7 @@ def _fetch_info_yaml(repo_obj: Any, ref: str) -> str:
     file is the common case, not an error.
     """
     try:
-        content = (
-            repo_obj.get_contents(INFO_YAML_PATH, ref=ref)
-            if ref
-            else repo_obj.get_contents(INFO_YAML_PATH)
-        )
+        content = repo_obj.get_contents(INFO_YAML_PATH, ref=ref)
         raw = getattr(content, "decoded_content", b"") or b""
         return bytes(raw).decode("utf-8")
     except Exception as exc:
@@ -209,32 +216,58 @@ def resolve_additional_approvers(
         base_repo: The **base** repository object, exposing
             ``get_contents(path, ref=...)``.  Passing the head
             repository would let a fork nominate its own approvers.
-        base_ref: The pull request's base ref.  Empty falls back to the
-            repository's default branch, which is equally
-            base-controlled and so equally safe, if possibly the wrong
-            branch's roster.
+        base_ref: The pull request's base ref.  Required for the
+            ``INFO.yaml`` source: without it the read is declined
+            rather than falling back to the default branch, which
+            would answer with a different branch's roster than the one
+            the pull request targets.  ``.gitreview`` resolution fails
+            closed in exactly the same situation.
 
     Returns:
         Lower-cased logins, empty when no source is enabled.
     """
     logins = set(explicit_approvers())
 
-    if env_bool(USE_INFO_YAML_ENV, False) and base_repo is not None:
-        text = _fetch_info_yaml(base_repo, base_ref)
-        if text:
-            from_file = parse_info_yaml(
-                text, match_lfid=env_bool(INFO_YAML_LFID_ENV, False)
-            )
-            if from_file:
-                log.debug(
-                    "Additional approvers from %s at ref %r: %s",
-                    INFO_YAML_PATH,
-                    base_ref or "<default branch>",
-                    sorted(from_file),
-                )
-            logins.update(from_file)
+    if env_bool(USE_INFO_YAML_ENV, False):
+        logins.update(_info_yaml_approvers(base_repo, base_ref))
 
     return frozenset(logins)
+
+
+def _info_yaml_approvers(
+    base_repo: Any | None, base_ref: str
+) -> frozenset[str]:
+    """Resolve approvers from ``INFO.yaml``, or name nobody."""
+    if base_repo is None:
+        log.debug("No base repository available; skipping %s", INFO_YAML_PATH)
+        return frozenset()
+
+    ref = base_ref.strip()
+    if not ref:
+        log.warning(
+            "No authoritative base ref for this pull request; declining to "
+            "read %s. Reading the default branch instead could authorise "
+            "from a different branch's roster than the one the pull "
+            "request targets.",
+            INFO_YAML_PATH,
+        )
+        return frozenset()
+
+    text = _fetch_info_yaml(base_repo, ref)
+    if not text:
+        return frozenset()
+
+    logins = parse_info_yaml(
+        text, match_lfid=env_bool(INFO_YAML_LFID_ENV, False)
+    )
+    if logins:
+        log.debug(
+            "Additional approvers from %s at ref %r: %s",
+            INFO_YAML_PATH,
+            ref,
+            sorted(logins),
+        )
+    return logins
 
 
 def describe_additional_sources() -> str:

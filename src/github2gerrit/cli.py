@@ -337,10 +337,23 @@ def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
 def _triggering_comment_body(gh: GitHubContext) -> str:
     """Return the body of the comment that triggered this run.
 
-    Empty when the payload carries no comment, which for an
-    ``issue_comment`` run means the doorbell cannot have been rung.
+    Empty when the payload carries no comment, or when the comment is
+    on an ordinary issue rather than a pull request. ``issue_comment``
+    fires for both, and the ``issue`` object carries a
+    ``pull_request`` member only in the latter case.
+
+    Checked here rather than left to the workflow: the reusable
+    workflow guards its job condition, but a composite-action caller
+    writes their own ``on:`` block with no such guard, and a directive
+    on issue N would otherwise be taken for pull request N.
     """
     evt = _load_event(gh.event_path)
+
+    issue = evt.get("issue")
+    if isinstance(issue, dict) and not issue.get("pull_request"):
+        log.debug("Comment is on an issue rather than a pull request")
+        return ""
+
     comment = evt.get("comment")
     if isinstance(comment, dict):
         body = comment.get("body")
@@ -385,6 +398,29 @@ def _skip_unrequested_comment_run(gh: GitHubContext) -> bool:
         CMD_CHECK.name,
     )
     return True
+
+
+def _recheck_has_nothing_to_unblock(gh: GitHubContext) -> bool:
+    """Report whether a re-check run has no gate to lift.
+
+    A re-check exists to notice that a maintainer has authorised a
+    gated pull request. A same-repository head never passed through
+    the gate, so there is nothing to notice, and proceeding would
+    resubmit an unchanged commit every time somebody comments on,
+    approves or requests changes to a pull request.
+
+    This matters most for the comment doorbell, which deliberately
+    accepts any author on the grounds that asking the tool to look
+    again grants nothing. That holds only because the gate answers the
+    question — so without this, any commenter could drive an unchanged
+    same-repository pull request through the submission pipeline at
+    will.
+
+    Uses ``head_is_trusted``, so a pull request whose provenance is
+    unresolved is *not* short-circuited: the gate applies to those, and
+    skipping them would leave them permanently unable to transfer.
+    """
+    return gh.event_name in models.RECHECK_EVENTS and gh.head_is_trusted
 
 
 def _check_fork_approval(
@@ -1804,7 +1840,21 @@ def _ref_for_pr(pr: Any, side: str) -> str:
 def _build_bulk_pr_tasks(
     gh: GitHubContext, prs_list: list[Any]
 ) -> list[tuple[Any, models.GitHubContext]]:
-    """Build per-PR contexts for each valid open pull request."""
+    """Build per-PR contexts for each valid open pull request.
+
+    A scheduled sweep is narrowed to pull requests the gate can
+    actually block. It exists to notice that a maintainer has approved
+    a fork pull request, and a same-repository pull request is never
+    gated, so there is nothing there for it to notice.
+
+    Without that narrowing the sweep would re-run the whole submission
+    pipeline for every open pull request at every interval. Duplicate
+    detection would not stop it: ``ALLOW_DUPLICATES`` defaults to
+    ``true``, under which a detected duplicate is logged and allowed
+    through. A dispatched sweep still processes everything, because
+    somebody asked it to; an unattended one must not.
+    """
+    gated_heads_only = gh.event_name == "schedule"
     pr_tasks: list[tuple[Any, models.GitHubContext]] = []
     for pr in prs_list:
         pr_number = int(getattr(pr, "number", 0) or 0)
@@ -1829,6 +1879,15 @@ def _build_bulk_pr_tasks(
             pr_number=pr_number,
             head_repo=_head_repo_for_pr(pr),
         )
+
+        if gated_heads_only and per_ctx.head_is_trusted:
+            log.debug(
+                "Scheduled sweep skipping PR #%d: its head is in this "
+                "repository, so the approval gate never applied to it",
+                pr_number,
+            )
+            continue
+
         pr_tasks.append((pr, per_ctx))
     return pr_tasks
 
@@ -3300,14 +3359,11 @@ def _handle_single_pr(
     # Augment PR refs via API when in URL mode and token present
     gh = _augment_pr_refs_if_needed(gh)
 
-    # A review only exists to unblock a gated pull request. On a
-    # same-repository head there is nothing to unblock, so stop rather
-    # than resubmitting an unchanged commit every time somebody
-    # comments on, approves or requests changes to a pull request.
-    if gh.event_name == "pull_request_review" and gh.head_is_trusted:
+    if _recheck_has_nothing_to_unblock(gh):
         log.info(
-            "Review on PR #%s, whose head is in this repository; "
+            "Re-check (%s) for PR #%s, whose head is in this repository; "
             "nothing to unblock, so no transfer is needed",
+            gh.event_name,
             gh.pr_number,
         )
         sys.exit(int(ExitCode.SUCCESS))

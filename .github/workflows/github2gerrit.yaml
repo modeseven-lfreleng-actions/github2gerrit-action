@@ -196,6 +196,24 @@ on:
         default: true
         type: boolean
 
+      # Fork approval gate: additional approver sources. Both default
+      # off; each widens who counts as a maintainer.
+      G2G_APPROVER_LOGINS:
+        description: "Comma-separated logins whose approvals clear the gate"
+        required: false
+        default: ""
+        type: string
+      G2G_APPROVERS_FROM_INFO_YAML:
+        description: "Read approvers from the base repo's INFO.yaml"
+        required: false
+        default: false
+        type: boolean
+      G2G_INFO_YAML_MATCH_LFID:
+        description: "Also treat an INFO.yaml 'id' as a GitHub login"
+        required: false
+        default: false
+        type: boolean
+
       # Metadata
       ORGANIZATION:
         description: >-
@@ -263,12 +281,16 @@ jobs:
     name: "GitHub2Gerrit"
     # Run for pull request context (mirror the PR to Gerrit), push
     # events (close PRs for merged Gerrit changes), scheduled sweeps
-    # (re-examine open PRs, which is how an approved fork PR is
+    # (re-examine gated PRs, which is how an approved fork PR is
     # unblocked without anyone touching the workflow), and dispatch
     # events from the caller (manual PR processing or Gerrit-event
     # dispatches)
+    #
+    # issue_comment fires for issues as well as pull requests, so the
+    # issue payload must carry a pull_request member. Admitting a bare
+    # issue.number would treat a comment on issue N as pull request N.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || github.event.issue.number }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -412,6 +434,10 @@ jobs:
           GERRIT_HTTP_USER: ${{ inputs.GERRIT_HTTP_USER }}
           GERRIT_HTTP_PASSWORD: ${{ inputs.GERRIT_HTTP_PASSWORD }}
           G2G_USE_SSH_AGENT: ${{ inputs.G2G_USE_SSH_AGENT }}
+          G2G_APPROVER_LOGINS: ${{ inputs.G2G_APPROVER_LOGINS }}
+          # yamllint disable-line rule:line-length
+          G2G_APPROVERS_FROM_INFO_YAML: ${{ inputs.G2G_APPROVERS_FROM_INFO_YAML }}
+          G2G_INFO_YAML_MATCH_LFID: ${{ inputs.G2G_INFO_YAML_MATCH_LFID }}
           ORGANIZATION: ${{ inputs.ORGANIZATION || github.repository_owner }}
           REVIEWERS_EMAIL: ${{ inputs.REVIEWERS_EMAIL }}
           ISSUE_ID: ${{ inputs.ISSUE_ID }}

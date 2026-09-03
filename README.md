@@ -93,11 +93,11 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-examines open PRs, which is how an approved fork PR is
+  # Re-examines gated fork PRs, which is how an approved one is
   # transferred. A review cannot do it: GitHub withholds secrets
   # from pull_request_review runs on fork PRs.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "17 * * * *"
   # Lets anyone post '@github2gerrit check' to re-examine one PR now
   issue_comment:
     types: [created]
@@ -126,6 +126,9 @@ jobs:
       GERRIT_SSH_USER_G2G: ${{ vars.GERRIT_SSH_USER_G2G }}
       GERRIT_SSH_USER_G2G_EMAIL: ${{ vars.GERRIT_SSH_USER_G2G_EMAIL }}
       PR_NUMBER: ${{ inputs.PR_NUMBER || '0' }}
+      # Required for human-authored fork PRs: the default closes them
+      # before the approval gate ever sees them
+      AUTOMATION_ONLY: false
     secrets:
       GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
 ```
@@ -136,7 +139,12 @@ and `issue_comment` triggers exist for pull requests raised from
 forks, which need a maintainer's approval and a *privileged* run to
 act on it — see
 [fork pull requests](docs/features.md#which-triggers-can-lift-the-gate).
-Omit both if the repository only ever receives automation PRs.
+
+Setting `AUTOMATION_ONLY: false` goes with them. It defaults to `true`,
+which closes a human-authored pull request before the approval gate
+sees it, so leaving it set would make the fork triggers unreachable.
+Drop all three if the repository only ever receives automation PRs.
+
 Repositories using the Gerrit-side dispatch integration should also
 declare `GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH`
 as dispatch inputs and forward them the same way.
@@ -153,11 +161,11 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-examines open PRs, which is how an approved fork PR is
+  # Re-examines gated fork PRs, which is how an approved one is
   # transferred. A review cannot do it: GitHub withholds secrets
   # from pull_request_review runs on fork PRs.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "17 * * * *"
   # Lets anyone post '@github2gerrit check' to re-examine one PR now
   issue_comment:
     types: [created]
@@ -180,6 +188,9 @@ jobs:
           GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
           GERRIT_SSH_USER_G2G: ${{ vars.GERRIT_SSH_USER_G2G }}
           GERRIT_SSH_USER_G2G_EMAIL: ${{ vars.GERRIT_SSH_USER_G2G_EMAIL }}
+          # Goes with the fork triggers above: the default closes a
+          # human-authored PR before the approval gate sees it
+          AUTOMATION_ONLY: false
 ```
 
 ### Option C: command-line tool

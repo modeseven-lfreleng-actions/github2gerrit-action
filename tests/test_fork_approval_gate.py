@@ -19,7 +19,9 @@ from unittest.mock import patch
 
 import pytest
 
+from github2gerrit.cli import _build_bulk_pr_tasks
 from github2gerrit.cli import _handle_bulk_mode
+from github2gerrit.cli import _recheck_has_nothing_to_unblock
 from github2gerrit.cli import _skip_unrequested_comment_run
 from github2gerrit.models import RECHECK_EVENTS
 from github2gerrit.models import GitHubContext
@@ -70,6 +72,16 @@ def _evaluate(reviews: list[Any], author: str = "contributor"):
     return evaluate_fork_approval(
         _pr(reviews, author), head_sha=HEAD_SHA, author_login=author
     )
+
+
+def _pr_stub(*, number: int, head_repo: str) -> Any:
+    """A pull request carrying only the fields task building reads."""
+    pr = MagicMock()
+    pr.number = number
+    pr.base.ref = "master"
+    pr.head.ref = "topic"
+    pr.head.repo.full_name = head_repo
+    return pr
 
 
 class TestApprovalEvaluation:
@@ -660,6 +672,49 @@ class TestCommentDoorbell:
         )
         assert _skip_unrequested_comment_run(ctx) is True
 
+    def test_comment_on_an_ordinary_issue_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        # issue_comment fires for issues too. Without this the issue
+        # number would be taken for a pull request number. Checked in
+        # the CLI because a composite-action caller writes their own
+        # `on:` block and so has no job-level guard.
+        payload = tmp_path / "event.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "issue": {"number": 29},
+                    "comment": {"body": "@github2gerrit check"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        ctx = dataclasses.replace(
+            _ctx(event_name="issue_comment"), event_path=payload
+        )
+        assert _skip_unrequested_comment_run(ctx) is True
+
+    def test_comment_on_a_pull_request_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        payload = tmp_path / "event.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "issue": {
+                        "number": 29,
+                        "pull_request": {"url": "https://api/pulls/29"},
+                    },
+                    "comment": {"body": "@github2gerrit check"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        ctx = dataclasses.replace(
+            _ctx(event_name="issue_comment"), event_path=payload
+        )
+        assert _skip_unrequested_comment_run(ctx) is False
+
     @pytest.mark.parametrize(
         "event_name",
         ["pull_request_target", "pull_request_review", "schedule", "push"],
@@ -754,6 +809,77 @@ class TestScheduledSweep:
         # A PR event names one pull request; sweeping them all from it
         # would process unrelated changes.
         assert self._handled(monkeypatch, "pull_request_target") is False
+
+
+class TestRecheckNeedsAGateToLift:
+    """A re-check on a same-repository head must do nothing.
+
+    The comment doorbell accepts any author, on the grounds that asking
+    the tool to look again grants nothing. That holds only because the
+    gate answers the question, and a same-repository pull request never
+    reaches the gate — so without this any commenter could drive an
+    unchanged pull request through the submission pipeline at will.
+    """
+
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_trusted_head_has_nothing_to_unblock(self, event_name: str) -> None:
+        ctx = _ctx(event_name=event_name, head_repo=BASE_REPO)
+        assert _recheck_has_nothing_to_unblock(ctx) is True
+
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_fork_head_proceeds(self, event_name: str) -> None:
+        ctx = _ctx(event_name=event_name, head_repo=FORK_REPO)
+        assert _recheck_has_nothing_to_unblock(ctx) is False
+
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_unresolved_provenance_proceeds(self, event_name: str) -> None:
+        # The gate applies to an unresolved head, so short-circuiting
+        # here would leave it permanently unable to transfer.
+        ctx = _ctx(event_name=event_name, head_repo="")
+        assert _recheck_has_nothing_to_unblock(ctx) is False
+
+    @pytest.mark.parametrize(
+        "event_name", ["pull_request_target", "pull_request", "push"]
+    )
+    def test_other_events_are_unaffected(self, event_name: str) -> None:
+        ctx = _ctx(event_name=event_name, head_repo=BASE_REPO)
+        assert _recheck_has_nothing_to_unblock(ctx) is False
+
+
+class TestScheduledSweepScope:
+    """A sweep looks only where the gate can block.
+
+    Re-running the pipeline for every open pull request each interval
+    would push to Gerrit repeatedly. Duplicate detection would not
+    stop it: ``ALLOW_DUPLICATES`` defaults to ``true``, under which a
+    detected duplicate is logged and allowed through.
+    """
+
+    def _numbers(self, event_name: str) -> list[int]:
+        prs = [
+            _pr_stub(number=1, head_repo=BASE_REPO),
+            _pr_stub(number=2, head_repo=FORK_REPO),
+            _pr_stub(number=3, head_repo=""),
+        ]
+        tasks = _build_bulk_pr_tasks(_ctx(event_name=event_name), prs)
+        return [ctx.pr_number for _pr, ctx in tasks if ctx.pr_number]
+
+    def test_schedule_skips_same_repository_pull_requests(self) -> None:
+        assert 1 not in self._numbers("schedule")
+
+    def test_schedule_keeps_fork_pull_requests(self) -> None:
+        assert 2 in self._numbers("schedule")
+
+    def test_schedule_keeps_unresolved_provenance(self) -> None:
+        # The gate applies to an unresolved head, so the sweep must
+        # still visit it. head_is_trusted is the right predicate here
+        # for exactly that reason.
+        assert 3 in self._numbers("schedule")
+
+    def test_dispatch_still_processes_everything(self) -> None:
+        # Somebody asked for a dispatched sweep, so it keeps its
+        # existing meaning.
+        assert self._numbers("workflow_dispatch") == [1, 2, 3]
 
 
 class TestBlockedCommentWording:
