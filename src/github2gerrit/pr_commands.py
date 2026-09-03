@@ -470,8 +470,14 @@ def _match_command(
     """Attempt to match *normalised* text against the phrase index.
 
     Tries an exact match first, then checks whether any registered
-    phrase is a prefix of the normalised text (to tolerate trailing
-    punctuation like periods or extra context).
+    phrase begins the normalised text (to tolerate trailing punctuation
+    like periods or extra context).
+
+    The prefix must end on a word boundary.  A bare string prefix would
+    make every longer word starting with a command name a match, so
+    ``check`` would answer for ``checkout this branch`` and ``checker``.
+    That matters more than it used to: the one-word commands are short,
+    common English stems, and one of them starts the transfer pipeline.
 
     Returns:
         The canonical command name on match, or ``None``.
@@ -484,8 +490,14 @@ def _match_command(
     best_match: str | None = None
     best_length = 0
     for phrase, canonical in phrase_index.items():
-        if normalised.startswith(phrase) and len(phrase) > best_length:
-            best_match = canonical
-            best_length = len(phrase)
+        if not normalised.startswith(phrase) or len(phrase) <= best_length:
+            continue
+        # The character ending the phrase must not continue a word.
+        # Punctuation and whitespace both end one; a letter or digit
+        # means the text merely happens to begin with the same stem.
+        if normalised[len(phrase)].isalnum():
+            continue
+        best_match = canonical
+        best_length = len(phrase)
 
     return best_match

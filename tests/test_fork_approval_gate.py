@@ -738,13 +738,41 @@ class TestOpenCommandRefusesPrivilegedCommands:
                 CMD_CREATE_MISSING.name,
             )
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "@github2gerrit checkout this branch",
+            "@github2gerrit checker",
+            "@github2gerrit rechecking the logs",
+            "@github2gerrit retryable",
+        ],
+    )
+    def test_longer_words_do_not_ring_the_doorbell(self, body: str) -> None:
+        # The matcher tolerates trailing text after a command, which
+        # without a word boundary makes every word starting with the
+        # command name a match. `check` is a short, common English
+        # stem, and matching it starts the transfer pipeline.
+        assert find_open_command(body, CMD_CHECK.name) is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "@github2gerrit check",
+            "@github2gerrit check.",
+            "@github2gerrit check please, it is approved",
+            "@github2gerrit recheck!",
+        ],
+    )
+    def test_trailing_text_is_still_tolerated(self, body: str) -> None:
+        assert find_open_command(body, CMD_CHECK.name) is not None
+
     def test_unregistered_command_is_refused(self) -> None:
         with pytest.raises(ValueError, match="unregistered command"):
             find_open_command("@github2gerrit nope", "nope")
 
     def test_commands_require_trust_unless_they_opt_out(self) -> None:
         # The default must stay restrictive, so a command added later
-        # is authorised unless its author thought about it.
+        # is confined to trusted authors unless its author opted out.
         opted_out = [c.name for c in COMMAND_REGISTRY if not c.requires_trust]
         assert opted_out == [CMD_CHECK.name]
 
