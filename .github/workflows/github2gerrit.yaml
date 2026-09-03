@@ -284,13 +284,19 @@ jobs:
     # events from the caller (manual PR processing or Gerrit-event
     # dispatches)
     #
-    # Review and review-comment events are excluded rather than merely
-    # ineffective. Neither can transfer anything — a fork review is
-    # denied secrets, and a same-repository one is short-circuited —
-    # but both payloads carry pull_request.number, so admitting them
-    # would take a slot in the per-PR group below and could evict a
-    # pending re-check. Callers keeping the review trigger from earlier
-    # documentation therefore cost nothing.
+    # Three event families reach this job carrying pull_request.number
+    # while being unable to transfer anything: reviews, review
+    # comments, and pull_request on a fork head, which GitHub denies
+    # secrets. All three are excluded rather than left to stop inside
+    # the tool, because reaching the tool means first taking a slot in
+    # the per-PR concurrency group below, where GitHub keeps one
+    # running and one pending run and cancels the older pending one.
+    # A run that can do no useful work must not be able to evict a
+    # re-check that can.
+    #
+    # pull_request_target on a fork head is deliberately kept: it runs
+    # from the default branch, holds the credentials, and is the
+    # trigger that applies the approval gate.
     #
     # issue_comment fires for issues, for open pull requests and for
     # closed ones. The issue payload must carry a pull_request member
@@ -298,23 +304,17 @@ jobs:
     # comment on issue N as pull request N, and a closed pull request
     # has no gate left to lift, so a run there could only fail.
     #
-    # The directive is matched here, not merely in the CLI, because
-    # admitting a comment costs a slot in the per-PR concurrency group
-    # below. GitHub keeps one running and one pending run per group
-    # and cancels the older pending one, so a comment admitted while a
-    # transfer runs can evict a pending re-check that somebody asked
-    # for. Narrowing to the command phrases keeps ordinary
-    # conversation, and bare mentions, out of the group entirely.
-    #
-    # Still coarser than the CLI's grammar, which normalises
-    # whitespace and requires a word boundary; a near miss such as
-    # 'checkout' is admitted here and refused there. That residue is
-    # recoverable by commenting again, and an exact filter would mean
-    # reimplementing the parser in YAML. Drift is guarded instead by
-    # tests/test_action_step_validation.py, which requires every phrase
-    # of every open command to appear below.
+    # The directive is matched here for the same concurrency reason:
+    # ordinary conversation and bare mentions stay out of the group
+    # entirely. It is still coarser than the CLI's grammar, which
+    # normalises whitespace and requires a word boundary, so a near
+    # miss such as 'checkout' is admitted here and refused there. That
+    # residue is recoverable by commenting again, and an exact filter
+    # would mean reimplementing the parser in YAML. Drift is guarded
+    # instead by tests/test_action_step_validation.py, which requires
+    # every phrase of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment') || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

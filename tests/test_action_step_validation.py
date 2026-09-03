@@ -374,6 +374,28 @@ class TestReusableWorkflowConcurrency:
         condition = self._job(reusable_workflow)["if"]
         assert f"github.event_name != '{event_name}'" in condition
 
+    def test_fork_pull_request_events_do_not_take_the_lock(
+        self, reusable_workflow
+    ):
+        # GitHub denies these secrets, so the run stops at
+        # _skip_unprivileged_fork_run — but only after taking a slot in
+        # the per-PR group, where it could evict a real re-check.
+        condition = self._job(reusable_workflow)["if"]
+        assert "github.event_name != 'pull_request'" in condition
+        assert (
+            "github.event.pull_request.head.repo.full_name == "
+            "github.repository" in condition
+        )
+
+    def test_fork_pull_request_target_is_still_admitted(
+        self, reusable_workflow
+    ):
+        # The privileged trigger applies the gate, so excluding fork
+        # heads there would disable the feature entirely. The head
+        # test must be scoped to pull_request alone.
+        condition = self._job(reusable_workflow)["if"]
+        assert "github.event_name != 'pull_request_target'" not in condition
+
     def test_readme_examples_reject_closed_pull_requests(self):
         # The bundled workflow guards this; a reader copying the
         # composite-action example gets no such condition unless the
