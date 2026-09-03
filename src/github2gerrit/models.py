@@ -27,13 +27,12 @@ RECHECK_EVENTS: frozenset[str] = frozenset(
     {
         "issue_comment",
         "pull_request_review",
-        "schedule",
     }
 )
 """Events that ask the tool to look at a pull request again.
 
-None of them changes the pull request's code, so each maps to UPDATE:
-an existing Gerrit change should gain a patchset rather than a sibling.
+Neither changes the pull request's code, so each maps to UPDATE: an
+existing Gerrit change should gain a patchset rather than a sibling.
 
 They exist because the fork approval gate needs a **privileged** run to
 notice that a maintainer has approved.  GitHub withholds secrets from
@@ -48,6 +47,11 @@ re-read from the API by
 event fired, and who fired it, grants nothing — which is what lets the
 comment trigger accept a comment from anybody without weakening the
 gate.
+
+That argument holds only where a gate exists.  A same-repository pull
+request never reaches one, so a re-check on it is short-circuited
+entirely; see
+:func:`github2gerrit.cli._recheck_has_nothing_to_unblock`.
 """
 
 

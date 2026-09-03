@@ -110,6 +110,7 @@ class TestSkipUnprivilegedForkRun:
     @pytest.fixture(autouse=True)
     def _in_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
 
     @pytest.mark.parametrize(
         "event_name",
@@ -154,6 +155,17 @@ class TestSkipUnprivilegedForkRun:
         # running the tool themselves and wants the real error.
         monkeypatch.setenv("GITHUB_ACTIONS", "false")
         monkeypatch.setenv("GITHUB_EVENT_NAME", "")
+        ctx = _gh_ctx(head_repo=FORK_REPO, event_name="pull_request")
+        assert _skip_unprivileged_fork_run(_inputs(), ctx) is False
+
+    def test_no_gerrit_mode_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # G2G_NO_GERRIT is keyless by design: it exercises the whole
+        # pipeline with the Gerrit network operations stubbed out. The
+        # absent key is the point, not a symptom of a denied secret,
+        # so skipping would defeat the mode entirely.
+        monkeypatch.setenv("G2G_NO_GERRIT", "true")
         ctx = _gh_ctx(head_repo=FORK_REPO, event_name="pull_request")
         assert _skip_unprivileged_fork_run(_inputs(), ctx) is False
 

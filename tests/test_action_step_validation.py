@@ -116,6 +116,66 @@ class TestReusableWorkflowCheckoutOrder:
         assert "pull_request" not in str(seed.get("with", {}).get("ref", ""))
 
 
+class TestReusableWorkflowForwardsItsInputs:
+    """Every declared input must reach the composite action.
+
+    An input the workflow accepts but never passes on is worse than an
+    absent one: the caller sets it, sees no error, and gets the
+    default. That is how the approver settings were unusable through
+    this interface when first written, and how
+    ``G2G_TRUSTED_ASSOCIATIONS`` still is (#420).
+
+    Stated as an invariant over whatever the workflow declares, so a
+    future input cannot repeat it.
+    """
+
+    ACTION_STEP = "Run github2gerrit composite action"
+
+    @staticmethod
+    def _workflow_call(reusable_workflow):
+        # YAML 1.1 resolves a bare `on:` key to the boolean True, so
+        # the mapping is not reachable under the string "on".
+        triggers = reusable_workflow.get("on", reusable_workflow.get(True))
+        assert triggers is not None, "workflow declares no triggers"
+        return triggers["workflow_call"]
+
+    def _action_step(self, reusable_workflow):
+        return next(
+            step
+            for step in reusable_workflow["jobs"]["github2gerrit"]["steps"]
+            if step.get("name") == self.ACTION_STEP
+        )
+
+    def test_every_input_is_forwarded(self, reusable_workflow):
+        declared = set(self._workflow_call(reusable_workflow)["inputs"])
+        step = self._action_step(reusable_workflow)
+        forwarded = "\n".join(
+            [
+                *step.get("with", {}).values(),
+                *step.get("env", {}).values(),
+            ]
+        )
+
+        missing = sorted(
+            name for name in declared if f"inputs.{name}" not in forwarded
+        )
+        assert not missing, (
+            f"the reusable workflow declares {missing} but never passes "
+            f"them to the action, so a caller setting them silently gets "
+            f"the defaults"
+        )
+
+    def test_secrets_are_forwarded(self, reusable_workflow):
+        declared = set(self._workflow_call(reusable_workflow)["secrets"])
+        forwarded = "\n".join(
+            self._action_step(reusable_workflow).get("with", {}).values()
+        )
+        missing = sorted(
+            name for name in declared if f"secrets.{name}" not in forwarded
+        )
+        assert not missing, f"secrets declared but not forwarded: {missing}"
+
+
 class TestExtractStepEventHandling:
     """The shipped extract script, executed rather than replicated.
 
@@ -154,16 +214,6 @@ class TestExtractStepEventHandling:
             env=environment,
         )
         return result, output.read_text()
-
-    def test_schedule_sweeps_every_open_pull_request(
-        self, action_config, tmp_path
-    ):
-        # A schedule carries no pull request context. Treating that as
-        # an error would make the zero-touch path for lifting the fork
-        # approval gate impossible.
-        result, output = self._run(action_config, tmp_path, "schedule")
-        assert result.returncode == 0, result.stderr
-        assert "sync_all=true" in output
 
     def test_push_needs_no_pull_request(self, action_config, tmp_path):
         result, output = self._run(action_config, tmp_path, "push")
@@ -229,7 +279,7 @@ class TestReusableWorkflowConcurrency:
         )
 
     def test_group_falls_back_to_the_event_name(self, reusable_workflow):
-        # Non-pull-request runs (push, schedule, dispatch) get one
+        # Non-pull-request runs (push and dispatch) get one
         # group each rather than colliding on an empty operand.
         group = self._job(reusable_workflow)["concurrency"]["group"]
         assert "github.event_name" in group

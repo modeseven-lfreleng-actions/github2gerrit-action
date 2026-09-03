@@ -192,10 +192,12 @@ CMD_CHECK = register_command(
         name="check",
         aliases=("recheck", "retry"),
         description=(
-            "Re-evaluate this pull request now. Use it after approving "
-            "a pull request raised from a fork, rather than waiting for "
-            "the periodic sweep. It re-reads the reviews and grants "
-            "nothing by itself, so anybody may ask for it."
+            "Re-evaluate this pull request now. Use it after a "
+            "maintainer approves a pull request raised from a fork: "
+            "the approving review cannot transfer the change itself, "
+            "because GitHub denies it this repository's credentials. "
+            "It re-reads the reviews and grants nothing by itself, so "
+            "anybody may ask for it."
         ),
         # The one command safe to obey from any author: it asks the
         # tool to look again, and the looking re-takes every

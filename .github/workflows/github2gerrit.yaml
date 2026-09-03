@@ -280,9 +280,7 @@ jobs:
   github2gerrit:
     name: "GitHub2Gerrit"
     # Run for pull request context (mirror the PR to Gerrit), push
-    # events (close PRs for merged Gerrit changes), scheduled sweeps
-    # (re-examine gated PRs, which is how an approved fork PR is
-    # unblocked without anyone touching the workflow), and dispatch
+    # events (close PRs for merged Gerrit changes), and dispatch
     # events from the caller (manual PR processing or Gerrit-event
     # dispatches)
     #
@@ -290,7 +288,7 @@ jobs:
     # issue payload must carry a pull_request member. Admitting a bare
     # issue.number would treat a comment on issue N as pull request N.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

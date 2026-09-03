@@ -93,12 +93,9 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-examines gated fork PRs, which is how an approved one is
-  # transferred. A review cannot do it: GitHub withholds secrets
-  # from pull_request_review runs on fork PRs.
-  schedule:
-    - cron: "17 * * * *"
-  # Lets anyone post '@github2gerrit check' to re-examine one PR now
+  # Lets anyone post '@github2gerrit check' to transfer an approved
+  # fork PR. A review cannot do it: GitHub withholds secrets from
+  # pull_request_review runs on fork PRs.
   issue_comment:
     types: [created]
   push:
@@ -134,16 +131,16 @@ jobs:
 ```
 
 The `push` trigger enables closing PRs whose Gerrit changes have
-merged; `workflow_dispatch` enables manual processing. The `schedule`
-and `issue_comment` triggers exist for pull requests raised from
-forks, which need a maintainer's approval and a *privileged* run to
-act on it — see
+merged; `workflow_dispatch` enables manual processing. The
+`issue_comment` trigger exists for pull requests raised from forks,
+which need a maintainer's approval and a *privileged* run to act on
+it — see
 [fork pull requests](docs/features.md#which-triggers-can-lift-the-gate).
 
-Setting `AUTOMATION_ONLY: false` goes with them. It defaults to `true`,
+Setting `AUTOMATION_ONLY: false` goes with it. It defaults to `true`,
 which closes a human-authored pull request before the approval gate
-sees it, so leaving it set would make the fork triggers unreachable.
-Drop all three if the repository only ever receives automation PRs.
+sees it, so leaving it set would make the fork path unreachable. Drop
+both if the repository only ever receives automation PRs.
 
 Repositories using the Gerrit-side dispatch integration should also
 declare `GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH`
@@ -161,12 +158,9 @@ name: github2gerrit
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  # Re-examines gated fork PRs, which is how an approved one is
-  # transferred. A review cannot do it: GitHub withholds secrets
-  # from pull_request_review runs on fork PRs.
-  schedule:
-    - cron: "17 * * * *"
-  # Lets anyone post '@github2gerrit check' to re-examine one PR now
+  # Lets anyone post '@github2gerrit check' to transfer an approved
+  # fork PR. A review cannot do it: GitHub withholds secrets from
+  # pull_request_review runs on fork PRs.
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -188,7 +182,7 @@ jobs:
           GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
           GERRIT_SSH_USER_G2G: ${{ vars.GERRIT_SSH_USER_G2G }}
           GERRIT_SSH_USER_G2G_EMAIL: ${{ vars.GERRIT_SSH_USER_G2G_EMAIL }}
-          # Goes with the fork triggers above: the default closes a
+          # Goes with the fork trigger above: the default closes a
           # human-authored PR before the approval gate sees it
           AUTOMATION_ONLY: false
 ```
@@ -278,8 +272,9 @@ re-exports all three outputs to callers.
 
 The reusable workflow (`.github/workflows/github2gerrit.yaml`) wraps
 the composite action for `workflow_call`, supporting caller triggers
-`pull_request_target`, `push` (close PRs for merged Gerrit changes),
-and `workflow_dispatch` (manual runs and Gerrit-event dispatches).
+`pull_request_target`, `issue_comment` (re-check an approved fork PR),
+`push` (close PRs for merged Gerrit changes), and `workflow_dispatch`
+(manual runs and Gerrit-event dispatches).
 Input defaults match the composite action defaults.
 
 <!-- markdownlint-disable MD013 -->

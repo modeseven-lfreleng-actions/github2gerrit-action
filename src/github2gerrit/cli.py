@@ -309,6 +309,12 @@ def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
         return False
     if data.gerrit_ssh_privkey_g2g:
         return False
+    if env_bool("G2G_NO_GERRIT", False):
+        # A keyless mode by design: it runs the whole pipeline and
+        # turns the Gerrit network operations into no-ops. The absent
+        # key is the point, not a symptom, so reading it as one would
+        # stop the very exercise the mode exists for.
+        return False
     if gh.event_name not in _FORK_UNPRIVILEGED_EVENTS:
         return False
     # The factual question, not the trust one. An unresolved head is
@@ -1840,21 +1846,7 @@ def _ref_for_pr(pr: Any, side: str) -> str:
 def _build_bulk_pr_tasks(
     gh: GitHubContext, prs_list: list[Any]
 ) -> list[tuple[Any, models.GitHubContext]]:
-    """Build per-PR contexts for each valid open pull request.
-
-    A scheduled sweep is narrowed to pull requests the gate can
-    actually block. It exists to notice that a maintainer has approved
-    a fork pull request, and a same-repository pull request is never
-    gated, so there is nothing there for it to notice.
-
-    Without that narrowing the sweep would re-run the whole submission
-    pipeline for every open pull request at every interval. Duplicate
-    detection would not stop it: ``ALLOW_DUPLICATES`` defaults to
-    ``true``, under which a detected duplicate is logged and allowed
-    through. A dispatched sweep still processes everything, because
-    somebody asked it to; an unattended one must not.
-    """
-    gated_heads_only = gh.event_name == "schedule"
+    """Build per-PR contexts for each valid open pull request."""
     pr_tasks: list[tuple[Any, models.GitHubContext]] = []
     for pr in prs_list:
         pr_number = int(getattr(pr, "number", 0) or 0)
@@ -1879,15 +1871,6 @@ def _build_bulk_pr_tasks(
             pr_number=pr_number,
             head_repo=_head_repo_for_pr(pr),
         )
-
-        if gated_heads_only and per_ctx.head_is_trusted:
-            log.debug(
-                "Scheduled sweep skipping PR #%d: its head is in this "
-                "repository, so the approval gate never applied to it",
-                pr_number,
-            )
-            continue
-
         pr_tasks.append((pr, per_ctx))
     return pr_tasks
 
@@ -3131,24 +3114,14 @@ def _handle_gerrit_change_events(
 def _handle_bulk_mode(
     data: Inputs, gh: GitHubContext, *, no_gerrit: bool
 ) -> bool:
-    """Run bulk mode for URL/dispatch/schedule. Return True if handled.
-
-    ``schedule`` is included because it is the zero-touch path for
-    lifting the fork approval gate: a maintainer approves in the
-    ordinary way and the next sweep notices.  The sweep is privileged
-    (it runs from the default branch, so it holds the Gerrit key) and
-    each pull request still passes through ``_check_fork_approval``
-    with its own provenance, so scheduling changes what is *looked at*
-    and never what is *permitted*.
-    """
+    """Run bulk mode for URL/workflow_dispatch. Return True if handled."""
     sync_all = env_bool("SYNC_ALL_OPEN_PRS", False)
     # When a target URL was provided via CLI, G2G_TARGET_URL is set
     # to the actual URL string (truthy check works for non-empty strings)
     if not (
         sync_all
         and (
-            gh.event_name in ("workflow_dispatch", "schedule")
-            or os.getenv("G2G_TARGET_URL")
+            gh.event_name == "workflow_dispatch" or os.getenv("G2G_TARGET_URL")
         )
     ):
         return False

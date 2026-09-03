@@ -299,11 +299,12 @@ def render_blocked_comment(
         ]
 
     lines += [
-        "**To proceed:** submit an approving review. A privileged run then "
-        "transfers the change — either the repository's periodic sweep, or "
-        "immediately if anyone comments `@github2gerrit check`. The review "
-        "alone cannot do it: GitHub withholds this repository's credentials "
-        "from runs triggered by a review on a pull request from a fork.",
+        "**To proceed:** submit an approving review, then comment "
+        "`@github2gerrit check` to transfer the change. Anyone may post "
+        "that comment; it grants nothing on its own, because the tool "
+        "re-reads the reviews to decide. The review alone cannot do it: "
+        "GitHub withholds this repository's credentials from runs "
+        "triggered by a review on a pull request from a fork.",
         "",
         f"Reviews count from: {_describe_approver_policy()}. The pull "
         "request author cannot approve their own pull request.",

@@ -346,17 +346,6 @@ runs:
           exit 0
         fi
 
-        # Scheduled runs sweep every open pull request. This is the
-        # zero-touch path for lifting the fork approval gate: a
-        # maintainer approves in the ordinary way and the next sweep
-        # notices. A schedule carries no pull request context, so it
-        # is a sync-all rather than an error.
-        if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-          echo "Scheduled run - re-examining all open pull requests."
-          echo "sync_all=true" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
         # Honor PR_NUMBER or sync-all from workflow_dispatch normalization
         if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
           if [[ -n "${DISPATCH_SYNC_ALL:-}" ]]; then

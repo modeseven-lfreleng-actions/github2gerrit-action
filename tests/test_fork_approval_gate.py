@@ -19,8 +19,6 @@ from unittest.mock import patch
 
 import pytest
 
-from github2gerrit.cli import _build_bulk_pr_tasks
-from github2gerrit.cli import _handle_bulk_mode
 from github2gerrit.cli import _recheck_has_nothing_to_unblock
 from github2gerrit.cli import _skip_unrequested_comment_run
 from github2gerrit.models import RECHECK_EVENTS
@@ -72,16 +70,6 @@ def _evaluate(reviews: list[Any], author: str = "contributor"):
     return evaluate_fork_approval(
         _pr(reviews, author), head_sha=HEAD_SHA, author_login=author
     )
-
-
-def _pr_stub(*, number: int, head_repo: str) -> Any:
-    """A pull request carrying only the fields task building reads."""
-    pr = MagicMock()
-    pr.number = number
-    pr.base.ref = "master"
-    pr.head.ref = "topic"
-    pr.head.repo.full_name = head_repo
-    return pr
 
 
 class TestApprovalEvaluation:
@@ -717,7 +705,7 @@ class TestCommentDoorbell:
 
     @pytest.mark.parametrize(
         "event_name",
-        ["pull_request_target", "pull_request_review", "schedule", "push"],
+        ["pull_request_target", "pull_request_review", "push"],
     )
     def test_other_events_are_never_filtered(
         self, tmp_path: Path, event_name: str
@@ -761,56 +749,6 @@ class TestOpenCommandRefusesPrivilegedCommands:
         assert opted_out == [CMD_CHECK.name]
 
 
-class TestScheduledSweep:
-    """The zero-touch path for lifting the gate.
-
-    A schedule runs from the default branch, so unlike a review on a
-    fork pull request it holds the Gerrit key.  It changes what is
-    looked at, never what is permitted: each pull request still passes
-    through the gate with its own provenance.
-    """
-
-    def _handled(
-        self, monkeypatch: pytest.MonkeyPatch, event_name: str
-    ) -> bool:
-        monkeypatch.setenv("SYNC_ALL_OPEN_PRS", "true")
-        monkeypatch.delenv("G2G_TARGET_URL", raising=False)
-        called: list[bool] = []
-
-        def _fake_bulk(*_args: Any, **_kwargs: Any) -> bool:
-            called.append(True)
-            return True
-
-        with (
-            patch("github2gerrit.cli._process_bulk", _fake_bulk),
-            patch("github2gerrit.cli._run_gerrit_cleanup_tasks"),
-            patch("github2gerrit.cli.log_api_metrics_summary"),
-        ):
-            _handle_bulk_mode(
-                MagicMock(),
-                _ctx(event_name=event_name),
-                no_gerrit=True,
-            )
-        return bool(called)
-
-    def test_schedule_runs_the_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        assert self._handled(monkeypatch, "schedule") is True
-
-    def test_workflow_dispatch_still_runs_the_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        assert self._handled(monkeypatch, "workflow_dispatch") is True
-
-    def test_pull_request_events_do_not_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # A PR event names one pull request; sweeping them all from it
-        # would process unrelated changes.
-        assert self._handled(monkeypatch, "pull_request_target") is False
-
-
 class TestRecheckNeedsAGateToLift:
     """A re-check on a same-repository head must do nothing.
 
@@ -844,42 +782,6 @@ class TestRecheckNeedsAGateToLift:
     def test_other_events_are_unaffected(self, event_name: str) -> None:
         ctx = _ctx(event_name=event_name, head_repo=BASE_REPO)
         assert _recheck_has_nothing_to_unblock(ctx) is False
-
-
-class TestScheduledSweepScope:
-    """A sweep looks only where the gate can block.
-
-    Re-running the pipeline for every open pull request each interval
-    would push to Gerrit repeatedly. Duplicate detection would not
-    stop it: ``ALLOW_DUPLICATES`` defaults to ``true``, under which a
-    detected duplicate is logged and allowed through.
-    """
-
-    def _numbers(self, event_name: str) -> list[int]:
-        prs = [
-            _pr_stub(number=1, head_repo=BASE_REPO),
-            _pr_stub(number=2, head_repo=FORK_REPO),
-            _pr_stub(number=3, head_repo=""),
-        ]
-        tasks = _build_bulk_pr_tasks(_ctx(event_name=event_name), prs)
-        return [ctx.pr_number for _pr, ctx in tasks if ctx.pr_number]
-
-    def test_schedule_skips_same_repository_pull_requests(self) -> None:
-        assert 1 not in self._numbers("schedule")
-
-    def test_schedule_keeps_fork_pull_requests(self) -> None:
-        assert 2 in self._numbers("schedule")
-
-    def test_schedule_keeps_unresolved_provenance(self) -> None:
-        # The gate applies to an unresolved head, so the sweep must
-        # still visit it. head_is_trusted is the right predicate here
-        # for exactly that reason.
-        assert 3 in self._numbers("schedule")
-
-    def test_dispatch_still_processes_everything(self) -> None:
-        # Somebody asked for a dispatched sweep, so it keeps its
-        # existing meaning.
-        assert self._numbers("workflow_dispatch") == [1, 2, 3]
 
 
 class TestBlockedCommentWording:

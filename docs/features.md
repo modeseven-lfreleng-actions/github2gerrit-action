@@ -467,61 +467,48 @@ decides *whether* to proceed, and the tool always re-reads it from the pull
 request's reviews. So no trigger, and nobody who fires one, can grant
 anything.
 
-Two privileged triggers act on an approval.
+Of the privileged triggers, this mechanism uses `issue_comment`.
 
-**A scheduled sweep** re-examines the pull requests the gate can block, and
-needs nothing from the maintainer beyond the approval itself:
+**A comment** is the privileged re-check. Subscribe to `issue_comment`:
 
 ```yaml
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize, closed]
-  schedule:
-    - cron: "17 * * * *"
-```
-
-The sweep considers only pull requests whose head is **not known to be in the
-base repository** — the same predicate the gate itself uses, so a pull request
-with unresolved provenance is still visited rather than left stuck. A
-same-repository pull request never passed through the gate, so the sweep has
-nothing to notice about it, and re-running the pipeline for every open pull
-request each hour would push to Gerrit repeatedly — duplicate detection would
-not prevent it, because `ALLOW_DUPLICATES` defaults to `true` and merely logs.
-A dispatched sweep still processes everything, since somebody asked for it.
-
-The same reasoning applies to the comment directive below: on a
-same-repository pull request it stops without transferring, so nobody can
-force repeated submissions with a comment.
-
-Each pull request still passes through the gate with its own provenance, so
-scheduling changes what the tool looks at and never what it permits.
-
-**A comment** does the same immediately, for when the sweep interval is longer
-than the wait is worth:
-
-```yaml
-on:
   issue_comment:
     types: [created]
 ```
 
-Anyone may then post `@github2gerrit check` to force a re-evaluation. The
-directive keeps ordinary conversation from starting a run, and performs no
-permission check. It grants nothing, because the answer still comes from
-re-reading the reviews.
+Once a maintainer has approved, anyone may post `@github2gerrit check` to
+transfer the change. The directive keeps ordinary conversation from starting a
+run, and performs no permission check. It grants nothing, because the answer
+still comes from re-reading the reviews — an unapproved pull request simply
+gets its notice updated and stays put.
 
-Both triggers need `AUTOMATION_ONLY: false`. It defaults to `true` and closes
+On a **same-repository** pull request a re-check stops without transferring,
+since no gate ever applied to it. So nobody can use a comment to force
+repeated submissions of an automation pull request.
+
+This trigger needs `AUTOMATION_ONLY: false`. It defaults to `true` and closes
 a human-authored pull request before the gate sees it, which would leave
-nothing for either trigger to unblock.
+nothing to unblock.
 
-Approving and then pushing also works with no extra trigger, since
-`pull_request_target` already listens for `synchronize`.
+A zero-touch variant — a periodic sweep that notices the approval without
+anyone commenting — remains open as
+[#421](https://github.com/lfreleng-actions/github2gerrit-action/issues/421).
+A repository-wide job needs cross-run serialisation that GitHub's per-job
+concurrency groups cannot express, so this mechanism deliberately omits it.
 
-`pull_request_review` needs no place in either list. On a fork pull request
-it runs unprivileged, and on a same-repository one the tool exits without
+`pull_request_review` needs no place in the list. On a fork pull request it
+runs unprivileged, and on a same-repository one the tool exits without
 transferring anyway, because re-submitting an unchanged commit every time
 somebody reviews it would add a patchset for nothing. Keeping the trigger is
 harmless, but it does no work.
+
+Note that approving and then pushing does **not** transfer the change either.
+A push moves the head, which makes the earlier approval stale by the rule
+described above, and approving afterwards only starts an unprivileged review
+run. Re-approve the new head, then comment.
 
 #### Naming approvers directly
 
