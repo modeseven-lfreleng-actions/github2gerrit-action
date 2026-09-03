@@ -10,6 +10,7 @@ integration between action steps.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -113,6 +114,54 @@ class TestReusableWorkflowCheckoutOrder:
 
         assert "github.event_name == 'push'" in str(seed.get("if", ""))
         assert "pull_request" not in str(seed.get("with", {}).get("ref", ""))
+
+
+class TestReusableWorkflowConcurrency:
+    """The concurrency group must tell pull requests apart.
+
+    GitHub keeps at most one running and one pending run per group and
+    discards the rest.  A group that cannot distinguish two pull
+    requests therefore does not merely serialise them, it silently
+    drops runs — which for a trigger used to re-evaluate the fork
+    approval gate means an approval that never takes effect.
+
+    The invariant is expressed against the job's own ``if`` condition
+    rather than a hard-coded list of events, so adding a trigger that
+    admits a new payload shape fails here until the group can key on
+    it.
+    """
+
+    _PR_NUMBER_ACCESSOR = re.compile(r"github\.event\.\w+\.number")
+
+    def _job(self, reusable_workflow):
+        return reusable_workflow["jobs"]["github2gerrit"]
+
+    def test_group_keys_on_every_admitted_payload_shape(
+        self, reusable_workflow
+    ):
+        job = self._job(reusable_workflow)
+        admitted = set(self._PR_NUMBER_ACCESSOR.findall(job["if"]))
+        assert admitted, "job condition admits no pull request payload"
+
+        group = job["concurrency"]["group"]
+        missing = sorted(a for a in admitted if a not in group)
+        assert not missing, (
+            f"the job admits runs via {missing} but the concurrency "
+            f"group cannot key on them, so those runs would share one "
+            f"group: {group}"
+        )
+
+    def test_group_falls_back_to_the_event_name(self, reusable_workflow):
+        # Non-pull-request runs (push, schedule, dispatch) get one
+        # group each rather than colliding on an empty operand.
+        group = self._job(reusable_workflow)["concurrency"]["group"]
+        assert "github.event_name" in group
+        assert group.split("||")[-1].strip().startswith("github.event_name")
+
+    def test_in_flight_runs_are_queued_not_cancelled(self, reusable_workflow):
+        # An interrupted run may already have pushed to Gerrit.
+        concurrency = self._job(reusable_workflow)["concurrency"]
+        assert concurrency["cancel-in-progress"] is False
 
 
 class TestActionStepValidation:

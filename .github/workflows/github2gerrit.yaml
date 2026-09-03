@@ -275,10 +275,18 @@ jobs:
       issues: write  # Post status/back-reference comments on issues
     # Serialize runs per pull request; non-PR runs (push events and
     # dispatches) queue per event type. Queue rather than cancel so an
-    # in-flight push to Gerrit is never interrupted
+    # in-flight push to Gerrit is never interrupted.
+    #
+    # Comment payloads carry github.event.issue, not
+    # github.event.pull_request, so both shapes must be consulted.
+    # Without the second operand every comment-triggered run in the
+    # repository shares one group: GitHub keeps at most one running
+    # and one pending run per group and discards the rest, so a
+    # comment on one pull request would silently drop the queued run
+    # for another.
     concurrency:
       # yamllint disable-line rule:line-length
-      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event_name }}
+      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event_name }}
       cancel-in-progress: false
     outputs:
       # yamllint disable rule:line-length
