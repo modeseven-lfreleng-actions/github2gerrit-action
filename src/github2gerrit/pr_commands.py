@@ -40,6 +40,15 @@ Design principles
    :func:`parse_commands`, :func:`find_command` or :func:`has_command`
    directly.
 
+   :func:`find_open_command` is the single, deliberate exception, and
+   it enforces its own limits: it refuses any command that has not set
+   ``requires_trust=False``.  A command may only do so when it *grants
+   nothing* — when it makes the tool look again rather than act, so
+   that every authorisation decision is re-taken from the API
+   afterwards.  ``requires_trust`` defaults to ``True``, so a new
+   command stays confined to trusted authors unless its author
+   deliberately opts out.
+
 Supported commands
 ──────────────────
 ``create missing change`` (aliases ``create missing``, ``create-missing``)
@@ -47,6 +56,18 @@ Supported commands
     operation cannot locate an existing one.  This addresses the
     scenario where the original ``opened`` event failed and subsequent
     ``synchronize`` events cannot find a change to update.
+
+    Requires a trusted author: it makes the tool act.
+
+``check`` (aliases ``recheck``, ``retry``)
+    Asks the tool to re-evaluate a pull request now, transferring it
+    when a maintainer has approved it.  It exists because GitHub
+    withholds this repository's credentials from a review on a fork
+    pull request, so the approving review cannot perform the transfer
+    itself.
+
+    Open to any author: it makes the tool look again, and the answer
+    still comes from re-reading the pull request's reviews.
 """
 
 from __future__ import annotations

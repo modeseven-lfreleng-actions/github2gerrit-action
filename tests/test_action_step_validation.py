@@ -362,6 +362,13 @@ class TestReusableWorkflowConcurrency:
         condition = self._job(reusable_workflow)["if"]
         assert "github.event.comment.body" in condition
 
+    def test_review_events_do_not_take_the_lock(self, reusable_workflow):
+        # A review can no longer transfer anything, but its payload
+        # carries pull_request.number, so admitting it would take a
+        # slot in the per-PR group and could evict a pending re-check.
+        condition = self._job(reusable_workflow)["if"]
+        assert "github.event_name != 'pull_request_review'" in condition
+
     def test_comments_on_closed_pull_requests_are_not_admitted(
         self, reusable_workflow
     ):

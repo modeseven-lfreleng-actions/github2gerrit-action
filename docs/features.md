@@ -510,11 +510,18 @@ anyone commenting — remains open as
 A repository-wide job needs cross-run serialisation that GitHub's per-job
 concurrency groups cannot express, so this mechanism deliberately omits it.
 
-`pull_request_review` needs no place in the list. On a fork pull request it
-runs unprivileged, and on a same-repository one the tool exits without
-transferring anyway, because re-submitting an unchanged commit every time
-somebody reviews it would add a patchset for nothing. Keeping the trigger is
-harmless, but it does no work.
+`pull_request_review` should be **removed** from any workflow that still
+carries it. It can no longer transfer anything: on a fork pull request it runs
+unprivileged, and on a same-repository one the tool exits without transferring,
+because re-submitting an unchanged commit every time somebody reviews it would
+add a patchset for nothing.
+
+Worse than useless, in fact. A review-triggered run takes a slot in the pull
+request's concurrency group, and GitHub keeps only one running and one pending
+run per group, so a review arriving while a transfer runs can evict a pending
+`@github2gerrit check` and lose the re-check. The bundled reusable workflow
+refuses review events for that reason; a workflow calling the composite action
+directly should simply not subscribe to them.
 
 Note that approving and then pushing does **not** transfer the change either.
 A push moves the head, which makes the earlier approval stale by the rule
