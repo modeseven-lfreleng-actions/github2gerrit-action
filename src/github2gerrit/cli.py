@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -416,6 +417,47 @@ def _skip_unrequested_comment_run(gh: GitHubContext) -> bool:
         CMD_CHECK.name,
     )
     return True
+
+
+def _provenance_from_pull_request(
+    gh: GitHubContext, pr_obj: Any | None
+) -> GitHubContext:
+    """Fill in an unresolved head repository from a fetched pull request.
+
+    Provenance decides whether the approval gate applies, so leaving it
+    unresolved when the answer is available costs a same-repository
+    pull request an unnecessary gate, and — worse — leaves a re-check
+    able to resubmit it.
+
+    Only fills a *blank* head repository. A value already present came
+    from the event payload or an earlier API call, and must not be
+    replaced by one taken from an object a caller supplied.
+
+    Returns *gh* unchanged when provenance is already known or the
+    pull request cannot supply it.
+    """
+    if gh.head_repo or pr_obj is None:
+        return gh
+
+    resolved = str(
+        getattr(
+            getattr(getattr(pr_obj, "head", None), "repo", None),
+            "full_name",
+            "",
+        )
+        or ""
+    ).strip()
+    if not resolved:
+        return gh
+
+    log.debug(
+        "Resolved PR #%s head repository as %s from the fetched pull request",
+        gh.pr_number,
+        resolved,
+    )
+    # The orchestrator reads this back out of the environment.
+    os.environ["PR_HEAD_REPO"] = resolved
+    return dataclasses.replace(gh, head_repo=resolved)
 
 
 def _recheck_has_nothing_to_unblock(gh: GitHubContext) -> bool:
@@ -3364,6 +3406,26 @@ def _handle_single_pr(
         # token cannot skip the gate.
         if pr_obj is None:
             pr_obj = _resolve_pr_for_gate(gh, data)
+
+        # Second chance at provenance, and a second look at the
+        # short-circuit above. An issue_comment payload carries no head
+        # repository, so the check before this depended on
+        # _augment_pr_refs_if_needed's API call; that helper swallows a
+        # failure and returns the context unresolved, while the fetch
+        # just above is a separate call that may well have succeeded.
+        # Without this, one transient failure would let a commenter
+        # resubmit an unchanged same-repository pull request — exactly
+        # what the short-circuit exists to prevent.
+        gh = _provenance_from_pull_request(gh, pr_obj)
+        if _recheck_has_nothing_to_unblock(gh):
+            log.info(
+                "Re-check (%s) for PR #%s, whose head is in this "
+                "repository; nothing to unblock, so no transfer is needed",
+                gh.event_name,
+                gh.pr_number,
+            )
+            sys.exit(int(ExitCode.SUCCESS))
+
         allowed, approved_sha = _check_fork_approval(
             pr_obj, gh, progress_tracker
         )

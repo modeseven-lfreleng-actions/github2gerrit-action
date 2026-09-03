@@ -181,9 +181,10 @@ jobs:
     runs-on: ubuntu-latest
     # Ordinary comments must not start a run. Besides the wasted job,
     # a comment occupies this pull request's concurrency slot and can
-    # evict a pending re-check.
+    # evict a pending re-check. A closed pull request has no gate left
+    # to lift, so a run there could only fail.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
+    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     # Serialise every route to one pull request. Two runs for the same
     # approved commit could otherwise both find no Gerrit change and
     # create one each; ALLOW_DUPLICATES defaults to true, so nothing

@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from github2gerrit.cli import _provenance_from_pull_request
 from github2gerrit.cli import _recheck_has_nothing_to_unblock
 from github2gerrit.cli import _skip_unrequested_comment_run
 from github2gerrit.models import RECHECK_EVENTS
@@ -839,6 +840,64 @@ class TestRecheckNeedsAGateToLift:
     def test_other_events_are_unaffected(self, event_name: str) -> None:
         ctx = _ctx(event_name=event_name, head_repo=BASE_REPO)
         assert _recheck_has_nothing_to_unblock(ctx) is False
+
+
+class TestProvenanceFromFetchedPullRequest:
+    """A second chance at provenance the payload did not carry.
+
+    An ``issue_comment`` payload has no head repository, so the first
+    provenance check depends on an API call that swallows its own
+    failures. The pull request fetched moments later is a separate
+    call, and one transient failure must not leave a same-repository
+    pull request looking gated — an approval on one would then let any
+    commenter resubmit its unchanged head.
+    """
+
+    def _pr(self, full_name: str) -> Any:
+        pr = MagicMock()
+        pr.head.repo.full_name = full_name
+        return pr
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+
+    def test_unresolved_head_is_filled_from_the_pull_request(self) -> None:
+        ctx = _ctx(event_name="issue_comment", head_repo="")
+        assert ctx.head_is_trusted is False
+
+        resolved = _provenance_from_pull_request(ctx, self._pr(BASE_REPO))
+
+        assert resolved.head_repo == BASE_REPO
+        assert resolved.head_is_trusted is True
+        assert _recheck_has_nothing_to_unblock(resolved) is True
+
+    def test_a_fork_head_still_proceeds(self) -> None:
+        ctx = _ctx(event_name="issue_comment", head_repo="")
+        resolved = _provenance_from_pull_request(ctx, self._pr(FORK_REPO))
+        assert resolved.head_repo == FORK_REPO
+        assert _recheck_has_nothing_to_unblock(resolved) is False
+
+    def test_known_provenance_is_never_overwritten(self) -> None:
+        # A head already resolved came from the event payload or an
+        # earlier API call, and must not be replaced by a value taken
+        # from an object the caller supplied.
+        ctx = _ctx(event_name="issue_comment", head_repo=FORK_REPO)
+        resolved = _provenance_from_pull_request(ctx, self._pr(BASE_REPO))
+        assert resolved.head_repo == FORK_REPO
+
+    @pytest.mark.parametrize("full_name", ["", None])
+    def test_a_pull_request_that_cannot_answer_changes_nothing(
+        self, full_name: str | None
+    ) -> None:
+        ctx = _ctx(event_name="issue_comment", head_repo="")
+        pr = MagicMock()
+        pr.head.repo.full_name = full_name
+        assert _provenance_from_pull_request(ctx, pr).head_repo == ""
+
+    def test_no_pull_request_changes_nothing(self) -> None:
+        ctx = _ctx(event_name="issue_comment", head_repo="")
+        assert _provenance_from_pull_request(ctx, None).head_repo == ""
 
 
 class TestBlockedCommentWording:

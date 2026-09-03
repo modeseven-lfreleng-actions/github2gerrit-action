@@ -284,13 +284,13 @@ jobs:
     # events from the caller (manual PR processing or Gerrit-event
     # dispatches)
     #
-    # pull_request_review is excluded rather than merely ineffective.
-    # It can no longer transfer anything — a fork review is denied
-    # secrets, and a same-repository one is short-circuited — but the
-    # payload carries pull_request.number, so admitting it would take a
-    # slot in the per-PR group below and could evict a pending
-    # re-check. Callers keeping the trigger from earlier documentation
-    # therefore cost nothing.
+    # Review and review-comment events are excluded rather than merely
+    # ineffective. Neither can transfer anything — a fork review is
+    # denied secrets, and a same-repository one is short-circuited —
+    # but both payloads carry pull_request.number, so admitting them
+    # would take a slot in the per-PR group below and could evict a
+    # pending re-check. Callers keeping the review trigger from earlier
+    # documentation therefore cost nothing.
     #
     # issue_comment fires for issues, for open pull requests and for
     # closed ones. The issue payload must carry a pull_request member
@@ -314,7 +314,7 @@ jobs:
     # tests/test_action_step_validation.py, which requires every phrase
     # of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review') || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment') || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

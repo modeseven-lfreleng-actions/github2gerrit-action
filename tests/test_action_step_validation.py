@@ -362,12 +362,34 @@ class TestReusableWorkflowConcurrency:
         condition = self._job(reusable_workflow)["if"]
         assert "github.event.comment.body" in condition
 
-    def test_review_events_do_not_take_the_lock(self, reusable_workflow):
-        # A review can no longer transfer anything, but its payload
-        # carries pull_request.number, so admitting it would take a
-        # slot in the per-PR group and could evict a pending re-check.
+    @pytest.mark.parametrize(
+        "event_name", ["pull_request_review", "pull_request_review_comment"]
+    )
+    def test_review_events_do_not_take_the_lock(
+        self, reusable_workflow, event_name
+    ):
+        # Neither can transfer anything, but both payloads carry
+        # pull_request.number, so admitting them would take a slot in
+        # the per-PR group and could evict a pending re-check.
         condition = self._job(reusable_workflow)["if"]
-        assert "github.event_name != 'pull_request_review'" in condition
+        assert f"github.event_name != '{event_name}'" in condition
+
+    def test_readme_examples_reject_closed_pull_requests(self):
+        # The bundled workflow guards this; a reader copying the
+        # composite-action example gets no such condition unless the
+        # example carries it.
+        readme = (Path(__file__).parent.parent / "README.md").read_text()
+        guards = [
+            line
+            for line in readme.splitlines()
+            if "contains(github.event.comment.body" in line
+        ]
+        assert guards, "README shows no comment guard to check"
+        for guard in guards:
+            assert "github.event.issue.state == 'open'" in guard, (
+                "a README comment guard admits closed pull requests, so "
+                "anyone could start a run on a merged one"
+            )
 
     def test_comments_on_closed_pull_requests_are_not_admitted(
         self, reusable_workflow
