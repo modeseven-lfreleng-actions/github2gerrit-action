@@ -253,6 +253,83 @@ def _resolve_pr_for_gate(gh: GitHubContext, data: Inputs) -> Any | None:
         return None
 
 
+_FORK_UNPRIVILEGED_EVENTS: frozenset[str] = frozenset(
+    {
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+    }
+)
+"""Triggers that run unprivileged when the pull request is from a fork.
+
+All three run from ``refs/pull/<N>/merge`` and print GitHub's fork
+secret restriction in their own section of the events reference, so
+their workflow file is fork-authored and the run receives no repository
+secrets. ``pull_request_target``, ``issue_comment``, ``schedule`` and
+``workflow_run`` run from the default branch and are deliberately
+absent.
+
+Naming them, rather than inferring the condition from an absent key
+alone, keeps a genuinely unset secret loud everywhere else. A trigger
+GitHub adds later therefore fails noisily rather than skipping in
+silence, which is the safer direction for a diagnostic.
+"""
+
+
+def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
+    """Report whether this run could never have reached Gerrit.
+
+    A fork pull request delivered on an unprivileged trigger arrives
+    without ``GERRIT_SSH_PRIVKEY_G2G``, because GitHub withholds
+    secrets from runs whose workflow file comes from the fork. Neither
+    of the two things that happen next is honest about that:
+
+    * with ``G2G_USE_SSH_AGENT`` disabled, validation reports a missing
+      required input, describing a misconfiguration the operator does
+      not have, and
+    * with it enabled — the default — ``_setup_ssh`` skips silently,
+      the run fetches the fork, tells the contributor their pull
+      request is approved and transferring, and only then fails at the
+      push with an opaque SSH error.
+
+    Stopping here is both truthful and cheap, and it happens before any
+    fork content is fetched.
+
+    Returns:
+        ``True`` when the caller should stop, successfully. Missing
+        provenance answers ``False`` so that a genuinely unset secret
+        stays loud: skipping in silence is the worse failure, because
+        it is indistinguishable from success.
+    """
+    if not _is_github_actions_context():
+        return False
+    if data.gerrit_ssh_privkey_g2g:
+        return False
+    if gh.event_name not in _FORK_UNPRIVILEGED_EVENTS:
+        return False
+    # The factual question, not the trust one. An unresolved head is
+    # not known to be a fork, and treating it as one here would hide a
+    # real misconfiguration on a same-repository pull request.
+    if not gh.is_fork_pr:
+        return False
+
+    log.info(
+        "⏩ Pull request #%s not processed by this run: GitHub withholds "
+        "repository secrets from a '%s' run on a fork pull request, so "
+        "no Gerrit key is available. This is how GitHub scopes the "
+        "trigger, not a misconfiguration — a privileged trigger "
+        "performs the transfer.",
+        gh.pr_number,
+        gh.event_name,
+    )
+    safe_console_print(
+        f"⏩ Skipped: a '{gh.event_name}' run on a fork pull request "
+        "receives no repository secrets",
+        style="yellow",
+    )
+    return True
+
+
 def _check_fork_approval(
     pr_obj: Any | None,
     gh: GitHubContext,
@@ -3220,8 +3297,17 @@ def _handle_single_pr(
 
 def _process() -> None:
     data = _load_effective_inputs()
-    _validate_inputs_or_raise(data)
+
+    # Context before validation. A run that GitHub denied secrets to
+    # has nothing to validate, and reporting the absent key as a
+    # missing input would misdescribe the cause on an outside
+    # contributor's pull request. Reading the context is pure and
+    # cannot raise, so the reorder costs nothing.
     gh = _read_github_context()
+    if _skip_unprivileged_fork_run(data, gh):
+        return
+
+    _validate_inputs_or_raise(data)
 
     # G2G_NO_GERRIT reuses the existing DRY_RUN +
     # G2G_DRYRUN_DISABLE_NETWORK code paths so that all tool logic runs
