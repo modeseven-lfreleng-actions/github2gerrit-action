@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
+from .approvers import describe_additional_sources
 from .github_api import get_pull_request_reviews
 from .trust import describe_trust_policy
 from .trust import is_trusted_association
@@ -136,6 +137,7 @@ def evaluate_fork_approval(
     *,
     head_sha: str,
     author_login: str = "",
+    extra_approvers: frozenset[str] = frozenset(),
 ) -> ApprovalStatus:
     """Decide whether a fork pull request may transfer to Gerrit.
 
@@ -144,6 +146,11 @@ def evaluate_fork_approval(
         head_sha: Current head commit of the pull request. Approvals
             recorded against any other commit do not count.
         author_login: Pull request author, excluded from reviewing.
+        extra_approvers: Lower-cased logins admitted by an opt-in
+            source (see :mod:`github2gerrit.approvers`). These widen
+            *who counts as a maintainer*, and nothing else: the head
+            binding, the ``CHANGES_REQUESTED`` block and the author
+            exclusion all still apply.
 
     Returns:
         An :class:`ApprovalStatus`. Any failure to read reviews yields
@@ -168,9 +175,11 @@ def evaluate_fork_approval(
 
     for login, review in sorted(latest.items()):
         association = str(getattr(review, "author_association", "") or "")
-        if not is_trusted_association(association):
+        named = login.strip().lower() in extra_approvers
+        if not (named or is_trusted_association(association)):
             log.debug(
-                "Ignoring review by %s (%s): not a trusted association",
+                "Ignoring review by %s (%s): not a trusted association, "
+                "and not named by any configured approver source",
                 login,
                 association or "unknown",
             )
@@ -293,8 +302,19 @@ def render_blocked_comment(
         "**To proceed:** submit an approving review. The tool re-runs on "
         "approval and transfers the change to Gerrit.",
         "",
-        f"Reviews count from: {describe_trust_policy()}. The pull request "
-        "author cannot approve their own pull request.",
+        f"Reviews count from: {_describe_approver_policy()}. The pull "
+        "request author cannot approve their own pull request.",
     ]
 
     return "\n".join(lines)
+
+
+def _describe_approver_policy() -> str:
+    """Describe who may approve, including any opt-in source.
+
+    The extra clause appears only when a project enabled one, so a
+    contributor is never told about machinery that is not in use.
+    """
+    policy = describe_trust_policy()
+    extra = describe_additional_sources()
+    return f"{policy}, and {extra}" if extra else policy

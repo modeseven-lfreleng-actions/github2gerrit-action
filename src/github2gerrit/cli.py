@@ -31,6 +31,7 @@ from urllib.parse import urlparse
 import typer
 
 from . import models
+from .approvers import resolve_additional_approvers
 from .config import _is_github_actions_context
 from .config import apply_config_to_env
 from .config import apply_parameter_derivation
@@ -456,8 +457,20 @@ def _check_fork_approval(
         getattr(getattr(pr_obj, "user", None), "login", "") or ""
     ).strip()
 
+    # Opt-in approver sources are read from the *base* side of the
+    # pull request, taken from GitHub's own metadata. Using the head
+    # would let a fork nominate the people permitted to authorise it.
+    base = getattr(pr_obj, "base", None)
+    extra_approvers = resolve_additional_approvers(
+        base_repo=getattr(base, "repo", None),
+        base_ref=str(getattr(base, "ref", "") or "").strip(),
+    )
+
     status = evaluate_fork_approval(
-        pr_obj, head_sha=head_sha, author_login=author
+        pr_obj,
+        head_sha=head_sha,
+        author_login=author,
+        extra_approvers=extra_approvers,
     )
 
     if status.approved:
