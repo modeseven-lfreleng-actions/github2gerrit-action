@@ -9,6 +9,8 @@ pin the conditions under which that is allowed.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,9 @@ from unittest.mock import patch
 
 import pytest
 
+from github2gerrit.cli import _handle_bulk_mode
+from github2gerrit.cli import _skip_unrequested_comment_run
+from github2gerrit.models import RECHECK_EVENTS
 from github2gerrit.models import GitHubContext
 from github2gerrit.models import PROperationMode
 from github2gerrit.pr_approval import APPROVAL_MARKER
@@ -24,6 +29,10 @@ from github2gerrit.pr_approval import ApprovalStatus
 from github2gerrit.pr_approval import evaluate_fork_approval
 from github2gerrit.pr_approval import render_blocked_comment
 from github2gerrit.pr_approval import render_cleared_comment
+from github2gerrit.pr_commands import CMD_CHECK
+from github2gerrit.pr_commands import CMD_CREATE_MISSING
+from github2gerrit.pr_commands import COMMAND_REGISTRY
+from github2gerrit.pr_commands import find_open_command
 
 
 BASE_REPO = "opendaylight/mdsal"
@@ -593,16 +602,158 @@ class TestApprovalNoticeRetraction:
         assert "fresh approval" in body
 
 
-class TestReviewEventOperationMode:
-    """A review must not create a sibling change."""
+class TestRecheckEventOperationMode:
+    """A re-check must not create a sibling change."""
 
-    def test_review_event_maps_to_update(self) -> None:
-        ctx = _ctx(event_name="pull_request_review")
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_recheck_events_map_to_update(self, event_name: str) -> None:
+        ctx = _ctx(event_name=event_name)
         assert ctx.get_operation_mode() is PROperationMode.UPDATE
 
     def test_pull_request_events_unchanged(self) -> None:
         ctx = _ctx(event_name="pull_request_target")
         assert ctx.get_operation_mode() is PROperationMode.CREATE
+
+
+class TestCommentDoorbell:
+    """A comment decides *when* to look, never *whether* to proceed.
+
+    The directive is a noise filter: without it, subscribing to
+    ``issue_comment`` would run the whole pipeline on every remark.
+    Authorisation is re-read from the reviews afterwards, so the
+    comment's author is deliberately irrelevant.
+    """
+
+    def _ctx_with_comment(
+        self, tmp_path: Path, body: str, *, event_name: str = "issue_comment"
+    ) -> GitHubContext:
+        payload = tmp_path / "event.json"
+        payload.write_text(
+            json.dumps({"comment": {"body": body}}), encoding="utf-8"
+        )
+        return dataclasses.replace(
+            _ctx(event_name=event_name), event_path=payload
+        )
+
+    def test_directive_lets_the_run_continue(self, tmp_path: Path) -> None:
+        ctx = self._ctx_with_comment(tmp_path, "@github2gerrit check")
+        assert _skip_unrequested_comment_run(ctx) is False
+
+    @pytest.mark.parametrize("alias", ["check", "recheck", "retry"])
+    def test_aliases_are_accepted(self, tmp_path: Path, alias: str) -> None:
+        ctx = self._ctx_with_comment(tmp_path, f"@github2gerrit {alias}")
+        assert _skip_unrequested_comment_run(ctx) is False
+
+    def test_ordinary_comment_is_skipped(self, tmp_path: Path) -> None:
+        ctx = self._ctx_with_comment(tmp_path, "Looks good to me, thanks!")
+        assert _skip_unrequested_comment_run(ctx) is True
+
+    def test_bare_mention_is_not_a_directive(self, tmp_path: Path) -> None:
+        ctx = self._ctx_with_comment(tmp_path, "cc @github2gerrit")
+        assert _skip_unrequested_comment_run(ctx) is True
+
+    def test_payload_without_a_comment_is_skipped(self, tmp_path: Path) -> None:
+        payload = tmp_path / "event.json"
+        payload.write_text(json.dumps({}), encoding="utf-8")
+        ctx = dataclasses.replace(
+            _ctx(event_name="issue_comment"), event_path=payload
+        )
+        assert _skip_unrequested_comment_run(ctx) is True
+
+    @pytest.mark.parametrize(
+        "event_name",
+        ["pull_request_target", "pull_request_review", "schedule", "push"],
+    )
+    def test_other_events_are_never_filtered(
+        self, tmp_path: Path, event_name: str
+    ) -> None:
+        # The filter exists only to stop comment runs multiplying; it
+        # must not silently swallow any other trigger.
+        ctx = self._ctx_with_comment(
+            tmp_path, "no directive here", event_name=event_name
+        )
+        assert _skip_unrequested_comment_run(ctx) is False
+
+
+class TestOpenCommandRefusesPrivilegedCommands:
+    """The authorship bypass must stay confined to safe commands.
+
+    ``find_open_command`` is the one sanctioned way around the trust
+    filter that issue #382 introduced.  It has to refuse anything that
+    grants something, or the defect returns by the back door.
+    """
+
+    def test_check_is_servable_without_an_author(self) -> None:
+        match = find_open_command("@github2gerrit check", CMD_CHECK.name)
+        assert match is not None
+
+    def test_privileged_command_is_refused(self) -> None:
+        assert CMD_CREATE_MISSING.requires_trust is True
+        with pytest.raises(ValueError, match="requires a trusted author"):
+            find_open_command(
+                "@github2gerrit create missing change",
+                CMD_CREATE_MISSING.name,
+            )
+
+    def test_unregistered_command_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="unregistered command"):
+            find_open_command("@github2gerrit nope", "nope")
+
+    def test_commands_require_trust_unless_they_opt_out(self) -> None:
+        # The default must stay restrictive, so a command added later
+        # is authorised unless its author thought about it.
+        opted_out = [c.name for c in COMMAND_REGISTRY if not c.requires_trust]
+        assert opted_out == [CMD_CHECK.name]
+
+
+class TestScheduledSweep:
+    """The zero-touch path for lifting the gate.
+
+    A schedule runs from the default branch, so unlike a review on a
+    fork pull request it holds the Gerrit key.  It changes what is
+    looked at, never what is permitted: each pull request still passes
+    through the gate with its own provenance.
+    """
+
+    def _handled(
+        self, monkeypatch: pytest.MonkeyPatch, event_name: str
+    ) -> bool:
+        monkeypatch.setenv("SYNC_ALL_OPEN_PRS", "true")
+        monkeypatch.delenv("G2G_TARGET_URL", raising=False)
+        called: list[bool] = []
+
+        def _fake_bulk(*_args: Any, **_kwargs: Any) -> bool:
+            called.append(True)
+            return True
+
+        with (
+            patch("github2gerrit.cli._process_bulk", _fake_bulk),
+            patch("github2gerrit.cli._run_gerrit_cleanup_tasks"),
+            patch("github2gerrit.cli.log_api_metrics_summary"),
+        ):
+            _handle_bulk_mode(
+                MagicMock(),
+                _ctx(event_name=event_name),
+                no_gerrit=True,
+            )
+        return bool(called)
+
+    def test_schedule_runs_the_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._handled(monkeypatch, "schedule") is True
+
+    def test_workflow_dispatch_still_runs_the_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._handled(monkeypatch, "workflow_dispatch") is True
+
+    def test_pull_request_events_do_not_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A PR event names one pull request; sweeping them all from it
+        # would process unrelated changes.
+        assert self._handled(monkeypatch, "pull_request_target") is False
 
 
 class TestBlockedCommentWording:
@@ -618,8 +769,8 @@ class TestBlockedCommentWording:
         assert "could not establish" in body
 
 
-class TestReviewTriggersCreateMissing:
-    """First approval of a fork PR has no change to update."""
+class TestRecheckTriggersCreateMissing:
+    """First authorisation of a fork PR has no change to update."""
 
     def _should_create(
         self, event_name: str, head_repo: str = FORK_REPO
@@ -634,8 +785,17 @@ class TestReviewTriggersCreateMissing:
         with patch("github2gerrit.core.build_client", side_effect=OSError):
             return orch._should_create_missing(inputs, gh)[0]
 
-    def test_review_event_authorises_create(self) -> None:
-        assert self._should_create("pull_request_review") is True
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_recheck_event_authorises_create(self, event_name: str) -> None:
+        # Whichever trigger notices the approval may be the first run
+        # permitted to reach Gerrit, so all of them need the fallback.
+        assert self._should_create(event_name) is True
+
+    @pytest.mark.parametrize("event_name", sorted(RECHECK_EVENTS))
+    def test_same_repo_head_is_not_authorised(self, event_name: str) -> None:
+        # A same-repository PR was never gated, so a re-check on one
+        # must not override CREATE_MISSING=false.
+        assert self._should_create(event_name, head_repo=BASE_REPO) is False
 
     def test_reason_names_the_review(self) -> None:
         """The notice must not claim a comment or flag triggered it."""

@@ -116,6 +116,83 @@ class TestReusableWorkflowCheckoutOrder:
         assert "pull_request" not in str(seed.get("with", {}).get("ref", ""))
 
 
+class TestExtractStepEventHandling:
+    """The shipped extract script, executed rather than replicated.
+
+    ``tests/test_action_pr_number_handling.py`` exercises a copy of
+    this logic, which cannot notice the real script changing.  These
+    run the script straight out of ``action.yaml``.
+    """
+
+    STEP_NAME = "Extract PR number, validate context"
+
+    def _script(self, action_config):
+        step = next(
+            s
+            for s in action_config["runs"]["steps"]
+            if s.get("name") == self.STEP_NAME
+        )
+        return step["run"]
+
+    def _run(self, action_config, tmp_path, event_name, **env):
+        output = tmp_path / "github_output"
+        output.touch()
+        environment = {
+            **os.environ,
+            "GITHUB_EVENT_NAME": event_name,
+            "GITHUB_OUTPUT": str(output),
+            "EVENT_PR_NUMBER": "",
+            "DISPATCH_PR_NUMBER": "",
+            "DISPATCH_SYNC_ALL": "",
+            **env,
+        }
+        result = subprocess.run(
+            ["bash", "-c", self._script(action_config)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        return result, output.read_text()
+
+    def test_schedule_sweeps_every_open_pull_request(
+        self, action_config, tmp_path
+    ):
+        # A schedule carries no pull request context. Treating that as
+        # an error would make the zero-touch path for lifting the fork
+        # approval gate impossible.
+        result, output = self._run(action_config, tmp_path, "schedule")
+        assert result.returncode == 0, result.stderr
+        assert "sync_all=true" in output
+
+    def test_push_needs_no_pull_request(self, action_config, tmp_path):
+        result, output = self._run(action_config, tmp_path, "push")
+        assert result.returncode == 0, result.stderr
+        assert "pr_number=" in output
+        assert "sync_all" not in output
+
+    def test_comment_uses_the_issue_number(self, action_config, tmp_path):
+        result, output = self._run(
+            action_config,
+            tmp_path,
+            "issue_comment",
+            EVENT_PR_NUMBER="29",
+        )
+        assert result.returncode == 0, result.stderr
+        assert "pr_number=29" in output
+
+    def test_missing_pull_request_context_still_errors(
+        self, action_config, tmp_path
+    ):
+        # Only the events that genuinely have no pull request may skip
+        # this; everything else must keep failing loudly.
+        result, _output = self._run(
+            action_config, tmp_path, "pull_request_target"
+        )
+        assert result.returncode == 2
+        assert "requires a valid pull request context" in result.stdout
+
+
 class TestReusableWorkflowConcurrency:
     """The concurrency group must tell pull requests apart.
 

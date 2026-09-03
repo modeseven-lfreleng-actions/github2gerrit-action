@@ -83,6 +83,9 @@ from .pr_approval import ApprovalStatus
 from .pr_approval import evaluate_fork_approval
 from .pr_approval import render_blocked_comment
 from .pr_approval import render_cleared_comment
+from .pr_commands import CMD_CHECK
+from .pr_commands import MENTION_PREFIX
+from .pr_commands import find_open_command
 from .rich_display import RICH_AVAILABLE
 from .rich_display import DummyProgressTracker
 from .rich_display import G2GProgressTracker
@@ -326,6 +329,59 @@ def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
         f"⏩ Skipped: a '{gh.event_name}' run on a fork pull request "
         "receives no repository secrets",
         style="yellow",
+    )
+    return True
+
+
+def _triggering_comment_body(gh: GitHubContext) -> str:
+    """Return the body of the comment that triggered this run.
+
+    Empty when the payload carries no comment, which for an
+    ``issue_comment`` run means the doorbell cannot have been rung.
+    """
+    evt = _load_event(gh.event_path)
+    comment = evt.get("comment")
+    if isinstance(comment, dict):
+        body = comment.get("body")
+        if isinstance(body, str):
+            return body
+    return ""
+
+
+def _skip_unrequested_comment_run(gh: GitHubContext) -> bool:
+    """Report whether a comment run should stop without doing anything.
+
+    Subscribing to ``issue_comment`` would otherwise run the whole
+    pipeline on every remark anyone makes on any pull request. The
+    directive narrows that to comments actually asking for a re-check.
+
+    This is a **noise filter, not a security control**. The comment's
+    author is deliberately not consulted: asking the tool to look again
+    grants nothing, because the answer comes from
+    :func:`evaluate_fork_approval` re-reading the reviews. Anyone may
+    therefore ring the doorbell, and it is logged rather than refused.
+
+    Returns:
+        ``True`` when the caller should stop, successfully.
+    """
+    if gh.event_name != "issue_comment":
+        return False
+
+    body = _triggering_comment_body(gh)
+    if find_open_command(body, CMD_CHECK.name) is not None:
+        log.info(
+            "🔁 Re-checking PR #%s: a comment asked for it. Authorisation "
+            "is re-read from the pull request's reviews, so the request "
+            "itself confers nothing.",
+            gh.pr_number,
+        )
+        return False
+
+    log.debug(
+        "Comment on PR #%s carries no '%s %s' directive; nothing to do",
+        gh.pr_number,
+        MENTION_PREFIX,
+        CMD_CHECK.name,
     )
     return True
 
@@ -3003,14 +3059,24 @@ def _handle_gerrit_change_events(
 def _handle_bulk_mode(
     data: Inputs, gh: GitHubContext, *, no_gerrit: bool
 ) -> bool:
-    """Run bulk mode for URL/workflow_dispatch. Return True if handled."""
+    """Run bulk mode for URL/dispatch/schedule. Return True if handled.
+
+    ``schedule`` is included because it is the zero-touch path for
+    lifting the fork approval gate: a maintainer approves in the
+    ordinary way and the next sweep notices.  The sweep is privileged
+    (it runs from the default branch, so it holds the Gerrit key) and
+    each pull request still passes through ``_check_fork_approval``
+    with its own provenance, so scheduling changes what is *looked at*
+    and never what is *permitted*.
+    """
     sync_all = env_bool("SYNC_ALL_OPEN_PRS", False)
     # When a target URL was provided via CLI, G2G_TARGET_URL is set
     # to the actual URL string (truthy check works for non-empty strings)
     if not (
         sync_all
         and (
-            gh.event_name == "workflow_dispatch" or os.getenv("G2G_TARGET_URL")
+            gh.event_name in ("workflow_dispatch", "schedule")
+            or os.getenv("G2G_TARGET_URL")
         )
     ):
         return False
@@ -3305,6 +3371,8 @@ def _process() -> None:
     # cannot raise, so the reorder costs nothing.
     gh = _read_github_context()
     if _skip_unprivileged_fork_run(data, gh):
+        return
+    if _skip_unrequested_comment_run(gh):
         return
 
     _validate_inputs_or_raise(data)

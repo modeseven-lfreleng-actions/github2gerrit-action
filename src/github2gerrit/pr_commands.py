@@ -58,6 +58,7 @@ from dataclasses import field
 
 
 __all__ = [
+    "CMD_CHECK",
     "CMD_CREATE_MISSING",
     "COMMAND_REGISTRY",
     "CommandDefinition",
@@ -65,6 +66,7 @@ __all__ = [
     "CommandParseResult",
     "contains_directive",
     "find_command",
+    "find_open_command",
     "has_command",
     "list_commands",
     "parse_commands",
@@ -99,12 +101,18 @@ class CommandDefinition:
         description: Human-readable description shown in help output.
         hidden: If ``True`` the command is recognised but omitted from
             user-facing documentation helpers.
+        requires_trust: Whether the command may only be obeyed when a
+            trusted author issued it.  Defaults to ``True``, so a new
+            command is authorised unless it deliberately opts out.
+            Only a command that *grants nothing* may set this
+            ``False`` — see :func:`find_open_command`.
     """
 
     name: str
     aliases: tuple[str, ...] = ()
     description: str = ""
     hidden: bool = False
+    requires_trust: bool = True
 
     def all_phrases(self) -> tuple[str, ...]:
         """Return all phrases that match this command (canonical + aliases)."""
@@ -175,6 +183,23 @@ CMD_CREATE_MISSING = register_command(
             "find an existing one. Use this when the original 'opened' "
             "event failed and subsequent PR updates keep failing."
         ),
+    )
+)
+
+CMD_CHECK = register_command(
+    CommandDefinition(
+        name="check",
+        aliases=("recheck", "retry"),
+        description=(
+            "Re-evaluate this pull request now. Use it after approving "
+            "a pull request raised from a fork, rather than waiting for "
+            "the periodic sweep. It re-reads the reviews and grants "
+            "nothing by itself, so anybody may ask for it."
+        ),
+        # The one command safe to obey from any author: it asks the
+        # tool to look again, and the looking re-takes every
+        # authorisation decision from the API.
+        requires_trust=False,
     )
 )
 
@@ -378,6 +403,50 @@ def find_command(
         if m.command_name == target:
             return m
     return None
+
+
+def find_open_command(body: str, command_name: str) -> CommandMatch | None:
+    """Match a command in one comment body, ignoring who wrote it.
+
+    The single sanctioned bypass of the authorship filter described in
+    :mod:`github2gerrit.pr_directives`, and it refuses to serve a
+    command that has not declared itself safe to obey from anybody.
+
+    A command qualifies only when it **grants nothing**: it may cause
+    the tool to look at a pull request again, never to act on one.
+    Re-evaluation is safe from any author precisely because every
+    authorisation decision is re-taken from the API afterwards, so the
+    comment is a doorbell rather than a key.
+
+    Args:
+        body: A single comment body, unfiltered.
+        command_name: Canonical command name to search for.
+
+    Returns:
+        The :class:`CommandMatch` if found, otherwise ``None``.
+
+    Raises:
+        ValueError: If *command_name* is unregistered, or is one that
+            requires a trusted author.  Both are programming errors:
+            reaching this function with such a command means the
+            authorisation filter was bypassed by mistake.
+    """
+    target = command_name.lower().strip()
+    defn = next(
+        (c for c in COMMAND_REGISTRY if c.name.lower().strip() == target),
+        None,
+    )
+    if defn is None:
+        msg = f"unregistered command: {command_name!r}"
+        raise ValueError(msg)
+    if defn.requires_trust:
+        msg = (
+            f"command {defn.name!r} requires a trusted author; use "
+            "github2gerrit.pr_directives.find_pr_command instead"
+        )
+        raise ValueError(msg)
+
+    return find_command([body], defn.name)
 
 
 def list_commands() -> list[CommandDefinition]:
