@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -436,52 +437,73 @@ def _recover_pr_metadata(
     branch, preparing a change against the wrong base. So this fills
     everything the object can answer, exactly as the first attempt
     does.
+    Each field is recovered independently. A pull request can expose
+    its refs while its head repository metadata is missing — a deleted
+    fork answers ``null`` for ``head.repo`` — and tying the refs to
+    the provenance would leave ``base_ref`` empty in exactly that
+    case, so workspace setup would skip the target branch and
+    resolution could fall back to a default one. Provenance that
+    cannot be established stays unresolved, and therefore gated.
 
-    Keyed on an unresolved head repository, which is the marker that
-    the first attempt did not succeed. Refs already present are left
-    alone; the head SHA is replaced, because the event's own value is
-    the merge or default-branch commit rather than the pull request
+    Refs already present are left alone; the head SHA is replaced
+    whenever anything else was missing, because the event's own value
+    is the merge or default-branch commit rather than the pull request
     head.
 
-    Returns *gh* unchanged when provenance is already known or the pull
-    request cannot supply it.
+    Returns *gh* unchanged when nothing was missing or the pull
+    request cannot answer.
     """
-    if gh.head_repo or pr_obj is None:
+    if pr_obj is None:
         return gh
 
-    head_repo = _head_repo_for_pr(pr_obj)
+    env_updates: dict[str, str] = {}
+    head_repo = gh.head_repo
+    base_ref = gh.base_ref
+    head_ref = gh.head_ref
+    sha = gh.sha
+
     if not head_repo:
+        found = _head_repo_for_pr(pr_obj)
+        if found:
+            env_updates["PR_HEAD_REPO"] = head_repo = found
+    if not base_ref:
+        found = _ref_for_pr(pr_obj, "base")
+        if found:
+            env_updates["GITHUB_BASE_REF"] = base_ref = found
+    if not head_ref:
+        found = _ref_for_pr(pr_obj, "head")
+        if found:
+            env_updates["GITHUB_HEAD_REF"] = head_ref = found
+
+    if not env_updates:
         return gh
 
-    # The orchestrator and the context reader both take these from the
-    # environment, so writing them there is what makes the recovery
-    # visible to everything downstream.
-    os.environ["PR_HEAD_REPO"] = head_repo
-    log.debug(
-        "Recovered PR #%s head repository from the fetched pull request: %s",
-        gh.pr_number,
-        head_repo,
-    )
-
-    if not gh.base_ref:
-        base_ref = _ref_for_pr(pr_obj, "base")
-        if base_ref:
-            os.environ["GITHUB_BASE_REF"] = base_ref
-            log.debug("Recovered base_ref: %s", base_ref)
-    if not gh.head_ref:
-        head_ref = _ref_for_pr(pr_obj, "head")
-        if head_ref:
-            os.environ["GITHUB_HEAD_REF"] = head_ref
-            log.debug("Recovered head_ref: %s", head_ref)
-
-    head_sha = str(
+    found = str(
         getattr(getattr(pr_obj, "head", object()), "sha", "") or ""
     ).strip()
-    if head_sha:
-        os.environ["GITHUB_SHA"] = head_sha
-        log.debug("Recovered head sha: %s", head_sha)
+    if found:
+        env_updates["GITHUB_SHA"] = sha = found
 
-    return _read_github_context()
+    # The orchestrator reads these back out of the environment, so
+    # writing them there is what makes the recovery visible to it.
+    # The context itself is amended rather than re-read, so a value
+    # the caller already held is never lost to an environment that
+    # happens to disagree.
+    for name, value in env_updates.items():
+        os.environ[name] = value
+    log.debug(
+        "Recovered PR #%s metadata from the fetched pull request: %s",
+        gh.pr_number,
+        ", ".join(sorted(env_updates)),
+    )
+
+    return dataclasses.replace(
+        gh,
+        head_repo=head_repo,
+        base_ref=base_ref,
+        head_ref=head_ref,
+        sha=sha,
+    )
 
 
 def _recheck_has_nothing_to_unblock(gh: GitHubContext) -> bool:

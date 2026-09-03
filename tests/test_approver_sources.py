@@ -151,7 +151,17 @@ class TestInfoYamlParsing:
         assert parse_info_yaml(contact_only) == frozenset({"committer-github"})
 
     @pytest.mark.parametrize(
-        "text", ["", "not: [a, mapping", "- a\n- list", "just a string"]
+        "text",
+        [
+            "",
+            "not: [a, mapping",
+            "- a\n- list",
+            "just a string",
+            # PyYAML raises RecursionError, not YAMLError, on deeply
+            # nested input. Letting it escape would turn a malformed
+            # base file into a failed workflow.
+            "[" * 4000 + "]" * 4000,
+        ],
     )
     def test_unparsable_content_names_nobody(self, text: str) -> None:
         # A malformed file must neither widen the set nor raise into

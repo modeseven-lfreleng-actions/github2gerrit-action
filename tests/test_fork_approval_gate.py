@@ -914,9 +914,27 @@ class TestPullRequestMetadataRecovery:
         assert recovered.head_repo == FORK_REPO
 
     def test_a_pull_request_that_cannot_answer_changes_nothing(self) -> None:
-        recovered = self._recover("", self._pr(""))
+        pr = MagicMock()
+        pr.head.repo.full_name = ""
+        pr.base.ref = ""
+        pr.head.ref = ""
+        pr.head.sha = ""
+        recovered = self._recover("", pr)
         assert recovered.head_repo == ""
         assert recovered.base_ref == ""
+
+    def test_refs_recover_without_provenance(self) -> None:
+        # A deleted fork answers null for head.repo while still
+        # exposing its refs. Tying the two together would leave
+        # base_ref empty exactly there, so workspace setup would skip
+        # the target branch and resolution could fall back to a
+        # default one.
+        recovered = self._recover("", self._pr(None))
+        assert recovered.base_ref == "stable/scandium"
+        assert recovered.head_ref == "topic"
+        # Provenance stays unresolved, so the pull request stays gated.
+        assert recovered.head_repo == ""
+        assert recovered.head_is_trusted is False
 
     def test_no_pull_request_changes_nothing(self) -> None:
         assert self._recover("", None).head_repo == ""

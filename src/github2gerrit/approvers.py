@@ -166,7 +166,11 @@ def parse_info_yaml(text: str, *, match_lfid: bool = False) -> frozenset[str]:
     """
     try:
         parsed = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
+        # RecursionError is not a YAMLError: PyYAML raises it on
+        # deeply nested input, and letting it escape would turn a
+        # malformed base file into a failed workflow rather than the
+        # empty result this function promises.
         log.warning("Could not parse %s; ignoring it: %s", INFO_YAML_PATH, exc)
         return frozenset()
 
