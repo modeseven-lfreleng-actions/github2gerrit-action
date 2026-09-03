@@ -286,6 +286,29 @@ class TestReusableWorkflowConcurrency:
             f"group: {group}"
         )
 
+    def test_dispatched_single_pr_shares_the_pull_request_lock(
+        self, reusable_workflow
+    ):
+        # A single-PR workflow_dispatch carries neither payload
+        # accessor and names its target in an input instead. Without
+        # this it would sit in the event-name group and could transfer
+        # concurrently with a comment-triggered run for the same PR.
+        group = self._job(reusable_workflow)["concurrency"]["group"]
+        assert "inputs.PR_NUMBER" in group
+        # '0' means a bulk sweep and '' means unset; neither names a
+        # pull request, so both must fall through to the event name
+        # rather than collapsing every run into one group.
+        assert "inputs.PR_NUMBER != '0'" in group
+        assert "inputs.PR_NUMBER != ''" in group
+
+    def test_ordinary_comments_do_not_enter_the_group(self, reusable_workflow):
+        # GitHub keeps one running and one pending run per group and
+        # discards the rest, so an unrelated comment admitted here can
+        # evict a pending re-check that somebody asked for.
+        condition = self._job(reusable_workflow)["if"]
+        assert "github.event.comment.body" in condition
+        assert "@github2gerrit" in condition
+
     def test_group_falls_back_to_the_event_name(self, reusable_workflow):
         # Non-pull-request runs (push and dispatch) get one
         # group each rather than colliding on an empty operand.
