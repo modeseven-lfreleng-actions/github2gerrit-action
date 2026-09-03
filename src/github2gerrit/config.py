@@ -49,6 +49,7 @@ import configparser
 import logging
 import os
 import re
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -497,6 +498,16 @@ def apply_config_to_env(cfg: dict[str, str]) -> None:
 # otherwise overwrite one another's values.
 DERIVED_KEYS_ENV = "G2G_DERIVED_KEYS"
 
+# Serialises the read-modify-write below.  The comment above explains
+# why the record is process-scoped rather than per-pull-request, and
+# that reasoning still holds -- but "established once before the pool
+# starts" was an invariant stated in prose and enforced by nothing.  A
+# second marking call from inside per-pull-request processing would
+# interleave read and write between workers, and the lost key would
+# silently turn a derived value back into apparent operator intent:
+# the #386 bug, returning with no error to point at.
+_DERIVED_KEYS_LOCK = threading.Lock()
+
 
 def _derived_keys() -> set[str]:
     """Return the set of config keys currently recorded as derived."""
@@ -509,7 +520,9 @@ def mark_derived_keys(keys: Iterable[str]) -> None:
     operator intent.
 
     Additive: keys already recorded stay recorded, so several derivation
-    passes accumulate rather than the last one winning.
+    passes accumulate rather than the last one winning.  The union is
+    taken under a lock, so concurrent callers accumulate rather than
+    overwriting one another.
 
     Args:
         keys: Config key names (case-insensitive).  Empty names are
@@ -518,7 +531,10 @@ def mark_derived_keys(keys: Iterable[str]) -> None:
     incoming = {k.strip().upper() for k in keys if k and k.strip()}
     if not incoming:
         return
-    os.environ[DERIVED_KEYS_ENV] = ",".join(sorted(_derived_keys() | incoming))
+    with _DERIVED_KEYS_LOCK:
+        os.environ[DERIVED_KEYS_ENV] = ",".join(
+            sorted(_derived_keys() | incoming)
+        )
 
 
 def is_derived_key(key: str) -> bool:
