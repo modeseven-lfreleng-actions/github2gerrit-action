@@ -304,6 +304,13 @@ jobs:
     # transfer, so the slot they take is the accepted cost of testing
     # the path consumers actually use.
     #
+    # G2G_NO_GERRIT is read from the repository variable too, matching
+    # the fallback the action step below applies, so a project setting
+    # only the variable is not skipped here. Compared against 'true'
+    # rather than tested for truthiness, because an unset variable is
+    # the empty string while one set to 'false' is a non-empty string
+    # and would otherwise count as enabled.
+    #
     # pull_request_target on a fork head is deliberately kept: it runs
     # from the default branch, holds the credentials, and is the
     # trigger that applies the approval gate.
@@ -332,7 +339,7 @@ jobs:
     # is guarded by tests/test_action_step_validation.py, which
     # requires every phrase of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || inputs.G2G_NO_GERRIT || inputs.DRY_RUN || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || inputs.G2G_NO_GERRIT || inputs.DRY_RUN || vars.G2G_NO_GERRIT == 'true' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

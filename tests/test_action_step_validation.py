@@ -410,6 +410,10 @@ class TestReusableWorkflowConcurrency:
         condition = self._job(reusable_workflow)["if"]
         assert "inputs.G2G_NO_GERRIT" in condition
         assert "inputs.DRY_RUN" in condition
+        # The action step falls back to the repository variable, so
+        # this condition has to as well or a project setting only the
+        # variable is skipped before the action ever sees it.
+        assert "vars.G2G_NO_GERRIT == 'true'" in condition
 
     def test_fork_pull_request_target_is_still_admitted(
         self, reusable_workflow
