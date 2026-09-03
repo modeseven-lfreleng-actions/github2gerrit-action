@@ -283,23 +283,38 @@ class TestExtractStepEventHandling:
         assert "requires a valid pull request context" in result.stdout
 
 
-def _open_command_directives() -> list[str]:
-    """Return every ``@github2gerrit <phrase>`` anybody may issue.
+def _open_command_phrases() -> list[str]:
+    """Return every phrase anybody may use to direct the tool.
 
     Derived from the registry so that a workflow condition or a README
     example naming these phrases cannot fall behind a new alias.
+
+    The mention is checked separately by callers, because the parser
+    accepts any whitespace between it and the phrase; requiring one
+    literal space would silently skip a supported directive.
     """
     from github2gerrit.pr_commands import COMMAND_REGISTRY
-    from github2gerrit.pr_commands import MENTION_PREFIX
 
-    directives = [
-        f"{MENTION_PREFIX} {phrase}"
+    phrases = [
+        phrase
         for command in COMMAND_REGISTRY
         if not command.requires_trust
         for phrase in command.all_phrases()
     ]
-    assert directives, "no open command to admit"
-    return directives
+    assert phrases, "no open command to admit"
+    return phrases
+
+
+def _readme_comment_guards() -> list[str]:
+    """Return the comment-guard lines the README shows to readers."""
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    guards = [
+        line
+        for line in readme.splitlines()
+        if "contains(github.event.comment.body" in line
+    ]
+    assert guards, "README shows no comment guard to check"
+    return guards
 
 
 class TestReusableWorkflowConcurrency:
@@ -400,14 +415,7 @@ class TestReusableWorkflowConcurrency:
         # The bundled workflow guards this; a reader copying the
         # composite-action example gets no such condition unless the
         # example carries it.
-        readme = (Path(__file__).parent.parent / "README.md").read_text()
-        guards = [
-            line
-            for line in readme.splitlines()
-            if "contains(github.event.comment.body" in line
-        ]
-        assert guards, "README shows no comment guard to check"
-        for guard in guards:
+        for guard in _readme_comment_guards():
             assert "github.event.issue.state == 'open'" in guard, (
                 "a README comment guard admits closed pull requests, so "
                 "anyone could start a run on a merged one"
@@ -423,33 +431,40 @@ class TestReusableWorkflowConcurrency:
         assert "github.event.issue.state == 'open'" in condition
 
     def test_every_open_command_phrase_is_admitted(self, reusable_workflow):
-        # The condition names the command phrases rather than the bare
-        # mention, which narrows the eviction window but duplicates the
+        # The condition names the command phrases, which duplicates the
         # registry in YAML. Without this, adding an alias would leave a
         # documented directive that silently never starts a run.
         condition = self._job(reusable_workflow)["if"]
         missing = [
-            text for text in _open_command_directives() if text not in condition
+            f"'{phrase}'"
+            for phrase in _open_command_phrases()
+            if f"'{phrase}'" not in condition
         ]
         assert not missing, (
             f"the job condition does not admit {missing}, so those "
             f"directives would never start a run"
         )
 
+    def test_the_mention_is_tested_separately(self, reusable_workflow):
+        # The parser accepts any whitespace between the mention and
+        # the phrase, and GitHub's mention autocomplete inserts a
+        # trailing space, so '@github2gerrit  check' is both supported
+        # and likely. Joining them into one literal would skip it.
+        condition = self._job(reusable_workflow)["if"]
+        assert "'@github2gerrit'" in condition
+        for phrase in _open_command_phrases():
+            assert f"'@github2gerrit {phrase}'" not in condition
+
     def test_readme_examples_admit_the_same_phrases(self):
         # Readers copy these guards verbatim, so an example that omits
         # an alias hands them a directive that silently does nothing.
-        readme = (Path(__file__).parent.parent / "README.md").read_text()
-        guards = [
-            line
-            for line in readme.splitlines()
-            if "contains(github.event.comment.body" in line
-        ]
-        assert guards, "README shows no comment guard to check"
-
+        guards = _readme_comment_guards()
         joined = "\n".join(guards)
+        assert "'@github2gerrit'" in joined
         missing = [
-            text for text in _open_command_directives() if text not in joined
+            f"'{phrase}'"
+            for phrase in _open_command_phrases()
+            if f"'{phrase}'" not in joined
         ]
         assert not missing, (
             f"the README comment guards omit {missing}, so a reader "

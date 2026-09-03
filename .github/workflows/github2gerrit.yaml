@@ -306,15 +306,23 @@ jobs:
     #
     # The directive is matched here for the same concurrency reason:
     # ordinary conversation and bare mentions stay out of the group
-    # entirely. It is still coarser than the CLI's grammar, which
-    # normalises whitespace and requires a word boundary, so a near
-    # miss such as 'checkout' is admitted here and refused there. That
-    # residue is recoverable by commenting again, and an exact filter
-    # would mean reimplementing the parser in YAML. Drift is guarded
-    # instead by tests/test_action_step_validation.py, which requires
-    # every phrase of every open command to appear below.
+    # entirely. The mention and the command phrase are tested
+    # separately rather than as one string, because the parser accepts
+    # any whitespace between them and GitHub's own mention
+    # autocomplete inserts a trailing space — so '@github2gerrit  check'
+    # is both a supported directive and a likely one. Requiring a
+    # single literal space would skip it silently, which is worse than
+    # admitting an extra run: a maintainer would comment and see
+    # nothing happen, with no feedback anywhere.
+    #
+    # Deliberately looser than the CLI's grammar in the other
+    # direction: a comment mentioning the tool and containing the word
+    # 'check' anywhere is admitted here and judged there. Erring that
+    # way costs a slot; erring the other way loses a directive. Drift
+    # is guarded by tests/test_action_step_validation.py, which
+    # requires every phrase of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
