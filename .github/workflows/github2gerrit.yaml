@@ -288,16 +288,23 @@ jobs:
     # issue payload must carry a pull_request member. Admitting a bare
     # issue.number would treat a comment on issue N as pull request N.
     #
-    # The mention is required here, not merely in the CLI, because
+    # The directive is matched here, not merely in the CLI, because
     # admitting a comment costs a slot in the per-PR concurrency group
     # below. GitHub keeps one running and one pending run per group
-    # and discards the rest, so an ordinary "thanks!" arriving while a
-    # transfer runs would evict a pending '@github2gerrit check' and
-    # silently drop the re-check somebody asked for. This is a coarse
-    # filter: the CLI still decides whether a real directive is
-    # present, and the comment authorises nothing either way.
+    # and cancels the older pending one, so a comment admitted while a
+    # transfer runs can evict a pending re-check that somebody asked
+    # for. Narrowing to the command phrases keeps ordinary
+    # conversation, and bare mentions, out of the group entirely.
+    #
+    # Still coarser than the CLI's grammar, which normalises
+    # whitespace and requires a word boundary; a near miss such as
+    # 'checkout' is admitted here and refused there. That residue is
+    # recoverable by commenting again, and an exact filter would mean
+    # reimplementing the parser in YAML. Drift is guarded instead by
+    # tests/test_action_step_validation.py, which requires every phrase
+    # of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request && contains(github.event.comment.body, '@github2gerrit')) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

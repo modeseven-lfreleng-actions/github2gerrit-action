@@ -303,11 +303,33 @@ class TestReusableWorkflowConcurrency:
 
     def test_ordinary_comments_do_not_enter_the_group(self, reusable_workflow):
         # GitHub keeps one running and one pending run per group and
-        # discards the rest, so an unrelated comment admitted here can
-        # evict a pending re-check that somebody asked for.
+        # cancels the older pending one, so an unrelated comment
+        # admitted here can evict a re-check that somebody asked for.
         condition = self._job(reusable_workflow)["if"]
         assert "github.event.comment.body" in condition
-        assert "@github2gerrit" in condition
+
+    def test_every_open_command_phrase_is_admitted(self, reusable_workflow):
+        # The condition names the command phrases rather than the bare
+        # mention, which narrows the eviction window but duplicates the
+        # registry in YAML. Without this, adding an alias would leave a
+        # documented directive that silently never starts a run.
+        from github2gerrit.pr_commands import COMMAND_REGISTRY
+        from github2gerrit.pr_commands import MENTION_PREFIX
+
+        condition = self._job(reusable_workflow)["if"]
+        expected = [
+            f"{MENTION_PREFIX} {phrase}"
+            for command in COMMAND_REGISTRY
+            if not command.requires_trust
+            for phrase in command.all_phrases()
+        ]
+        assert expected, "no open command to admit"
+
+        missing = [text for text in expected if text not in condition]
+        assert not missing, (
+            f"the job condition does not admit {missing}, so those "
+            f"directives would never start a run"
+        )
 
     def test_group_falls_back_to_the_event_name(self, reusable_workflow):
         # Non-pull-request runs (push and dispatch) get one

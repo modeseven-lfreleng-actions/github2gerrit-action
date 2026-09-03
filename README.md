@@ -175,9 +175,17 @@ jobs:
     runs-on: ubuntu-latest
     # Ordinary comments must not start a run. Besides the wasted job,
     # a comment occupies this pull request's concurrency slot and can
-    # evict a pending '@github2gerrit check'.
+    # evict a pending re-check.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && contains(github.event.comment.body, '@github2gerrit')) }}
+    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && contains(github.event.comment.body, '@github2gerrit check')) }}
+    # Serialise every route to one pull request. Two runs for the same
+    # approved commit could otherwise both find no Gerrit change and
+    # create one each; ALLOW_DUPLICATES defaults to true, so nothing
+    # downstream would stop them.
+    concurrency:
+      # yamllint disable-line rule:line-length
+      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event_name }}
+      cancel-in-progress: false
     steps:
       - name: Submit PR to Gerrit
         id: g2g
