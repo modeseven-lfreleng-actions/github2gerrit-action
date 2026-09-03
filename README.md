@@ -148,6 +148,12 @@ as dispatch inputs and forward them the same way.
 
 Pin `@main` to a release tag or commit SHA for production use.
 
+A bulk `workflow_dispatch` (`PR_NUMBER` of `0`) processes every open
+pull request in one run, which does not serialise against the
+per-pull-request runs that events start. Avoid triggering one while
+pull request activity is in flight; see
+[#422](https://github.com/lfreleng-actions/github2gerrit-action/issues/422).
+
 ### Option B: composite action
 
 Call the action directly for full control over all inputs:
@@ -177,7 +183,7 @@ jobs:
     # a comment occupies this pull request's concurrency slot and can
     # evict a pending re-check.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && contains(github.event.comment.body, '@github2gerrit check')) }}
+    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     # Serialise every route to one pull request. Two runs for the same
     # approved commit could otherwise both find no Gerrit change and
     # create one each; ALLOW_DUPLICATES defaults to true, so nothing

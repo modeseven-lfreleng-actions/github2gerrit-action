@@ -251,6 +251,25 @@ class TestExtractStepEventHandling:
         assert "requires a valid pull request context" in result.stdout
 
 
+def _open_command_directives() -> list[str]:
+    """Return every ``@github2gerrit <phrase>`` anybody may issue.
+
+    Derived from the registry so that a workflow condition or a README
+    example naming these phrases cannot fall behind a new alias.
+    """
+    from github2gerrit.pr_commands import COMMAND_REGISTRY
+    from github2gerrit.pr_commands import MENTION_PREFIX
+
+    directives = [
+        f"{MENTION_PREFIX} {phrase}"
+        for command in COMMAND_REGISTRY
+        if not command.requires_trust
+        for phrase in command.all_phrases()
+    ]
+    assert directives, "no open command to admit"
+    return directives
+
+
 class TestReusableWorkflowConcurrency:
     """The concurrency group must tell pull requests apart.
 
@@ -313,22 +332,33 @@ class TestReusableWorkflowConcurrency:
         # mention, which narrows the eviction window but duplicates the
         # registry in YAML. Without this, adding an alias would leave a
         # documented directive that silently never starts a run.
-        from github2gerrit.pr_commands import COMMAND_REGISTRY
-        from github2gerrit.pr_commands import MENTION_PREFIX
-
         condition = self._job(reusable_workflow)["if"]
-        expected = [
-            f"{MENTION_PREFIX} {phrase}"
-            for command in COMMAND_REGISTRY
-            if not command.requires_trust
-            for phrase in command.all_phrases()
+        missing = [
+            text for text in _open_command_directives() if text not in condition
         ]
-        assert expected, "no open command to admit"
-
-        missing = [text for text in expected if text not in condition]
         assert not missing, (
             f"the job condition does not admit {missing}, so those "
             f"directives would never start a run"
+        )
+
+    def test_readme_examples_admit_the_same_phrases(self):
+        # Readers copy these guards verbatim, so an example that omits
+        # an alias hands them a directive that silently does nothing.
+        readme = (Path(__file__).parent.parent / "README.md").read_text()
+        guards = [
+            line
+            for line in readme.splitlines()
+            if "contains(github.event.comment.body" in line
+        ]
+        assert guards, "README shows no comment guard to check"
+
+        joined = "\n".join(guards)
+        missing = [
+            text for text in _open_command_directives() if text not in joined
+        ]
+        assert not missing, (
+            f"the README comment guards omit {missing}, so a reader "
+            f"copying them would find those directives ignored"
         )
 
     def test_group_falls_back_to_the_event_name(self, reusable_workflow):

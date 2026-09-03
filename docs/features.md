@@ -161,8 +161,19 @@ accounts rather than the project's reviewers.
 | Command                 | Aliases                            | Description                                                                 |
 | ----------------------- | ---------------------------------- | --------------------------------------------------------------------------- |
 | `create missing change` | `create-missing`, `create missing` | Create a Gerrit change when an UPDATE operation cannot find an existing one |
+| `check`                 | `recheck`, `retry`                 | Re-evaluate a pull request now, transferring it if a maintainer approved it |
 
 <!-- markdownlint-enable MD013 -->
+
+The two differ in who may issue them. `create missing change` causes the tool
+to *act*, so only a trusted author may give it. `check` causes the tool to
+*look again*, and the looking re-takes every authorisation decision from the
+API, so anybody may ask for it — see
+[which triggers can lift the gate](#which-triggers-can-lift-the-gate).
+
+The command itself carries that distinction, as `requires_trust`, which
+defaults to restricting a command. A new command stays confined to trusted
+authors unless its author deliberately opts out.
 
 ### Create Missing Change
 
