@@ -193,16 +193,16 @@ class TestExtractStepEventHandling:
     """
 
     STEP_NAME = "Extract PR number, validate context"
+    NORMALIZE_STEP = "Normalize PR_NUMBER"
 
-    def _script(self, action_config):
+    def _script(self, action_config, step_name=None):
+        wanted = step_name or self.STEP_NAME
         step = next(
-            s
-            for s in action_config["runs"]["steps"]
-            if s.get("name") == self.STEP_NAME
+            s for s in action_config["runs"]["steps"] if s.get("name") == wanted
         )
         return step["run"]
 
-    def _run(self, action_config, tmp_path, event_name, **env):
+    def _run(self, action_config, tmp_path, event_name, step_name=None, **env):
         output = tmp_path / "github_output"
         output.touch()
         environment = {
@@ -212,10 +212,11 @@ class TestExtractStepEventHandling:
             "EVENT_PR_NUMBER": "",
             "DISPATCH_PR_NUMBER": "",
             "DISPATCH_SYNC_ALL": "",
+            "INPUT_PR_NUMBER": "",
             **env,
         }
         result = subprocess.run(
-            ["bash", "-c", self._script(action_config)],
+            ["bash", "-c", self._script(action_config, step_name)],
             capture_output=True,
             text=True,
             check=False,
@@ -235,6 +236,37 @@ class TestExtractStepEventHandling:
             tmp_path,
             "issue_comment",
             EVENT_PR_NUMBER="29",
+        )
+        assert result.returncode == 0, result.stderr
+        assert "pr_number=29" in output
+
+    @pytest.mark.parametrize("value", ["029", "0029", "01"])
+    def test_non_canonical_dispatch_numbers_are_refused(
+        self, action_config, tmp_path, value
+    ):
+        # The concurrency key uses this string raw, so '029' would key
+        # on '029' while naming pull request 29 and race the events
+        # for it. GitHub expressions cannot normalise it, so refuse it
+        # here: a run that cannot start cannot race.
+        result, _output = self._run(
+            action_config,
+            tmp_path,
+            "workflow_dispatch",
+            step_name=self.NORMALIZE_STEP,
+            INPUT_PR_NUMBER=value,
+        )
+        assert result.returncode == 2
+        assert "no leading zeros" in result.stdout
+
+    def test_canonical_dispatch_number_is_accepted(
+        self, action_config, tmp_path
+    ):
+        result, output = self._run(
+            action_config,
+            tmp_path,
+            "workflow_dispatch",
+            step_name=self.NORMALIZE_STEP,
+            INPUT_PR_NUMBER="29",
         )
         assert result.returncode == 0, result.stderr
         assert "pr_number=29" in output
@@ -314,9 +346,12 @@ class TestReusableWorkflowConcurrency:
         # concurrently with a comment-triggered run for the same PR.
         group = self._job(reusable_workflow)["concurrency"]["group"]
         assert "inputs.PR_NUMBER" in group
-        # '0' means a bulk sweep and '' means unset; neither names a
-        # pull request, so both must fall through to the event name
-        # rather than collapsing every run into one group.
+        # Used raw, because GitHub expressions have no arithmetic to
+        # canonicalise it; the action rejects a non-canonical value
+        # such as '029' instead, so a run that would key on the wrong
+        # group never starts. '0' is a bulk sweep and '' is unset, so
+        # both fall through to the event name rather than collapsing
+        # every run into one group.
         assert "inputs.PR_NUMBER != '0'" in group
         assert "inputs.PR_NUMBER != ''" in group
 
@@ -326,6 +361,15 @@ class TestReusableWorkflowConcurrency:
         # admitted here can evict a re-check that somebody asked for.
         condition = self._job(reusable_workflow)["if"]
         assert "github.event.comment.body" in condition
+
+    def test_comments_on_closed_pull_requests_are_not_admitted(
+        self, reusable_workflow
+    ):
+        # A closed pull request has no gate left to lift, so a run
+        # there could only fail. Any commenter could otherwise put a
+        # failing check on it at will.
+        condition = self._job(reusable_workflow)["if"]
+        assert "github.event.issue.state == 'open'" in condition
 
     def test_every_open_command_phrase_is_admitted(self, reusable_workflow):
         # The condition names the command phrases rather than the bare

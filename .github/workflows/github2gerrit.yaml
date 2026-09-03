@@ -284,9 +284,11 @@ jobs:
     # events from the caller (manual PR processing or Gerrit-event
     # dispatches)
     #
-    # issue_comment fires for issues as well as pull requests, so the
-    # issue payload must carry a pull_request member. Admitting a bare
-    # issue.number would treat a comment on issue N as pull request N.
+    # issue_comment fires for issues, for open pull requests and for
+    # closed ones. The issue payload must carry a pull_request member
+    # and still be open: admitting a bare issue.number would treat a
+    # comment on issue N as pull request N, and a closed pull request
+    # has no gate left to lift, so a run there could only fail.
     #
     # The directive is matched here, not merely in the CLI, because
     # admitting a comment costs a slot in the per-PR concurrency group
@@ -304,7 +306,7 @@ jobs:
     # tests/test_action_step_validation.py, which requires every phrase
     # of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.number || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && (contains(github.event.comment.body, '@github2gerrit check') || contains(github.event.comment.body, '@github2gerrit recheck') || contains(github.event.comment.body, '@github2gerrit retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -323,9 +325,16 @@ jobs:
     # one route must share one group, or two runs could transfer the
     # same commit concurrently and leave two Gerrit changes.
     #
-    # PR_NUMBER is '0' for a bulk sweep and '' when unset, neither of
-    # which names a pull request, so both fall through to the event
-    # name rather than collapsing every run into one group.
+    # The dispatch operand is the raw string, so a non-canonical value
+    # such as '029' would key on '029' while naming pull request 29.
+    # GitHub expressions have no arithmetic to normalise it, so the
+    # action rejects such values outright instead: see the PR_NUMBER
+    # normalisation step, whose pattern admits only canonical numbers.
+    # A run that cannot start cannot race.
+    #
+    # '0' is a bulk sweep and '' is unset, neither of which names a
+    # pull request, so both fall through to the event name rather than
+    # collapsing every run into one group.
     concurrency:
       # yamllint disable-line rule:line-length
       group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || ((inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0') && inputs.PR_NUMBER) || github.event_name }}

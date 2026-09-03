@@ -296,7 +296,7 @@ class TestPRNumberHandling:
         )
 
         assert result.returncode == 2
-        assert "must be a numeric value" in result.stdout
+        assert "numeric value" in result.stdout
 
     def test_non_dispatch_rejects_explicit_pr_number(
         self, action_tester, default_inputs, default_github_context

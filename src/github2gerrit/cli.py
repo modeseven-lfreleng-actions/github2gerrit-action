@@ -344,10 +344,16 @@ def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
 def _triggering_comment_body(gh: GitHubContext) -> str:
     """Return the body of the comment that triggered this run.
 
-    Empty when the payload carries no comment, or when the comment is
-    on an ordinary issue rather than a pull request. ``issue_comment``
-    fires for both, and the ``issue`` object carries a
-    ``pull_request`` member only in the latter case.
+    Empty when the payload carries no comment, when the comment is on
+    an ordinary issue rather than a pull request, or when that pull
+    request is closed.
+
+    ``issue_comment`` fires for all three. The ``issue`` object carries
+    a ``pull_request`` member only for a pull request, and its
+    ``state`` distinguishes one still open. A closed pull request has
+    no gate left to lift, and letting the run continue would reach
+    ``_exit_for_pr_state_error`` and put a failing check on the pull
+    request — which any commenter could then do at will.
 
     Checked here rather than left to the workflow: the reusable
     workflow guards its job condition, but a composite-action caller
@@ -357,9 +363,14 @@ def _triggering_comment_body(gh: GitHubContext) -> str:
     evt = _load_event(gh.event_path)
 
     issue = evt.get("issue")
-    if isinstance(issue, dict) and not issue.get("pull_request"):
-        log.debug("Comment is on an issue rather than a pull request")
-        return ""
+    if isinstance(issue, dict):
+        if not issue.get("pull_request"):
+            log.debug("Comment is on an issue rather than a pull request")
+            return ""
+        state = str(issue.get("state", "") or "").strip().lower()
+        if state and state != "open":
+            log.debug("Comment is on a %s pull request; nothing to do", state)
+            return ""
 
     comment = evt.get("comment")
     if isinstance(comment, dict):

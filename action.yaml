@@ -315,8 +315,8 @@ runs:
         if [[ -z "${pr_in}" || "${pr_in}" == "null" ]]; then
           pr_in="0"
         fi
-        if ! [[ "${pr_in}" =~ ^[0-9]+$ ]]; then
-          echo "Error: PR_NUMBER must be a numeric value"
+        if ! [[ "${pr_in}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+          echo "Error: PR_NUMBER must be a canonical numeric value (no leading zeros)"
           exit 2
         fi
         if [[ "${pr_in}" == "0" ]]; then

@@ -691,6 +691,7 @@ class TestCommentDoorbell:
                 {
                     "issue": {
                         "number": 29,
+                        "state": "open",
                         "pull_request": {"url": "https://api/pulls/29"},
                     },
                     "comment": {"body": "@github2gerrit check"},
@@ -702,6 +703,32 @@ class TestCommentDoorbell:
             _ctx(event_name="issue_comment"), event_path=payload
         )
         assert _skip_unrequested_comment_run(ctx) is False
+
+    @pytest.mark.parametrize("state", ["closed", "CLOSED"])
+    def test_comment_on_a_closed_pull_request_is_skipped(
+        self, tmp_path: Path, state: str
+    ) -> None:
+        # A closed pull request has no gate left to lift. Continuing
+        # would reach _exit_for_pr_state_error and put a failing check
+        # on it, which any commenter could then do at will.
+        payload = tmp_path / "event.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "issue": {
+                        "number": 29,
+                        "state": state,
+                        "pull_request": {"url": "https://api/pulls/29"},
+                    },
+                    "comment": {"body": "@github2gerrit check"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        ctx = dataclasses.replace(
+            _ctx(event_name="issue_comment"), event_path=payload
+        )
+        assert _skip_unrequested_comment_run(ctx) is True
 
     @pytest.mark.parametrize(
         "event_name",
