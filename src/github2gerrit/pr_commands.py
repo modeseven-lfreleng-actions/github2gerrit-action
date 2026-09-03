@@ -475,9 +475,10 @@ def _match_command(
 
     The prefix must end on a word boundary.  A bare string prefix would
     make every longer word starting with a command name a match, so
-    ``check`` would answer for ``checkout this branch`` and ``checker``.
-    That matters more than it used to: the one-word commands are short,
-    common English stems, and one of them starts the transfer pipeline.
+    ``check`` would answer for ``checkout this branch``, ``checker`` and
+    ``check_status``.  That matters more than it used to: the one-word
+    commands are short, common English stems, and one of them starts
+    the transfer pipeline.
 
     Returns:
         The canonical command name on match, or ``None``.
@@ -493,9 +494,11 @@ def _match_command(
         if not normalised.startswith(phrase) or len(phrase) <= best_length:
             continue
         # The character ending the phrase must not continue a word.
-        # Punctuation and whitespace both end one; a letter or digit
-        # means the text merely happens to begin with the same stem.
-        if normalised[len(phrase)].isalnum():
+        # Punctuation and whitespace both end one; a letter, digit or
+        # underscore means the text merely begins with the same stem.
+        # ``str.isalnum`` omits the underscore, so name it explicitly.
+        following = normalised[len(phrase)]
+        if following.isalnum() or following == "_":
             continue
         best_match = canonical
         best_length = len(phrase)

@@ -81,6 +81,7 @@ from .netrc import NetrcParseError
 from .netrc import get_credentials_for_host
 from .pr_approval import APPROVAL_MARKER
 from .pr_approval import ApprovalStatus
+from .pr_approval import describe_approver_policy
 from .pr_approval import evaluate_fork_approval
 from .pr_approval import render_blocked_comment
 from .pr_approval import render_cleared_comment
@@ -94,7 +95,6 @@ from .rich_display import display_pr_info
 from .rich_display import safe_console_print
 from .rich_display import safe_typer_echo
 from .rich_logging import setup_rich_aware_logging
-from .trust import describe_trust_policy
 from .utils import append_github_output
 from .utils import env_bool
 from .utils import env_str
@@ -309,11 +309,12 @@ def _skip_unprivileged_fork_run(data: Inputs, gh: GitHubContext) -> bool:
         return False
     if data.gerrit_ssh_privkey_g2g:
         return False
-    if env_bool("G2G_NO_GERRIT", False):
-        # A keyless mode by design: it runs the whole pipeline and
-        # turns the Gerrit network operations into no-ops. The absent
-        # key is the point, not a symptom, so reading it as one would
-        # stop the very exercise the mode exists for.
+    if env_bool("G2G_NO_GERRIT", False) or data.dry_run:
+        # Both are keyless by design. G2G_NO_GERRIT turns the Gerrit
+        # network operations into no-ops, and a dry run returns from
+        # ``Orchestrator.execute`` before SSH setup. The absent key is
+        # the point in each case, not a symptom, so reading it as one
+        # would stop the very exercise the mode exists for.
         return False
     if gh.event_name not in _FORK_UNPRIVILEGED_EVENTS:
         return False
@@ -532,7 +533,7 @@ def _check_fork_approval(
         "Reviews count from: %s",
         gh.pr_number,
         status.reason,
-        describe_trust_policy(),
+        describe_approver_policy(),
     )
     safe_console_print(
         f"🛑 Awaiting maintainer approval: {status.reason}",

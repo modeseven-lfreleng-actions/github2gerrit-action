@@ -743,7 +743,9 @@ class TestOpenCommandRefusesPrivilegedCommands:
         [
             "@github2gerrit checkout this branch",
             "@github2gerrit checker",
+            "@github2gerrit check_status",
             "@github2gerrit rechecking the logs",
+            "@github2gerrit retry_later",
             "@github2gerrit retryable",
         ],
     )

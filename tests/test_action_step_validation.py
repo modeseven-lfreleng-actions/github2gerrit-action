@@ -131,6 +131,8 @@ class TestReusableWorkflowForwardsItsInputs:
 
     ACTION_STEP = "Run github2gerrit composite action"
 
+    _INPUT_REFERENCE = re.compile(r"inputs\.([A-Za-z_][A-Za-z0-9_]*)")
+
     @staticmethod
     def _workflow_call(reusable_workflow):
         # YAML 1.1 resolves a bare `on:` key to the boolean True, so
@@ -146,19 +148,25 @@ class TestReusableWorkflowForwardsItsInputs:
             if step.get("name") == self.ACTION_STEP
         )
 
+    def _forwarded_names(self, reusable_workflow) -> set[str]:
+        """Return the input names the action step actually references.
+
+        Whole names, extracted by pattern, rather than a substring
+        test: `"inputs.GERRIT_SERVER" in text` is satisfied by a
+        forwarded `inputs.GERRIT_SERVER_PORT`, so dropping the shorter
+        mapping would go unnoticed. This interface has two such pairs.
+        """
+        step = self._action_step(reusable_workflow)
+        text = "\n".join(
+            [*step.get("with", {}).values(), *step.get("env", {}).values()]
+        )
+        return set(self._INPUT_REFERENCE.findall(text))
+
     def test_every_input_is_forwarded(self, reusable_workflow):
         declared = set(self._workflow_call(reusable_workflow)["inputs"])
-        step = self._action_step(reusable_workflow)
-        forwarded = "\n".join(
-            [
-                *step.get("with", {}).values(),
-                *step.get("env", {}).values(),
-            ]
-        )
+        forwarded = self._forwarded_names(reusable_workflow)
 
-        missing = sorted(
-            name for name in declared if f"inputs.{name}" not in forwarded
-        )
+        missing = sorted(declared - forwarded)
         assert not missing, (
             f"the reusable workflow declares {missing} but never passes "
             f"them to the action, so a caller setting them silently gets "

@@ -43,6 +43,7 @@ from .trust import is_trusted_association
 __all__ = [
     "APPROVAL_MARKER",
     "ApprovalStatus",
+    "describe_approver_policy",
     "evaluate_fork_approval",
     "render_blocked_comment",
     "render_cleared_comment",
@@ -306,18 +307,22 @@ def render_blocked_comment(
         "GitHub withholds this repository's credentials from runs "
         "triggered by a review on a pull request from a fork.",
         "",
-        f"Reviews count from: {_describe_approver_policy()}. The pull "
+        f"Reviews count from: {describe_approver_policy()}. The pull "
         "request author cannot approve their own pull request.",
     ]
 
     return "\n".join(lines)
 
 
-def _describe_approver_policy() -> str:
+def describe_approver_policy() -> str:
     """Describe who may approve, including any opt-in source.
 
-    The extra clause appears only when a project enabled one, so a
-    contributor is never told about machinery that is not in use.
+    Shared by the rendered notice and the blocking log line, so a
+    project that has widened its approver set is not told in either
+    place that only associations count.
+
+    The extra clause appears only when a project enabled a source, so
+    nobody is told about machinery that is not in use.
     """
     policy = describe_trust_policy()
     extra = describe_additional_sources()

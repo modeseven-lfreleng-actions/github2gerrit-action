@@ -299,16 +299,20 @@ jobs:
     # dispatches) queue per event type. Queue rather than cancel so an
     # in-flight push to Gerrit is never interrupted.
     #
-    # Comment payloads carry github.event.issue, not
-    # github.event.pull_request, so both shapes must be consulted.
-    # Without the second operand every comment-triggered run in the
-    # repository shares one group: GitHub keeps at most one running
-    # and one pending run per group and discards the rest, so a
-    # comment on one pull request would silently drop the queued run
-    # for another.
+    # Three operands, because a pull request reaches this job through
+    # three payload shapes. Comment payloads carry github.event.issue
+    # rather than github.event.pull_request, and a single-PR
+    # workflow_dispatch carries neither: it names its target in
+    # inputs.PR_NUMBER. Any pull request able to arrive by more than
+    # one route must share one group, or two runs could transfer the
+    # same commit concurrently and leave two Gerrit changes.
+    #
+    # PR_NUMBER is '0' for a bulk sweep and '' when unset, neither of
+    # which names a pull request, so both fall through to the event
+    # name rather than collapsing every run into one group.
     concurrency:
       # yamllint disable-line rule:line-length
-      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.event_name }}
+      group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || ((inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0') && inputs.PR_NUMBER) || github.event_name }}
       cancel-in-progress: false
     outputs:
       # yamllint disable rule:line-length

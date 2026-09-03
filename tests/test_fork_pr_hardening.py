@@ -68,14 +68,17 @@ def _gh_ctx(
     )
 
 
-def _inputs(*, privkey: str = "") -> Inputs:
-    """A stand-in carrying only the field the skip decision reads.
+def _inputs(*, privkey: str = "", dry_run: bool = False) -> Inputs:
+    """A stand-in carrying only the fields the skip decision reads.
 
     ``Inputs`` has some thirty required fields; supplying all of them
     here would suggest the rest matter to this decision, which they do
     not. The cast records the partiality deliberately.
     """
-    return cast(Inputs, SimpleNamespace(gerrit_ssh_privkey_g2g=privkey))
+    return cast(
+        Inputs,
+        SimpleNamespace(gerrit_ssh_privkey_g2g=privkey, dry_run=dry_run),
+    )
 
 
 class TestIsForkPr:
@@ -168,6 +171,12 @@ class TestSkipUnprivilegedForkRun:
         monkeypatch.setenv("G2G_NO_GERRIT", "true")
         ctx = _gh_ctx(head_repo=FORK_REPO, event_name="pull_request")
         assert _skip_unprivileged_fork_run(_inputs(), ctx) is False
+
+    def test_dry_run_still_runs(self) -> None:
+        # A dry run returns from Orchestrator.execute before SSH setup,
+        # so it is keyless for the same reason.
+        ctx = _gh_ctx(head_repo=FORK_REPO, event_name="pull_request")
+        assert _skip_unprivileged_fork_run(_inputs(dry_run=True), ctx) is False
 
 
 class TestHeadIsTrusted:
