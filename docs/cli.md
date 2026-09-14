@@ -160,14 +160,19 @@ Some settings have no CLI flag and use environment variables.
 When running the tool as a GitHub Action, how you set one depends on the
 integration:
 
-- **Reusable workflow** — the workflow forwards exactly these seven names from
-  repository or organisation **variables**:
+- **Reusable workflow** — the workflow reads these nine names from repository
+  or organisation **variables**:
   `G2G_TRUSTED_ASSOCIATIONS`, `G2G_TOPIC_PREFIX`, `G2G_SKIP_GERRIT_COMMENTS`,
-  `G2G_ENABLE_DERIVATION`, `G2G_ANON_SUPERSEDE_FALLBACK`, `G2G_SHOW_PROGRESS`
-  and `G2G_LOG_LEVEL`. Anything else in this table needs a workflow input
-  (see the README's interface table), because environment variables do not
-  cross a `workflow_call` boundary and `env:` in the caller is silently
-  ignored.
+  `G2G_ENABLE_DERIVATION`, `G2G_ANON_SUPERSEDE_FALLBACK`, `G2G_SHOW_PROGRESS`,
+  `G2G_LOG_LEVEL`, `G2G_NO_GERRIT` and `G2G_DISABLED`.
+
+  The last two are also workflow *inputs*: `G2G_NO_GERRIT` takes the input
+  first and falls back to the variable, and `G2G_DISABLED` is variable-only.
+  Both act as operational kill switches, which is why they predate the rest.
+
+  Anything else in this table needs a workflow input (see the README's
+  interface table), because environment variables do not cross a
+  `workflow_call` boundary and `env:` in the caller is silently ignored.
 - **Composite action** — set any of them with `env:` on the job or step.
   Repository variables are *not* inherited automatically here; map them
   yourself with `${{ vars.NAME }}` if that is where you keep them.

@@ -116,6 +116,15 @@ class TestReusableWorkflowCheckoutOrder:
         assert "pull_request" not in str(seed.get("with", {}).get("ref", ""))
 
 
+# Whole-identifier matchers for workflow expression references. A
+# substring test is not good enough for either: `inputs.GERRIT_SERVER`
+# is a prefix of `inputs.GERRIT_SERVER_PORT`, and `vars.G2G_LOG_LEVEL`
+# of `vars.G2G_LOG_LEVEL_SUFFIX`, so a typo or a swapped mapping would
+# satisfy a naive check while the intended setting never arrives.
+_INPUT_REFERENCE = re.compile(r"inputs\.([A-Za-z_][A-Za-z0-9_]*)")
+_VARS_REFERENCE = re.compile(r"vars\.([A-Za-z_][A-Za-z0-9_]*)")
+
+
 # Recognised settings a consumer cannot supply through the reusable
 # workflow, each with the reason it is deliberately out of reach. See
 # TestEveryKnownSettingIsReachable for what this list holds to account.
@@ -200,14 +209,16 @@ class TestEveryKnownSettingIsReachable:
         # input, `env` is inherited by the composite action's steps.
         #
         # The referenced variable has to carry the destination's own
-        # name. Accepting any `vars.` reference would let a swapped
-        # mapping such as `G2G_TOPIC_PREFIX: ${{ vars.G2G_LOG_LEVEL }}`
-        # satisfy the invariant while neither setting arrives.
+        # name, compared as a whole identifier. Accepting any `vars.`
+        # reference would let a swapped mapping such as
+        # `G2G_TOPIC_PREFIX: ${{ vars.G2G_LOG_LEVEL }}` satisfy the
+        # invariant, and a substring test would accept a typo such as
+        # `vars.G2G_LOG_LEVEL_SUFFIX` for `G2G_LOG_LEVEL`.
         forwarded = {
             name
             for block in (step.get("with", {}), step.get("env", {}))
             for name, value in block.items()
-            if f"vars.{name}" in str(value)
+            if name in _VARS_REFERENCE.findall(str(value))
         }
         return declared | forwarded
 
@@ -254,8 +265,6 @@ class TestReusableWorkflowForwardsItsInputs:
 
     ACTION_STEP = "Run github2gerrit composite action"
 
-    _INPUT_REFERENCE = re.compile(r"inputs\.([A-Za-z_][A-Za-z0-9_]*)")
-
     @staticmethod
     def _workflow_call(reusable_workflow):
         # YAML 1.1 resolves a bare `on:` key to the boolean True, so
@@ -283,7 +292,7 @@ class TestReusableWorkflowForwardsItsInputs:
         text = "\n".join(
             [*step.get("with", {}).values(), *step.get("env", {}).values()]
         )
-        return set(self._INPUT_REFERENCE.findall(text))
+        return set(_INPUT_REFERENCE.findall(text))
 
     def test_every_input_is_forwarded(self, reusable_workflow):
         declared = set(self._workflow_call(reusable_workflow)["inputs"])

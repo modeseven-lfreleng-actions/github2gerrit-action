@@ -279,14 +279,14 @@ environment variables do not cross the `workflow_call` boundary. See
 [docs/cli.md](docs/cli.md) for the full option reference and
 [docs/features.md](docs/features.md) for feature-specific settings.
 
-Seven `G2G_`-prefixed settings have no input of their own — among them
-`G2G_TRUSTED_ASSOCIATIONS`, `G2G_TOPIC_PREFIX` and
-`G2G_ENABLE_DERIVATION`. The reusable workflow forwards these from
-repository or organisation **variables**, so an organisation can set
-one once for every repository beneath it. A workflow calling the
-composite action directly does not inherit those variables; map them
-in with `env:` yourself. See [docs/cli.md](docs/cli.md) for the full
-list.
+Nine `G2G_`-prefixed settings can come from repository or organisation
+**variables**, which the reusable workflow reads and passes to the
+action — among them `G2G_TRUSTED_ASSOCIATIONS`, `G2G_TOPIC_PREFIX`
+and `G2G_ENABLE_DERIVATION`, plus the `G2G_NO_GERRIT` and
+`G2G_DISABLED` kill switches. An organisation can set one once for
+every repository beneath it. A workflow calling the composite action
+directly does not inherit those variables; map them in with `env:`
+yourself. See [docs/cli.md](docs/cli.md) for the full list.
 
 The three `G2G_APPROVER*` inputs widen who may clear the fork approval
 gate, and each defaults to off. `G2G_INFO_YAML_MATCH_LFID` carries a
