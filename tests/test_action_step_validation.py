@@ -281,18 +281,24 @@ class TestReusableWorkflowForwardsItsInputs:
         )
 
     def _forwarded_names(self, reusable_workflow) -> set[str]:
-        """Return the input names the action step actually references.
+        """Return the inputs the action step passes to their own name.
 
-        Whole names, extracted by pattern, rather than a substring
-        test: `"inputs.GERRIT_SERVER" in text` is satisfied by a
-        forwarded `inputs.GERRIT_SERVER_PORT`, so dropping the shorter
-        mapping would go unnoticed. This interface has two such pairs.
+        The destination key has to match the input it references, not
+        merely be present somewhere in the block. Collecting referenced
+        names alone cannot see a swap: mapping `GERRIT_SERVER` from
+        `inputs.GERRIT_SERVER_PORT` and back again leaves both names in
+        the set while neither setting reaches its destination.
+
+        Whole identifiers, for the same reason the pattern exists:
+        `inputs.GERRIT_SERVER` is a prefix of `inputs.GERRIT_SERVER_PORT`.
         """
         step = self._action_step(reusable_workflow)
-        text = "\n".join(
-            [*step.get("with", {}).values(), *step.get("env", {}).values()]
-        )
-        return set(_INPUT_REFERENCE.findall(text))
+        return {
+            name
+            for block in (step.get("with", {}), step.get("env", {}))
+            for name, value in block.items()
+            if name in _INPUT_REFERENCE.findall(str(value))
+        }
 
     def test_every_input_is_forwarded(self, reusable_workflow):
         declared = set(self._workflow_call(reusable_workflow)["inputs"])

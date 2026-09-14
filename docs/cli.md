@@ -166,9 +166,10 @@ integration:
   `G2G_ENABLE_DERIVATION`, `G2G_ANON_SUPERSEDE_FALLBACK`, `G2G_SHOW_PROGRESS`,
   `G2G_LOG_LEVEL`, `G2G_NO_GERRIT` and `G2G_DISABLED`.
 
-  The last two are also workflow *inputs*: `G2G_NO_GERRIT` takes the input
-  first and falls back to the variable, and `G2G_DISABLED` is variable-only.
-  Both act as operational kill switches, which is why they predate the rest.
+  The last two predate the rest and behave differently: `G2G_NO_GERRIT` is
+  also a workflow input, taking the input first and falling back to the
+  variable, while `G2G_DISABLED` has no input and reads the variable only.
+  Both act as operational kill switches.
 
   Anything else in this table needs a workflow input (see the README's
   interface table), because environment variables do not cross a
