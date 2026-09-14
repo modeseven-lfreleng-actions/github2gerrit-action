@@ -9,6 +9,7 @@ integration between action steps.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import subprocess
@@ -247,19 +248,27 @@ class TestEveryKnownSettingIsReachable:
         workflow_inputs = set(triggers["workflow_call"]["inputs"])
         step = self._step(reusable_workflow, "jobs", self.ACTION_STEP)
 
-        def supplied(value: str) -> bool:
-            """Can a consumer decide this expression's value?"""
-            refs = set(_INPUT_REFERENCE.findall(value))
-            return bool(refs & workflow_inputs) or bool(
-                _VARS_REFERENCE.findall(value)
+        def supplied(name: str, value: str) -> bool:
+            """Can a consumer decide *name* through this expression?
+
+            The reference has to carry the destination's own name.
+            Accepting any input or variable would let a swap such as
+            ``G2G_TOPIC_PREFIX: ${{ vars.G2G_LOG_LEVEL }}`` mark both
+            reachable while neither arrives — the silent misrouting
+            this invariant exists to catch.
+            """
+            from_input = (
+                name in workflow_inputs
+                and name in _INPUT_REFERENCE.findall(value)
             )
+            return from_input or name in _VARS_REFERENCE.findall(value)
 
         # Set straight into the composite action's environment, which
         # its steps inherit.
         reachable = {
             variable
             for variable, value in step.get("env", {}).items()
-            if supplied(str(value))
+            if supplied(variable, str(value))
         }
 
         # Or passed as an action input. It has to be one action.yaml
@@ -270,7 +279,7 @@ class TestEveryKnownSettingIsReachable:
         supplied_inputs = {
             name
             for name, value in step.get("with", {}).items()
-            if supplied(str(value))
+            if supplied(name, str(value))
         } & set(action_config["inputs"])
         reachable |= supplied_inputs
 
@@ -331,6 +340,23 @@ class TestEveryKnownSettingIsReachable:
         assert "G2G_TRUSTED_ASSOCIATIONS" in self._reachable(
             reusable_workflow, action_config
         )
+
+    def test_a_swapped_variable_mapping_is_not_reachable(
+        self, reusable_workflow, action_config
+    ):
+        # The failure this invariant is for. Exchanging two values
+        # leaves both destination keys present and both variables
+        # referenced, so anything short of a same-name check calls the
+        # interface healthy while neither setting arrives.
+        step = self._step(reusable_workflow, "jobs", self.ACTION_STEP)
+        swapped = copy.deepcopy(reusable_workflow)
+        swapped_step = self._step(swapped, "jobs", self.ACTION_STEP)
+        swapped_step["env"]["G2G_TOPIC_PREFIX"] = step["env"]["G2G_LOG_LEVEL"]
+        swapped_step["env"]["G2G_LOG_LEVEL"] = step["env"]["G2G_TOPIC_PREFIX"]
+
+        reachable = self._reachable(swapped, action_config)
+        assert "G2G_TOPIC_PREFIX" not in reachable
+        assert "G2G_LOG_LEVEL" not in reachable
 
     def test_an_undeclared_action_input_is_not_reachable(
         self, reusable_workflow, action_config
