@@ -3173,12 +3173,13 @@ class Orchestrator:
         """Resolve Gerrit connection info from .gitreview or inputs.
 
         The project is *repo*'s, settled by :meth:`_derive_repo_names`;
-        only the host and port are resolved here. An explicit
-        ``GERRIT_SERVER`` outranks ``.gitreview``, as an explicit
-        ``GERRIT_PROJECT`` does; otherwise the file's host and port
-        apply when there is a file, and the inputs' otherwise. A guessed
-        project is refused for any run that pushes, whichever supplied
-        the host.
+        only the host and port are resolved here, each by the same rule
+        as the project: an explicit input outranks ``.gitreview``, and
+        ``.gitreview`` outranks a derived input. A port is explicit when
+        it was set at all -- the action and the CLI pass none rather
+        than 29418 when the caller gave none -- and not recorded as
+        derived. 29418 is the final fallback. A guessed project is
+        refused for any run that pushes, whichever supplied the host.
 
         After resolution, the Gerrit host is validated via DNS to
         catch bogus hostnames early — regardless of whether the host
@@ -3216,19 +3217,32 @@ class Orchestrator:
         explicit_host = _explicit_input(
             inputs, "GERRIT_SERVER", inputs.gerrit_server
         )
+        explicit_port = _explicit_input(
+            inputs,
+            "GERRIT_SERVER_PORT",
+            str(inputs.gerrit_server_port or ""),
+        )
         if gitreview and explicit_host is None:
             log.debug("Using .gitreview settings: %s", gitreview)
             self._validate_resolved_gerrit_host(gitreview.host)
-            if gitreview.project == project:
+            port = int(explicit_port) if explicit_port else gitreview.port
+            if explicit_port and port != gitreview.port:
+                log.info(
+                    "Using Gerrit port %d over .gitreview's %d: an explicit "
+                    "GERRIT_SERVER_PORT outranks the file",
+                    port,
+                    gitreview.port,
+                )
+            if gitreview.project == project and port == gitreview.port:
                 return gitreview
-            if gitreview.project.strip():
+            if gitreview.project.strip() and gitreview.project != project:
                 log.info(
                     "Using Gerrit project %r over .gitreview's %r: an "
                     "explicit GERRIT_PROJECT outranks the file",
                     project,
                     gitreview.project,
                 )
-            return dataclass_replace(gitreview, project=project)
+            return dataclass_replace(gitreview, project=project, port=port)
 
         host = inputs.gerrit_server.strip()
         if not host:
@@ -3240,12 +3254,11 @@ class Orchestrator:
                 host,
                 gitreview.host,
             )
-        port_s = str(inputs.gerrit_server_port).strip() or "29418"
-        try:
-            port = int(port_s)
-        except ValueError as exc:
-            msg = "bad GERRIT_SERVER_PORT"
-            raise OrchestratorError(msg) from exc
+        # An explicit or derived port applies; with neither, the file's
+        # if there is one, else the Gerrit default.
+        port = inputs.gerrit_server_port or (
+            gitreview.port if gitreview else 29418
+        )
 
         info = make_gitreview_info(host=host, port=port, project=project)
         log.debug("Resolved Gerrit info: %s", info)

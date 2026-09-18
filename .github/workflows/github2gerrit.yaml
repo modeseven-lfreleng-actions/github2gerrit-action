@@ -156,9 +156,9 @@ on:
         default: ""
         type: string
       GERRIT_SERVER_PORT:
-        description: "Gerrit port. (Default: 29418)"
+        description: "Gerrit SSH port; .gitreview's when unset, else 29418"
         required: false
-        default: "29418"
+        default: ""
         type: string
       GERRIT_PROJECT:
         description: "Gerrit project name. ex: releng/builder"

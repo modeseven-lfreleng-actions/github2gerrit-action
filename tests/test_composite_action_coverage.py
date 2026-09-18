@@ -166,7 +166,7 @@ def default_inputs():
         "DUPLICATE_TYPES": "open",
         "NORMALISE_COMMIT": "false",
         "GERRIT_SERVER": "",
-        "GERRIT_SERVER_PORT": "29418",
+        "GERRIT_SERVER_PORT": "",
         "GERRIT_PROJECT": "",
         "GERRIT_HTTP_BASE_PATH": "",
         "GERRIT_HTTP_USER": "",
@@ -211,7 +211,7 @@ class TestInputValidation:
         assert inputs["SUBMIT_SINGLE_COMMITS"]["default"] == "false"
         assert inputs["FETCH_DEPTH"]["default"] == "10"
         assert inputs["PR_NUMBER"]["default"] == "0"
-        assert inputs["GERRIT_SERVER_PORT"]["default"] == "29418"
+        assert inputs["GERRIT_SERVER_PORT"]["default"] == ""
         assert inputs["G2G_USE_SSH_AGENT"]["default"] == "true"
 
     def test_boolean_input_values(self, action_tester):

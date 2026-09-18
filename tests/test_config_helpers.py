@@ -1467,6 +1467,78 @@ def test_config_file_server_survives_without_gitreview(
 
 @patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_gitreview_port_is_exported_with_the_host(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The port belongs to the host and is exported alongside it (#448).
+
+    The closed-pull-request handler abandons over SSH on whatever port
+    the environment holds, before the orchestrator has resolved
+    anything. Exporting the file's host without its port sent it to
+    29418 of a server listening on 29420. The action passes a blank
+    port when the caller gave none, so the export lands.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29420, project="multicloud/openstack"
+    )
+    monkeypatch.setenv("GERRIT_SERVER", "")
+    monkeypatch.setenv("GERRIT_SERVER_PORT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_SERVER_PORT": "29418"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_SERVER"] == "gerrit.onap.org"
+    # The per-organization file's port is displaced with the host.
+    assert os.environ["GERRIT_SERVER_PORT"] == "29420"
+    assert is_derived_key("GERRIT_SERVER_PORT")
+
+    # An explicit port is untouched.
+    monkeypatch.setenv("GERRIT_SERVER_PORT", "2222")
+    result = apply_parameter_derivation(
+        {}, "onap", repository="onap/multicloud-openstack", save_to_config=False
+    )
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_SERVER_PORT"] == "2222"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_no_port_is_exported_without_a_gitreview_host(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing to derive it from; the Gerrit default applies downstream.
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    assert "GERRIT_SERVER_PORT" not in derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+    # An explicit server takes the host tier, so the file's port is not
+    # the host's port and is not exported either.
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29420, project="multicloud/openstack"
+    )
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.explicit.example")
+    assert "GERRIT_SERVER_PORT" not in derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_config_file_server_is_recorded_as_derived(
     mock_derive_creds,
     mock_gitreview,

@@ -423,10 +423,13 @@ class DerivedParameters:
             one somebody wrote in a configuration file, and a *guess* is
             worth exporting for queries but must stay labelled so the
             push refuses it.
-        host_from_gitreview: ``True`` when ``GERRIT_SERVER`` in *values*
-            is the ``.gitreview`` host.  That host travels with the
-            project as one target and, like a confirmed project, may
-            displace a per-organization configuration value.
+        host_from_gitreview: ``True`` when ``GERRIT_SERVER`` and
+            ``GERRIT_SERVER_PORT`` in *values* are the ``.gitreview``
+            host and port.  They travel with the project as one target
+            and, like a confirmed project, may displace per-organization
+            configuration values.  The port is exported only in this
+            case: without a file there is nothing to derive it from, and
+            the Gerrit default applies downstream.
     """
 
     values: dict[str, str] = field(default_factory=dict)
@@ -635,6 +638,12 @@ def derive_gerrit_parameters_detailed(
         or f"releng+{org}-gh2gerrit@linuxfoundation.org",
         "GERRIT_SERVER": gerrit_host,
     }
+    if host_from_gitreview and gitreview is not None:
+        # The port belongs to the host. The closed-pull-request handler
+        # abandons over SSH on whatever port the environment holds, and
+        # exporting the file's host without its port would have it
+        # knock on 29418 of a server listening elsewhere.
+        result["GERRIT_SERVER_PORT"] = str(gitreview.port)
     if gerrit_project:
         result["GERRIT_PROJECT"] = gerrit_project
     return DerivedParameters(
@@ -642,6 +651,73 @@ def derive_gerrit_parameters_detailed(
         project_source=project_source,
         host_from_gitreview=host_from_gitreview,
     )
+
+
+def _merge_derived(
+    cfg: dict[str, str],
+    derived: DerivedParameters,
+    *,
+    organization: str,
+    repository: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fill *cfg*'s missing keys from *derived*, displacing the target.
+
+    Only missing or empty keys are filled -- with one exception, for the
+    Gerrit target.  A ``GERRIT_PROJECT`` that *cfg* carries from the
+    configuration file is a per-organization fallback, and a project
+    derived for this repository from its own ``.gitreview``, or
+    confirmed against Gerrit, outranks it: the CLOSE dispatch consumes
+    the resulting inputs before the orchestrator runs and never
+    consults provenance, so leaving the file's value in place would
+    keep cleanup on the wrong project despite the read.  The
+    ``.gitreview`` host and port displace the file's ``GERRIT_SERVER``
+    and ``GERRIT_SERVER_PORT`` for the same reason: the three are
+    queried together, and the pipeline pushes to the ``.gitreview``
+    target, so they have to come from one place.  Nothing inferred from
+    the name alone displaces a project, whether a guess or the one
+    reading of a hyphen-free name; the file's value was at least written
+    down by somebody.  An explicit environment value is untouched either
+    way, since :func:`apply_config_to_env` never overwrites one.
+
+    Returns the merged mapping and the keys derivation supplied.
+    """
+    result = dict(cfg)
+    newly_derived: dict[str, str] = {}
+
+    def _env_blank(key: str) -> bool:
+        return (os.getenv(key) or "").strip() == ""
+
+    replaceable = {
+        key
+        for key, confirmed in (
+            ("GERRIT_PROJECT", derived.project_confirmed),
+            ("GERRIT_SERVER", derived.host_from_gitreview),
+            ("GERRIT_SERVER_PORT", derived.host_from_gitreview),
+        )
+        if confirmed and cfg.get(key, "").strip() and _env_blank(key)
+    }
+
+    for key, value in derived.values.items():
+        replacing = key in replaceable
+        if key not in result or not result[key].strip() or replacing:
+            if replacing:
+                log.debug(
+                    "Replacing configuration-file %s %r with %r resolved "
+                    "for repository %s",
+                    key,
+                    result[key],
+                    value,
+                    repository,
+                )
+            log.debug(
+                "Deriving %s from organization '%s': %s",
+                key,
+                organization,
+                value,
+            )
+            result[key] = value
+            newly_derived[key] = value
+    return result, newly_derived
 
 
 def apply_parameter_derivation(
@@ -690,10 +766,11 @@ def apply_parameter_derivation(
     # by releases before such writes stopped, and hand-written ones,
     # which are equally misscoped. Marking it derived keeps it usable as
     # a last resort while letting the per-pull-request .gitreview
-    # outrank it. A GERRIT_SERVER from the file is marked the same way:
-    # it is a sensible per-organization default, but an explicit server
-    # now outranks .gitreview at the push, and a default must not carry
-    # that authority. Only a value the operator set for this run does.
+    # outrank it. A GERRIT_SERVER, and a GERRIT_SERVER_PORT, from the
+    # file are marked the same way: sensible per-organization defaults,
+    # but an explicit server or port now outranks .gitreview at the
+    # push, and a default must not carry that authority. Only a value
+    # the operator set for this run does.
     #
     # Recorded ahead of the early returns below, because this describes
     # what cfg already carries rather than anything derivation adds.
@@ -703,7 +780,7 @@ def apply_parameter_derivation(
     if mark_derived:
         mark_derived_keys(
             key
-            for key in ("GERRIT_PROJECT", "GERRIT_SERVER")
+            for key in ("GERRIT_PROJECT", "GERRIT_SERVER", "GERRIT_SERVER_PORT")
             if cfg.get(key, "").strip() and (os.getenv(key) or "").strip() == ""
         )
 
@@ -725,60 +802,12 @@ def apply_parameter_derivation(
         )
         return cfg
 
-    # Only derive parameters that are missing or empty -- with one
-    # exception, for the Gerrit target. A GERRIT_PROJECT that cfg
-    # carries from the configuration file is the per-organization
-    # fallback described above, and a project derived for this
-    # repository from its own .gitreview, or confirmed against Gerrit,
-    # outranks it: the CLOSE dispatch consumes the resulting Inputs
-    # before the orchestrator runs and never consults provenance, so
-    # leaving the file's value in place would keep cleanup on the wrong
-    # project despite the read. The .gitreview host displaces the
-    # file's GERRIT_SERVER for the same reason: host and project are
-    # queried together, and the pipeline pushes to the .gitreview host,
-    # so the pair has to come from one place. Nothing inferred from the
-    # name alone displaces a project, whether a guess or the one
-    # reading of a hyphen-free name; the file's value was at least
-    # written down by somebody. An explicit environment value is
-    # untouched either way, since apply_config_to_env never overwrites
-    # one and the provenance record above agrees.
+    # Only derive parameters that are missing or empty, except for the
+    # Gerrit target; _merge_derived explains the exception.
     derived = derive_gerrit_parameters_detailed(organization, repository)
-    result = dict(cfg)
-    newly_derived = {}
-
-    def _env_blank(key: str) -> bool:
-        return (os.getenv(key) or "").strip() == ""
-
-    replaceable = {
-        key
-        for key, confirmed in (
-            ("GERRIT_PROJECT", derived.project_confirmed),
-            ("GERRIT_SERVER", derived.host_from_gitreview),
-        )
-        if confirmed and cfg.get(key, "").strip() and _env_blank(key)
-    }
-
-    for key, value in derived.values.items():
-        replacing = key in replaceable
-        if key not in result or not result[key].strip() or replacing:
-            if replacing:
-                log.debug(
-                    "Replacing configuration-file %s %r with %r resolved "
-                    "for repository %s",
-                    key,
-                    result[key],
-                    value,
-                    repository,
-                )
-            log.debug(
-                "Deriving %s from organization '%s': %s (context: %s)",
-                key,
-                organization,
-                value,
-                "GitHub Actions" if is_github_actions else "Local CLI",
-            )
-            result[key] = value
-            newly_derived[key] = value
+    result, newly_derived = _merge_derived(
+        cfg, derived, organization=organization, repository=repository
+    )
 
     if newly_derived:
         log.debug(

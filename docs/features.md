@@ -403,8 +403,12 @@ signal never earns a fork unwarranted trust.
 
 Resolution order for a fork pull request:
 
-1. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT` inputs,
-   each for its own field — an operator configured them for this run
+1. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT`
+   inputs, each for its own field — an operator configured them for this
+   run. The port input has no default: the action and the CLI pass none
+   when the caller gave none, so a set port is distinguishable from an
+   unset one. 29418 applies only when neither an input nor `.gitreview`
+   names a port.
 2. `.gitreview` from the base repository at the pull request's base branch,
    via the GitHub API or `raw.githubusercontent.com`
 3. Per-organization configuration file
