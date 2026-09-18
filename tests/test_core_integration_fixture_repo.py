@@ -103,15 +103,83 @@ def test_derive_repo_names_from_gitreview(tmp_path: Path) -> None:
     assert names.project_github == "releng-builder"
 
 
-def test_derive_repo_names_from_context_fallback(tmp_path: Path) -> None:
+def test_derive_repo_names_from_context_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
     repo = init_repo(tmp_path / "repo3", default_branch="main")
     orch = Orchestrator(workspace=repo.path)
     # No .gitreview present; derive from GitHub repository owner/name
     gh = _gh_ctx(repository="acme/my-repo-name", owner="acme")
     names = orch._derive_repo_names(None, gh)
-    # Fallback maps '-' to '/' for Gerrit path
+    # Fallback guesses '-' as '/' for the Gerrit path
     assert names.project_gerrit == "my/repo/name"
     assert names.project_github == "my-repo-name"
+
+
+def test_derive_repo_names_asks_gerrit_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no .gitreview, the guess is wrong for aai-aai-common.
+
+    Opting in lets the tool ask Gerrit which reading exists, and the
+    lister is only built when there is a host to ask.
+    """
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.onap.org")
+
+    class _Client:
+        def get(self, path: str) -> dict[str, dict[str, str]]:
+            assert path == "/projects/?p=aai"
+            return {"aai/aai-common": {}, "aai/babel": {}}
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host",
+        lambda host, **_: _Client(),
+    )
+    orch = Orchestrator(workspace=init_repo(tmp_path / "r").path)
+    names = orch._derive_repo_names(
+        None, _gh_ctx(repository="onap/aai-aai-common", owner="onap")
+    )
+    assert names == RepoNames("aai/aai-common", "aai-aai-common")
+
+
+def test_derive_repo_names_gerrit_lookup_needs_a_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Opted in but nothing to ask: fall back to the guess rather than
+    # fail, since the guess is what every caller got before.
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.delenv("GERRIT_SERVER", raising=False)
+    orch = Orchestrator(workspace=init_repo(tmp_path / "r").path)
+    names = orch._derive_repo_names(
+        None, _gh_ctx(repository="onap/aai-aai-common", owner="onap")
+    )
+    assert names.project_gerrit == "aai/aai/common"
+
+
+def test_derive_repo_names_gitreview_makes_gerrit_lookup_moot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An authoritative answer means no network call, even when opted in.
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.onap.org")
+
+    def _never(host: str, **_: object) -> None:
+        raise AssertionError("Gerrit must not be consulted")
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _never
+    )
+    repo = init_repo(tmp_path / "r", default_branch="main")
+    write_gitreview(
+        repo, host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+    orch = Orchestrator(workspace=repo.path)
+    gitreview = orch._read_gitreview(repo.path / ".gitreview")
+    assert gitreview is not None
+    names = orch._derive_repo_names(gitreview, _gh_ctx())
+    assert names.project_gerrit == "aai/aai-common"
 
 
 def test_resolve_gerrit_info_prefers_gitreview(

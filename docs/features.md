@@ -20,6 +20,7 @@ action in detail. For a quick start and the full inputs table, see the
 - [Duplicate Detection](#duplicate-detection)
 - [Commit Message Normalization](#commit-message-normalization)
 - [Change-ID Reconciliation](#change-id-reconciliation)
+- [Repository and Project Names](#repository-and-project-names)
 - [Configuration](#configuration)
 - [Behavior Details](#behavior-details)
 
@@ -827,6 +828,48 @@ github2gerrit \
   --similarity-update-factor 0.8 \
   https://github.com/owner/repo/pull/123
 ```
+
+## Repository and Project Names
+
+Gerrit projects are paths, such as `multicloud/openstack`; GitHub repository
+names are flat, such as `multicloud-openstack`. Linux Foundation mirrors
+flatten a path by replacing every `/` with `-`. One module, `project_names`,
+handles that mapping for the whole tool, so every part of it agrees on what a
+name means.
+
+### One direction is exact, the other is not
+
+Gerrit to GitHub is deterministic. GitHub to Gerrit is **ambiguous**: a hyphen
+is both the flattened separator and an ordinary character inside a segment.
+On gerrit.onap.org, `aai-aai-common` is `aai/aai-common`, not
+`aai/aai/common`, and nothing in the name can tell you which.
+
+So the tool resolves the Gerrit project from the best source it has, in this
+order:
+
+1. An explicit `GERRIT_PROJECT` input — an operator said so.
+2. The repository's `.gitreview` — the repository says so. For a pull request
+   the tool reads this from the **base** repository at the base ref, never
+   from a fork; see [Gerrit target resolution](#gerrit-target-resolution).
+3. Gerrit's own project list, when you enable
+   `G2G_RESOLVE_PROJECT_VIA_GERRIT` — the server says so. The tool checks
+   every reading of the hyphens against `GET /projects/?p=<first segment>`;
+   exactly one match resolves it, and on two matches the tool refuses to
+   choose.
+4. A guess that every hyphen is a separator, logged as a guess.
+
+Every Linux Foundation repository carries a `.gitreview`, so in practice step
+2 answers. Step 3 is off by default because it adds a network call to name
+resolution; enable it for repositories that have no `.gitreview` and whose
+names contain hyphens inside segments.
+
+### Why this matters for cleanup
+
+The close handler, the bulk sweep and duplicate detection all query Gerrit
+with `project:<name>`. A wrong name matches nothing and the tool reports
+"no change found" rather than an error — which is how 239 changes across 43
+ONAP projects stayed open after their pull requests closed (#441). The tool
+now resolves the project from `.gitreview` before any of those paths run.
 
 ## Configuration
 

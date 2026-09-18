@@ -82,6 +82,9 @@ from .models import RECHECK_EVENTS
 from .models import GitHubContext
 from .models import Inputs
 from .pr_content_filter import filter_pr_body
+from .project_names import RepoNames as RepoNames
+from .project_names import gerrit_project_lister
+from .project_names import resolve_repo_names
 from .reconcile_matcher import LocalCommit
 from .reconcile_matcher import create_local_commit
 from .rich_display import safe_console_print
@@ -277,14 +280,10 @@ def _is_valid_change_id(value: str) -> bool:
 # The top-level import uses the redundant ``as GerritInfo`` form so that
 # ``from github2gerrit.core import GerritInfo`` keeps working under
 # no_implicit_reexport, which strict type checking enables.
-
-
-@dataclass(frozen=True)
-class RepoNames:
-    # Gerrit repo path, e.g. "releng/builder"
-    project_gerrit: str
-    # GitHub repo name (no org/owner), e.g. "releng-builder"
-    project_github: str
+#
+# RepoNames likewise now lives in project_names, alongside the mapping
+# functions that produce it, and is re-exported here for the same
+# reason.
 
 
 @dataclass(frozen=True)
@@ -3000,32 +2999,58 @@ class Orchestrator:
         gitreview: GerritInfo | None,
         gh: GitHubContext,
     ) -> RepoNames:
-        """Compute Gerrit and GitHub repo names following existing rules.
+        """Settle both names for the repository being processed.
 
-        - Gerrit project remains as-is (from .gitreview when present).
-        - GitHub repo name is Gerrit project path with '/' replaced by '-'.
-          If .gitreview is not available, derive from GITHUB_REPOSITORY.
+        Delegates to :func:`project_names.resolve_repo_names`, which
+        owns the mapping in both directions. ``.gitreview`` is
+        authoritative when present. Without it the Gerrit path has to
+        be inferred from the GitHub name, which is ambiguous —
+        ``aai-aai-common`` is ``aai/aai-common``, not ``aai/aai/common``
+        — so the fallback may consult Gerrit's project list when
+        ``G2G_RESOLVE_PROJECT_VIA_GERRIT`` is enabled, and otherwise
+        guesses and says so.
         """
-        if gitreview:
-            gerrit_name = gitreview.project
-            github_name = gerrit_name.replace("/", "-")
-            names = RepoNames(
-                project_gerrit=gerrit_name,
-                project_github=github_name,
-            )
-            log.debug("Derived names from .gitreview: %s", names)
-            return names
-
-        # Fallback: use the repository name portion only.
         repo_full = gh.repository
-        if not repo_full or "/" not in repo_full:
+        if not gitreview and (not repo_full or "/" not in repo_full):
             raise OrchestratorError(_MSG_BAD_REPOSITORY_CONTEXT)
-        _owner, name = repo_full.split("/", 1)
-        # Fallback: map all '-' to '/' for Gerrit path (e.g., 'my/repo/name')
-        gerrit_name = name.replace("-", "/")
-        names = RepoNames(project_gerrit=gerrit_name, project_github=name)
-        log.debug("Derived names from context: %s", names)
+
+        names = resolve_repo_names(
+            repo_full,
+            gitreview_project=gitreview.project if gitreview else None,
+            list_projects=self._gerrit_project_lister(gitreview),
+        )
+        log.debug(
+            "Derived names from %s: %s",
+            ".gitreview" if gitreview else "context",
+            names,
+        )
         return names
+
+    def _gerrit_project_lister(
+        self, gitreview: GerritInfo | None
+    ) -> Callable[[str], list[str]] | None:
+        """Return a Gerrit project lister for name disambiguation, or None.
+
+        Only offered when opted in and when there is no ``.gitreview``
+        to make the question moot. Needs a host to ask, which without
+        ``.gitreview`` can only come from ``GERRIT_SERVER``.
+        """
+        if gitreview or not env_bool("G2G_RESOLVE_PROJECT_VIA_GERRIT", False):
+            return None
+        host = os.getenv("GERRIT_SERVER", "").strip()
+        if not host:
+            log.debug(
+                "G2G_RESOLVE_PROJECT_VIA_GERRIT set but no GERRIT_SERVER to "
+                "ask; falling back to the name guess"
+            )
+            return None
+        try:
+            from .gerrit_rest import build_client_for_host
+
+            return gerrit_project_lister(build_client_for_host(host))
+        except Exception as exc:
+            log.debug("Could not build a Gerrit client for %s: %s", host, exc)
+            return None
 
     def _resolve_gerrit_info(
         self,

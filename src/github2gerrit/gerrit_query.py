@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from .gerrit_rest import GerritRestClient
 from .gerrit_rest import warn_gerrit_credentials_unavailable
+from .project_names import github_repo_name
 from .trailers import GITHUB_PR_TRAILER
 from .trailers import parse_trailers
 from .utils import env_bool
@@ -61,13 +62,12 @@ def build_gerrit_topic(
 def derive_project_github(repository: str) -> str:
     """Derive a GitHub-style project name from ``owner/repo``.
 
-    Fallback used when resolved repository names are unavailable
-    (mirrors the fallback branch of
-    ``core.Orchestrator._derive_repo_names``).
+    Fallback used when resolved repository names are unavailable.
+    Delegates to :func:`project_names.github_repo_name`, which owns the
+    mapping between GitHub and Gerrit names; kept as a name here so
+    existing callers and tests keep working.
     """
-    if "/" in repository:
-        return repository.split("/")[-1]
-    return repository
+    return github_repo_name(repository)
 
 
 def _gerrit_quote(value: str) -> str:
