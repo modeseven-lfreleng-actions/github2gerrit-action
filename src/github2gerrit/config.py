@@ -591,61 +591,22 @@ def _is_local_cli_context() -> bool:
     return not _is_github_actions_context()
 
 
-def _read_gitreview_host(repository: str | None = None) -> str | None:
-    """Read the Gerrit host from the .gitreview file.
+def _read_gitreview_info(repository: str | None = None) -> Any:
+    """Read ``.gitreview`` host and project for the current context.
 
-    Delegates to the shared :mod:`github2gerrit.gitreview` module which
-    consolidates all ``.gitreview`` parsing and fetching logic.
-
-    This runs during parameter derivation, before the pull request
-    context is read, so provenance comes from ``PR_HEAD_REPO`` as the
-    composite action exports it.
-
-    ``GITHUB_HEAD_REF`` is consulted only when the head is known to live
-    in the base repository.  A fork chooses its own branch name, and one
-    matching a real base-repository branch would otherwise select that
-    branch's host.  Keeping the head ref for a *trusted* head matters
-    too: :meth:`Orchestrator._read_gitreview` reads the head tree in
-    that case, and dropping it here would let derivation record one host
-    while the pipeline pushes to another.
-
-    Provenance that cannot be established counts as untrusted, so the
-    absent-signal case falls back to the base ref alone.
-
-    The local working-directory file is still read.  This layer cannot
-    tell a pull request the *tool* is processing from one the *workflow*
-    merely runs inside, so any attempt to skip it here also breaks
-    legitimate local reads.  See issue #386: the fix belongs with the
-    wider question of tracking where a configuration value came from.
-
-    Args:
-        repository: GitHub repository in owner/repo format (optional).
-            Falls back to GITHUB_REPOSITORY env var.
-
-    Returns:
-        The host string from .gitreview, or None if unavailable.
+    Delegates to :func:`gitreview.read_gitreview_for_context`, which
+    holds the provenance rules.  Kept as a module attribute so tests can
+    substitute the read.
     """
-    from .gitreview import read_gitreview_host
-    from .models import head_repo_is_trusted
+    from .gitreview import read_gitreview_for_context
 
-    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
-    head_repo = os.getenv("PR_HEAD_REPO", "").strip()
-    trusted_head = head_repo_is_trusted(repo_full, head_repo)
+    return read_gitreview_for_context(repository)
 
-    branches: list[str] = []
-    if trusted_head:
-        head_ref = os.getenv("GITHUB_HEAD_REF", "").strip()
-        if head_ref:
-            branches.append(head_ref)
-    base_ref = os.getenv("GITHUB_BASE_REF", "").strip()
-    if base_ref:
-        branches.append(base_ref)
 
-    return read_gitreview_host(
-        repository,
-        branches=tuple(branches),
-        include_env_refs=False,
-    )
+def _read_gitreview_host(repository: str | None = None) -> str | None:
+    """Return only the host from :func:`_read_gitreview_info`."""
+    info = _read_gitreview_info(repository)
+    return info.host if info else None
 
 
 def derive_gerrit_parameters(
@@ -657,6 +618,19 @@ def derive_gerrit_parameters(
     1. Per-org configuration file entry (GERRIT_SERVER)
     2. .gitreview host field (local file or fetched from GitHub)
     3. Heuristic fallback: gerrit.[org].org
+
+    Priority order for project derivation:
+    1. .gitreview project field, from the same read as the host
+    2. A guess from the GitHub repository name, every hyphen read as a
+       path separator (see :mod:`github2gerrit.project_names`)
+
+    The project matters here, not only in the orchestrator, because the
+    closed-pull-request handler and the cleanup sweeps query Gerrit
+    with whatever this function derives, and they run before the
+    orchestrator ever resolves ``.gitreview`` itself.  Deriving the raw
+    GitHub name -- ``multicloud-openstack`` for a project that is
+    really ``multicloud/openstack`` -- made those queries match nothing
+    and left every such change open (#441).
 
     Priority order for credential derivation:
     1. SSH config user for gerrit.* hosts (checks generic and specific patterns)
@@ -672,7 +646,7 @@ def derive_gerrit_parameters(
         - GERRIT_SSH_USER_G2G: From SSH config or [org].gh2gerrit
         - GERRIT_SSH_USER_G2G_EMAIL: From git config or fallback email
         - GERRIT_SERVER: Resolved from config, .gitreview, or gerrit.[org].org
-        - GERRIT_PROJECT: Derived from repository name if provided
+        - GERRIT_PROJECT: From .gitreview, else guessed from the repository
     """
     if not organization:
         return {}
@@ -683,10 +657,17 @@ def derive_gerrit_parameters(
     config = load_org_config(org)
     configured_server = config.get("GERRIT_SERVER", "").strip()
 
-    # Read .gitreview host only when no config file entry
-    # (avoid unnecessary I/O)
+    # Read .gitreview once for both host and project. The host is
+    # only needed when no config file entry names one, but the project
+    # is per-repository and the config file cannot supply it, so the
+    # file is worth reading whenever a repository is known.
+    gitreview = (
+        _read_gitreview_info(repository)
+        if repository or not configured_server
+        else None
+    )
     gitreview_host = (
-        _read_gitreview_host(repository) if not configured_server else None
+        gitreview.host if gitreview and not configured_server else None
     )
 
     # Priority: config file > .gitreview > heuristic fallback
@@ -700,41 +681,36 @@ def derive_gerrit_parameters(
             org,
         )
 
-    # Derive GERRIT_PROJECT from repository if provided
+    # Derive GERRIT_PROJECT from .gitreview, else from the repository
     gerrit_project = ""
     if repository and "/" in repository:
-        # Extract repo name from owner/repo format
-        # For lfit/sandbox -> sandbox
-        _owner, repo_name = repository.split("/", 1)
-        gerrit_project = repo_name
+        from .project_names import resolve_repo_names
+
+        gerrit_project = resolve_repo_names(
+            repository,
+            gitreview_project=gitreview.project if gitreview else None,
+        ).project_gerrit
 
     # Try to use SSH config and git config for personalized credentials
+    ssh_user: str | None = None
+    git_email: str | None = None
     try:
         from .ssh_config_parser import derive_gerrit_credentials
 
         ssh_user, git_email = derive_gerrit_credentials(gerrit_host, org)
     except ImportError:
-        # Fallback to original behavior if ssh_config_parser not available
-        result = {
-            "GERRIT_SSH_USER_G2G": f"{org}.gh2gerrit",
-            "GERRIT_SSH_USER_G2G_EMAIL": (
-                f"releng+{org}-gh2gerrit@linuxfoundation.org"
-            ),
-            "GERRIT_SERVER": gerrit_host,
-        }
-        if gerrit_project:
-            result["GERRIT_PROJECT"] = gerrit_project
-        return result
-    else:
-        result = {
-            "GERRIT_SSH_USER_G2G": ssh_user or f"{org}.gh2gerrit",
-            "GERRIT_SSH_USER_G2G_EMAIL": git_email
-            or (f"releng+{org}-gh2gerrit@linuxfoundation.org"),
-            "GERRIT_SERVER": gerrit_host,
-        }
-        if gerrit_project:
-            result["GERRIT_PROJECT"] = gerrit_project
-        return result
+        # ssh_config_parser unavailable: organisation-based fallbacks apply
+        pass
+
+    result = {
+        "GERRIT_SSH_USER_G2G": ssh_user or f"{org}.gh2gerrit",
+        "GERRIT_SSH_USER_G2G_EMAIL": git_email
+        or f"releng+{org}-gh2gerrit@linuxfoundation.org",
+        "GERRIT_SERVER": gerrit_host,
+    }
+    if gerrit_project:
+        result["GERRIT_PROJECT"] = gerrit_project
+    return result
 
 
 def apply_parameter_derivation(

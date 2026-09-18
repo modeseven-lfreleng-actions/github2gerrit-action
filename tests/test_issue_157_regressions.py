@@ -24,6 +24,7 @@ from github2gerrit.config import _read_gitreview_host
 from github2gerrit.config import derive_gerrit_parameters
 from github2gerrit.gerrit_pr_closer import cleanup_closed_github_prs
 from github2gerrit.gerrit_rest import GerritRestError
+from github2gerrit.gitreview import GitReviewInfo
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +277,7 @@ class TestDeriveGerritParametersGitreview:
     Priority: config file > .gitreview > heuristic gerrit.{org}.org
     """
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     def test_gitreview_host_used_when_no_config(
         self,
@@ -285,7 +286,9 @@ class TestDeriveGerritParametersGitreview:
     ) -> None:
         """When no config file entry, .gitreview host wins over heuristic."""
         mock_derive_creds.return_value = (None, None)
-        mock_read_gitreview.return_value = "git.opendaylight.org"
+        mock_read_gitreview.return_value = GitReviewInfo(
+            host="git.opendaylight.org"
+        )
 
         derived = derive_gerrit_parameters(
             "opendaylight", repository="opendaylight/l2switch"
@@ -297,7 +300,7 @@ class TestDeriveGerritParametersGitreview:
             "git.opendaylight.org", "opendaylight"
         )
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.config.load_org_config")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     def test_config_file_beats_gitreview(
@@ -308,7 +311,9 @@ class TestDeriveGerritParametersGitreview:
     ) -> None:
         """Config file GERRIT_SERVER takes precedence over .gitreview."""
         mock_derive_creds.return_value = (None, None)
-        mock_read_gitreview.return_value = "git.opendaylight.org"
+        mock_read_gitreview.return_value = GitReviewInfo(
+            host="git.opendaylight.org"
+        )
         mock_load_org_config.return_value = {
             "GERRIT_SERVER": "custom.gerrit.example.org",
         }
@@ -319,7 +324,7 @@ class TestDeriveGerritParametersGitreview:
 
         assert derived["GERRIT_SERVER"] == "custom.gerrit.example.org"
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     def test_heuristic_fallback_when_no_gitreview(
         self,
@@ -334,7 +339,7 @@ class TestDeriveGerritParametersGitreview:
 
         assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     def test_project_derived_from_repository(
         self,
@@ -343,7 +348,9 @@ class TestDeriveGerritParametersGitreview:
     ) -> None:
         """GERRIT_PROJECT is derived from repository owner/repo format."""
         mock_derive_creds.return_value = (None, None)
-        mock_read_gitreview.return_value = "git.opendaylight.org"
+        mock_read_gitreview.return_value = GitReviewInfo(
+            host="git.opendaylight.org"
+        )
 
         derived = derive_gerrit_parameters(
             "opendaylight", repository="opendaylight/l2switch"

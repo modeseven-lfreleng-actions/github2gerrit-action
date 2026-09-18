@@ -454,6 +454,48 @@ def fetch_gitreview(
     return None
 
 
+def read_gitreview_for_context(
+    repository: str | None = None,
+) -> GitReviewInfo | None:
+    """Read ``.gitreview`` with the provenance the GitHub context implies.
+
+    Used by parameter derivation, which runs before the pull request
+    context exists, so provenance comes from ``PR_HEAD_REPO`` as the
+    composite action exports it.  ``GITHUB_HEAD_REF`` is consulted only
+    for a head known to live in the base repository: a fork picks its
+    own branch name, and one matching a real base branch would
+    otherwise select that branch's file.  Unresolved provenance counts
+    as untrusted.  :meth:`Orchestrator._read_gitreview` applies the same
+    rule later, and the two must agree or derivation records one target
+    while the pipeline pushes to another.
+
+    The local working-directory file is still read; see issue #386.
+
+    Returns:
+        Host **and project**, or ``None`` when no file can be found.
+    """
+    from .models import head_repo_is_trusted
+
+    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    head_repo = os.getenv("PR_HEAD_REPO", "").strip()
+
+    branches: list[str] = []
+    if head_repo_is_trusted(repo_full, head_repo):
+        head_ref = os.getenv("GITHUB_HEAD_REF", "").strip()
+        if head_ref:
+            branches.append(head_ref)
+    base_ref = os.getenv("GITHUB_BASE_REF", "").strip()
+    if base_ref:
+        branches.append(base_ref)
+
+    return fetch_gitreview(
+        local_path=Path(".gitreview"),
+        repo_full=repo_full,
+        branches=tuple(branches),
+        include_env_refs=False,
+    )
+
+
 def read_gitreview_host(
     repository: str | None = None,
     *,

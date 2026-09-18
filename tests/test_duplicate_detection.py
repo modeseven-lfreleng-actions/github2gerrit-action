@@ -539,7 +539,7 @@ project=test/project.git
 
         assert result == ("gerrit.explicit.org", "gitreview/project")
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     @patch("urllib.request.urlopen")
     def test_legacy_config_file_project_loses_to_gitreview(

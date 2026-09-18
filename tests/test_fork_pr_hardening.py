@@ -457,14 +457,15 @@ class TestConfigGitreviewProvenance:
     def _host(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured: dict[str, Any] = {}
 
-        def _fake(repository: str | None = None, **kwargs: Any) -> None:
+        def _fake(**kwargs: Any) -> None:
             captured.update(kwargs)
             return None
 
-        monkeypatch.setattr(
-            "github2gerrit.gitreview.read_gitreview_host", _fake
-        )
-        config._read_gitreview_host(BASE_REPO)
+        # Derivation reads the whole file now, for the project as well
+        # as the host, so the provenance arguments arrive at
+        # fetch_gitreview rather than the host-only wrapper.
+        monkeypatch.setattr("github2gerrit.gitreview.fetch_gitreview", _fake)
+        config._read_gitreview_info(BASE_REPO)
         return captured
 
     def test_fork_head_ref_ignored(

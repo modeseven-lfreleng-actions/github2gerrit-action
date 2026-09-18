@@ -298,6 +298,110 @@ def test_overlay_missing_prefers_primary_and_fills_empty_strings() -> None:
     assert merged["D"] == "added"
 
 
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_project_from_gitreview(
+    mock_derive_creds, mock_gitreview
+) -> None:
+    """The .gitreview project outranks any reading of the GitHub name.
+
+    Regression for #441. The closed-pull-request handler and the
+    cleanup sweeps query Gerrit with the project this function derives,
+    and they run before the orchestrator resolves .gitreview itself.
+    Deriving the raw GitHub name here queried project:multicloud-openstack
+    for changes that lived under multicloud/openstack, matched nothing,
+    and left 239 changes open across 43 projects on gerrit.onap.org.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+
+    derived = derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+    assert derived["GERRIT_PROJECT"] == "multicloud/openstack"
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_gitreview_beats_the_guess(
+    mock_derive_creds, mock_gitreview
+) -> None:
+    """Where the guess is wrong, .gitreview is still right.
+
+    aai-aai-common is aai/aai-common, not aai/aai/common, and only the
+    repository itself can say so.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_guesses_without_gitreview(
+    mock_derive_creds, mock_gitreview
+) -> None:
+    """Without .gitreview the guess matches what the orchestrator does.
+
+    Two derivations that disagree are how the close handler ended up
+    querying a different project from the one the pipeline pushed to.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+
+    derived = derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+    assert derived["GERRIT_PROJECT"] == "multicloud/openstack"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_reads_gitreview_despite_configured_server(
+    mock_derive_creds, mock_gitreview, tmp_path: Path, monkeypatch
+) -> None:
+    """A configured host does not excuse skipping the file.
+
+    The host may come from the per-organisation config file, but the
+    project is per-repository and that file cannot supply it, so
+    .gitreview must still be read for it.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    config_file = tmp_path / "configuration.txt"
+    config_file.write_text(
+        "[onap]\nGERRIT_SERVER = configured.example.org\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+
+    derived = derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+    # Host from the config file, project from the repository.
+    assert derived["GERRIT_SERVER"] == "configured.example.org"
+    assert derived["GERRIT_PROJECT"] == "multicloud/openstack"
+    mock_gitreview.assert_called_once()
+
+
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_derive_gerrit_parameters_basic(mock_derive_creds) -> None:
     """Test basic parameter derivation from organization name."""
@@ -909,7 +1013,7 @@ def test_mark_derived_keys_is_additive() -> None:
     assert not is_derived_key("")
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_marks_only_unset_env_keys(
     mock_derive_creds,
@@ -943,12 +1047,15 @@ def test_apply_parameter_derivation_marks_only_unset_env_keys(
     assert not is_derived_key("GERRIT_SERVER")
 
     # The project had no explicit value, so the guess landed and is
-    # recorded as derived.
-    assert os.environ["GERRIT_PROJECT"] == "integration-distribution"
+    # recorded as derived. With no .gitreview to consult, the guess
+    # reads every hyphen as a path separator, the same way the
+    # orchestrator does; the raw repository name it used to produce was
+    # the wrong project for every slash-path mirror (#441).
+    assert os.environ["GERRIT_PROJECT"] == "integration/distribution"
     assert is_derived_key("GERRIT_PROJECT")
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_can_skip_marking(
     mock_derive_creds,
@@ -980,7 +1087,7 @@ def test_apply_parameter_derivation_can_skip_marking(
     assert not is_derived_key("GERRIT_SERVER")
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_marks_config_file_project(
     mock_derive_creds,
@@ -1018,7 +1125,7 @@ def test_apply_parameter_derivation_marks_config_file_project(
     assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_config_file_project_marked_when_derivation_disabled(
     mock_derive_creds,
@@ -1052,7 +1159,7 @@ def test_config_file_project_marked_when_derivation_disabled(
     assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_config_file_project_marked_without_organization(
     mock_derive_creds,
@@ -1082,7 +1189,7 @@ def test_config_file_project_marked_without_organization(
     assert os.environ["GERRIT_PROJECT"] == "stale-org-project"
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_keeps_explicit_env_project(
     mock_derive_creds,
@@ -1113,7 +1220,7 @@ def test_apply_parameter_derivation_keeps_explicit_env_project(
     assert not is_derived_key("GERRIT_PROJECT")
 
 
-@patch("github2gerrit.config._read_gitreview_host")
+@patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_apply_parameter_derivation_config_project_opt_out(
     mock_derive_creds,
