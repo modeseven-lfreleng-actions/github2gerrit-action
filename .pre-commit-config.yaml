@@ -72,6 +72,24 @@ repos:
       - id: ruff-format
         files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
 
+  - repo: local
+    hooks:
+      - id: sync-mypy-pins
+        # Rewrites the mypy hook's exact pins below to the versions
+        # uv.lock records, so the two cannot drift. Ordered ahead of the
+        # mypy hook so the pins are corrected before mypy is reached,
+        # though pre-commit reads this file and builds hook environments
+        # before any hook runs: a rewrite fails this run, as any
+        # modifying hook does, and the corrected pins take effect on the
+        # rerun. Both files come from the same checkout, so the verdict
+        # is the same locally and in CI, and a Dependabot lockfile bump
+        # fails here on its own pull request rather than on main.
+        name: sync mypy hook pins with uv.lock
+        entry: python3 scripts/sync_mypy_pins.py
+        language: system
+        files: ^(\.pre-commit-config\.yaml|uv\.lock)$
+        pass_filenames: false
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: 7ff8d35ae36a7d2b968f2f90b4c723e292e594ee  # frozen: v2.3.1
     hooks:
@@ -100,10 +118,16 @@ repos:
         # nobody runs locally. That drift is not theoretical: CI once
         # resolved typer 0.27.2 against a lockfile holding 0.27.1, and the
         # two disagreed about which module typer.Exit lives in.
-        # Every version here must equal the one uv.lock records for that
-        # package, so update both together (after `uv lock --upgrade`, for
-        # instance). tests/test_precommit_mypy_pins.py compares the two
-        # files and fails if they diverge in either direction.
+        # The versions are not maintained by hand: the sync-mypy-pins hook
+        # above rewrites them from uv.lock, so after `uv lock --upgrade` a
+        # `prek run sync-mypy-pins --all-files` brings them into step
+        # (--all-files, because neither file is staged at that point and
+        # the hook would otherwise not be selected). The tests in
+        # tests/test_precommit_mypy_pins.py check the list is exact and
+        # complete against the imports; they deliberately do not compare
+        # versions to the lockfile, since a pull request is tested as
+        # merged into main and would otherwise fail for a dependency that
+        # moved there, not for anything on the branch.
         #
         # These pins do not freeze the whole resolved closure: pip still
         # picks transitive versions at build time, and listing every
@@ -119,8 +143,9 @@ repos:
         # runs, and nothing otherwise ties it to the locked one, so an
         # autoupdate of the mirror or a lockfile-only mypy upgrade would
         # leave the hook running a different checker in silence. With the
-        # pin present, the test compares it against uv.lock, and a mirror
-        # whose rev disagrees fails to install rather than quietly winning.
+        # pin present, the sync hook keeps it at the locked version, and a
+        # mirror whose rev disagrees fails to install rather than quietly
+        # winning.
         additional_dependencies:
           - mypy==2.3.1
           - click==8.5.0
