@@ -229,9 +229,9 @@ uvx github2gerrit https://github.com/onap/portal-ng-bff/pull/33
 | `GERRIT_KNOWN_HOSTS`           | No       | —                | Known hosts entries for Gerrit SSH (auto-populated when empty) |
 | `GERRIT_SSH_USER_G2G`          | No       | `""`             | Gerrit SSH username; derived when not supplied                 |
 | `GERRIT_SSH_USER_G2G_EMAIL`    | No       | `""`             | Gerrit user email address; derived when not supplied           |
-| `GERRIT_SERVER`                | No       | `""`             | Gerrit server hostname; `.gitreview` preferred                 |
+| `GERRIT_SERVER`                | No       | `""`             | Gerrit server hostname; overrides `.gitreview` when set        |
 | `GERRIT_SERVER_PORT`           | No       | `"29418"`        | Gerrit SSH port                                                |
-| `GERRIT_PROJECT`               | No       | `""`             | Gerrit project name; `.gitreview` preferred                    |
+| `GERRIT_PROJECT`               | No       | `""`             | Gerrit project name; overrides `.gitreview` when set           |
 | `GERRIT_HTTP_BASE_PATH`        | No       | `""`             | HTTP base path for Gerrit REST API (e.g. `/r`)                 |
 | `GERRIT_HTTP_USER`             | No       | `""`             | Gerrit HTTP user for REST queries                              |
 | `GERRIT_HTTP_PASSWORD`         | No       | `""`             | Gerrit HTTP password/token for REST queries                    |
@@ -279,14 +279,15 @@ environment variables do not cross the `workflow_call` boundary. See
 [docs/cli.md](docs/cli.md) for the full option reference and
 [docs/features.md](docs/features.md) for feature-specific settings.
 
-Nine `G2G_`-prefixed settings can come from repository or organisation
+Ten `G2G_`-prefixed settings can come from repository or organisation
 **variables**, which the reusable workflow reads and passes to the
-action — among them `G2G_TRUSTED_ASSOCIATIONS`, `G2G_TOPIC_PREFIX`
-and `G2G_ENABLE_DERIVATION`, plus the `G2G_NO_GERRIT` and
-`G2G_DISABLED` kill switches. An organisation can set one once for
-every repository beneath it. A workflow calling the composite action
-directly does not inherit those variables; map them in with `env:`
-yourself. See [docs/cli.md](docs/cli.md) for the full list.
+action — among them `G2G_TRUSTED_ASSOCIATIONS`, `G2G_TOPIC_PREFIX`,
+`G2G_ENABLE_DERIVATION` and the `G2G_RESOLVE_PROJECT_VIA_GERRIT`
+opt-in, plus the `G2G_NO_GERRIT` and `G2G_DISABLED` kill switches. An
+organisation can set one once for every repository beneath it. A
+workflow calling the composite action directly does not inherit those
+variables; map them in with `env:` yourself. See
+[docs/cli.md](docs/cli.md) for the full list.
 
 The three `G2G_APPROVER*` inputs widen who may clear the fork approval
 gate, and each defaults to off. `G2G_INFO_YAML_MATCH_LFID` carries a

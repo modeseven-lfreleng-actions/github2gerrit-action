@@ -457,14 +457,15 @@ class TestConfigGitreviewProvenance:
     def _host(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured: dict[str, Any] = {}
 
-        def _fake(repository: str | None = None, **kwargs: Any) -> None:
+        def _fake(**kwargs: Any) -> None:
             captured.update(kwargs)
             return None
 
-        monkeypatch.setattr(
-            "github2gerrit.gitreview.read_gitreview_host", _fake
-        )
-        config._read_gitreview_host(BASE_REPO)
+        # Derivation reads the whole file now, for the project as well
+        # as the host, so the provenance arguments arrive at
+        # fetch_gitreview rather than the host-only wrapper.
+        monkeypatch.setattr("github2gerrit.gitreview.fetch_gitreview", _fake)
+        config._read_gitreview_info(BASE_REPO)
         return captured
 
     def test_fork_head_ref_ignored(
@@ -478,6 +479,127 @@ class TestConfigGitreviewProvenance:
 
         assert kwargs["include_env_refs"] is False
         assert kwargs["branches"] == ("master",)
+
+    def test_fork_pull_request_is_pinned_to_its_base_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No master/main fallback, and no local file, for a fork head.
+
+        Either fallback would answer for a branch the pull request does
+        not target, and the orchestrator declines both for such a tree
+        (core._fetch_remote_gitreview). A calling workflow may also
+        have checked the fork head out into the workspace, and the host
+        read here reaches the close handler's REST client.
+        """
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_target")
+        monkeypatch.setenv("PR_HEAD_REPO", FORK_REPO)
+        monkeypatch.setenv("GITHUB_BASE_REF", "stable/scandium")
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["branches"] == ("stable/scandium",)
+        assert kwargs["default_branches"] == ()
+        assert kwargs["skip_local"] is True
+
+    def test_unknown_provenance_in_pr_context_is_pinned_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PR_NUMBER", "29")
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["default_branches"] == ()
+        assert kwargs["skip_local"] is True
+
+    def test_bulk_sentinel_is_not_pull_request_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR_NUMBER=0 means every open pull request, not a pull request."""
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+        monkeypatch.setenv("PR_NUMBER", "0")
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["default_branches"] == ("master", "main")
+        assert kwargs["skip_local"] is False
+
+    def test_trusted_head_keeps_the_fallbacks_and_the_local_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+        monkeypatch.setenv("PR_HEAD_REPO", BASE_REPO)
+        monkeypatch.setenv("GITHUB_BASE_REF", "master")
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["default_branches"] == ("master", "main")
+        assert kwargs["skip_local"] is False
+
+    def test_pin_needs_a_base_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct-URL runs know the PR number but not yet its base ref.
+
+        The pipeline resolves that through the API before it reads
+        .gitreview itself; derivation keeps the fallbacks meanwhile for
+        the host, which does not vary by branch, but still declines the
+        local file, which for a CLI user is whatever directory they ran
+        from. The provenance object reports the read as provisional so
+        the caller declines the project.
+        """
+        from github2gerrit.gitreview import context_provenance
+
+        monkeypatch.setenv("PR_NUMBER", "29")
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+
+        kwargs = self._host(monkeypatch)
+
+        assert kwargs["branches"] == ()
+        assert kwargs["default_branches"] == ("master", "main")
+        assert kwargs["skip_local"] is True
+
+        provenance = context_provenance(BASE_REPO)
+        assert provenance.untrusted is True
+        assert provenance.pinned is False
+        assert provenance.provisional is True
+
+    def test_provenance_object_agrees_with_the_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from github2gerrit.gitreview import context_provenance
+
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_target")
+        monkeypatch.setenv("PR_HEAD_REPO", FORK_REPO)
+        monkeypatch.setenv("GITHUB_BASE_REF", "stable/scandium")
+        pinned = context_provenance(BASE_REPO)
+        assert (pinned.untrusted, pinned.pinned, pinned.provisional) == (
+            True,
+            True,
+            False,
+        )
+
+        monkeypatch.setenv("PR_HEAD_REPO", BASE_REPO)
+        trusted = context_provenance(BASE_REPO)
+        assert (trusted.trusted, trusted.untrusted, trusted.provisional) == (
+            True,
+            False,
+            False,
+        )
+
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+        monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("PR_NUMBER", "0")
+        push = context_provenance(BASE_REPO)
+        assert (push.in_pr_context, push.untrusted, push.provisional) == (
+            False,
+            False,
+            False,
+        )
 
     def test_unknown_provenance_ignores_head_ref(
         self, monkeypatch: pytest.MonkeyPatch
@@ -508,7 +630,9 @@ class TestConfigGitreviewProvenance:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Push runs have no PR refs; master/main still apply."""
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
         monkeypatch.setenv("PR_HEAD_REPO", "")
+        monkeypatch.setenv("PR_NUMBER", "")
         monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
         monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
 
@@ -516,6 +640,8 @@ class TestConfigGitreviewProvenance:
 
         assert kwargs["branches"] == ()
         assert kwargs["include_env_refs"] is False
+        assert kwargs["default_branches"] == ("master", "main")
+        assert kwargs["skip_local"] is False
 
 
 class TestHeadRepoResolution:

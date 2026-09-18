@@ -539,7 +539,48 @@ project=test/project.git
 
         assert result == ("gerrit.explicit.org", "gitreview/project")
 
-    @patch("github2gerrit.config._read_gitreview_host")
+    @patch("urllib.request.urlopen")
+    def test_ci_testing_uses_the_environment_pair_only(
+        self, mock_urlopen: Any
+    ) -> None:
+        """CI_TESTING ignores .gitreview here as everywhere else.
+
+        Derivation and the orchestrator both skip the file in that
+        mode; a resolver that still read it would query a project the
+        mode promises to ignore.
+        """
+        detector = DuplicateDetector(Mock())
+        gh = self._create_mock_github_context()
+
+        mock_urlopen.side_effect = _gitreview_urlopen(
+            b"[gerrit]\nhost=gerrit.gitreview.org\nport=29418\n"
+            b"project=gitreview/project.git\n"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CI_TESTING": "true",
+                "GERRIT_SERVER": "gerrit.derived.org",
+                "GERRIT_PROJECT": "derived-project",
+            },
+        ):
+            mark_derived_keys(["GERRIT_SERVER", "GERRIT_PROJECT"])
+            result = detector._resolve_gerrit_info_from_env_or_gitreview(gh)
+
+        assert result == ("gerrit.derived.org", "derived-project")
+        mock_urlopen.assert_not_called()
+
+        with patch.dict(
+            "os.environ",
+            {"CI_TESTING": "true", "GERRIT_SERVER": "", "GERRIT_PROJECT": ""},
+        ):
+            assert (
+                detector._resolve_gerrit_info_from_env_or_gitreview(gh) is None
+            )
+        mock_urlopen.assert_not_called()
+
+    @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
     @patch("urllib.request.urlopen")
     def test_legacy_config_file_project_loses_to_gitreview(

@@ -11,6 +11,7 @@ and ensure consistent behavior.
 import logging
 import os
 import threading
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -35,6 +36,38 @@ def env_bool(name: str, default: bool = False) -> bool:
     if val is None or not val.strip():
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def setting_str(name: str, config: Mapping[str, str] | None = None) -> str:
+    """Read a setting from the environment, else from *config*.
+
+    Configuration values are normally exported to the environment by
+    ``config.apply_config_to_env`` and read from there.  Parameter
+    derivation runs before that export, so code on that path reads
+    through here with the loaded configuration as the second source.
+    A non-blank environment value wins, as it will once the export has
+    happened; the two must agree or a setting would change meaning
+    between the two halves of one run.  Returns ``""`` when neither
+    source has a non-blank value.
+    """
+    val = (os.getenv(name) or "").strip()
+    if val:
+        return val
+    if config is None:
+        return ""
+    return (config.get(name) or "").strip()
+
+
+def setting_bool(
+    name: str,
+    config: Mapping[str, str] | None = None,
+    default: bool = False,
+) -> bool:
+    """Boolean form of :func:`setting_str`, with :func:`env_bool`'s rules."""
+    val = setting_str(name, config)
+    if not val:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
 
 
 def env_str(name: str, default: str = "") -> str:

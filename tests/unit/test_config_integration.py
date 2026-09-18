@@ -16,6 +16,7 @@ from unittest import mock
 
 import pytest
 
+from github2gerrit.config import DerivedParameters
 from github2gerrit.config import apply_parameter_derivation
 from github2gerrit.config import derive_gerrit_parameters
 
@@ -166,7 +167,7 @@ class TestApplyParameterDerivation:
 
         assert result == cfg
 
-    @mock.patch("github2gerrit.config.derive_gerrit_parameters")
+    @mock.patch("github2gerrit.config.derive_gerrit_parameters_detailed")
     @mock.patch("github2gerrit.config._is_github_actions_context")
     def test_derivation_disabled(self, mock_is_actions, mock_derive):
         """Test that derivation can be disabled via environment variable."""
@@ -179,15 +180,17 @@ class TestApplyParameterDerivation:
             assert result == cfg
             mock_derive.assert_not_called()
 
-    @mock.patch("github2gerrit.config.derive_gerrit_parameters")
+    @mock.patch("github2gerrit.config.derive_gerrit_parameters_detailed")
     @mock.patch("github2gerrit.config._is_github_actions_context")
     def test_derivation_enabled_by_default(self, mock_is_actions, mock_derive):
         """Test that derivation is enabled by default."""
         mock_is_actions.return_value = False
-        mock_derive.return_value = {
-            "GERRIT_SSH_USER_G2G": "deriveduser",
-            "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
-        }
+        mock_derive.return_value = DerivedParameters(
+            values={
+                "GERRIT_SSH_USER_G2G": "deriveduser",
+                "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
+            }
+        )
 
         cfg: dict[str, str] = {}
         result = apply_parameter_derivation(
@@ -201,15 +204,17 @@ class TestApplyParameterDerivation:
         assert result == expected
         mock_derive.assert_called_once_with("testorg", None)
 
-    @mock.patch("github2gerrit.config.derive_gerrit_parameters")
+    @mock.patch("github2gerrit.config.derive_gerrit_parameters_detailed")
     @mock.patch("github2gerrit.config._is_github_actions_context")
     def test_existing_values_not_overridden(self, mock_is_actions, mock_derive):
         """Test that existing non-empty values are not overridden."""
         mock_is_actions.return_value = False
-        mock_derive.return_value = {
-            "GERRIT_SSH_USER_G2G": "deriveduser",
-            "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
-        }
+        mock_derive.return_value = DerivedParameters(
+            values={
+                "GERRIT_SSH_USER_G2G": "deriveduser",
+                "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
+            }
+        )
 
         cfg = {
             "GERRIT_SSH_USER_G2G": "existinguser",
@@ -226,15 +231,17 @@ class TestApplyParameterDerivation:
         }
         assert result == expected
 
-    @mock.patch("github2gerrit.config.derive_gerrit_parameters")
+    @mock.patch("github2gerrit.config.derive_gerrit_parameters_detailed")
     @mock.patch("github2gerrit.config._is_github_actions_context")
     def test_empty_values_are_derived(self, mock_is_actions, mock_derive):
         """Test that empty string values are treated as missing and derived."""
         mock_is_actions.return_value = False
-        mock_derive.return_value = {
-            "GERRIT_SSH_USER_G2G": "deriveduser",
-            "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
-        }
+        mock_derive.return_value = DerivedParameters(
+            values={
+                "GERRIT_SSH_USER_G2G": "deriveduser",
+                "GERRIT_SSH_USER_G2G_EMAIL": "derived@example.com",
+            }
+        )
 
         cfg = {
             "GERRIT_SSH_USER_G2G": "   ",  # Whitespace only

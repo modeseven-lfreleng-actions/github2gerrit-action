@@ -387,6 +387,7 @@ def build_client_for_host(
     *,
     timeout: float = 8.0,
     max_attempts: int = 5,
+    base_path: str | None = None,
     http_user: str | None = None,
     http_password: str | None = None,
     use_netrc: bool = True,
@@ -396,7 +397,8 @@ def build_client_for_host(
     """
     Build a GerritRestClient for a given host using the centralized URL builder.
 
-    - Uses auto-discovered or environment-provided base path.
+    - Uses the given base path, else the auto-discovered or
+      environment-provided one.
     - Reads HTTP auth from multiple sources in priority order:
       1. Pre-resolved GerritCredentials object (if provided)
       2. Explicit http_user/http_password arguments
@@ -409,6 +411,10 @@ def build_client_for_host(
       host: Gerrit hostname (no scheme)
       timeout: Request timeout in seconds.
       max_attempts: Max retry attempts for transient failures.
+      base_path: HTTP base path override (e.g. ``"r"``).  Callers that
+        run before the configuration file has been exported to the
+        environment pass the file's value here; ``None`` defers to
+        ``GERRIT_HTTP_BASE_PATH`` and discovery as before.
       http_user: Optional HTTP user (deprecated, use credentials).
       http_password: Optional HTTP password/token (deprecated, use credentials).
       use_netrc: Whether to try .netrc for credentials (default: True).
@@ -418,7 +424,7 @@ def build_client_for_host(
     Returns:
       Configured GerritRestClient.
     """
-    builder = create_gerrit_url_builder(host)
+    builder = create_gerrit_url_builder(host, base_path)
     base_url = builder.api_url()
 
     # Use pre-resolved credentials if provided

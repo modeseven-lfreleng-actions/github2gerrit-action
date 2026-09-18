@@ -58,6 +58,22 @@ def _minimal_inputs(
 
 _FAKE_DNS_RESULT = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 0))]
 
+
+@pytest.fixture(autouse=True)
+def _inputs_server_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat the stand-in ``gerrit_server`` as a derived value.
+
+    These tests hand-construct ``Inputs`` and expect a ``.gitreview``
+    host, when one is present, to be the one validated.  An explicit
+    ``GERRIT_SERVER`` now outranks the file, as an explicit project
+    does, so the stand-in must carry derived provenance for the file to
+    win.  Where no ``.gitreview`` is supplied the mark changes nothing.
+    """
+    from github2gerrit.config import DERIVED_KEYS_ENV
+
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
+
+
 _REPO = RepoNames(project_gerrit="example/project", project_github="project")
 
 

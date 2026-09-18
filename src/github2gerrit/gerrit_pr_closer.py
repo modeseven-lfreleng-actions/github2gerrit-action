@@ -1432,70 +1432,81 @@ def abandon_gerrit_change_for_closed_pr(
 
     Returns:
         Change number as string if Gerrit change was abandoned
-        (or would be in dry-run), None otherwise
+        (or would be in dry-run), ``None`` when no open change carries
+        this pull request's trailer.
+
+    Raises:
+        Exception: Whatever the Gerrit client raised when the query or
+            the abandon failed.  A failed lookup is not the same answer
+            as a lookup that found nothing, and the caller reports the
+            two differently; swallowing the failure here made both look
+            like "no change found" (#441).
     """
     log.debug(
         "Looking for Gerrit change associated with PR #%d",
         pr_number,
     )
 
-    try:
-        gerrit_client = build_client_for_host(gerrit_server)
+    gerrit_client = build_client_for_host(gerrit_server)
 
-        pr_url = f"https://github.com/{repository}/pull/{pr_number}"
+    pr_url = f"https://github.com/{repository}/pull/{pr_number}"
 
-        # Query for open changes with this PR URL in the commit message
-        # We search for the GitHub-PR trailer value
-        query = f"project:{gerrit_project} status:open"
-        query_path = (
-            f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT&n=100"
+    # Query for open changes with this PR URL in the commit message
+    # We search for the GitHub-PR trailer value
+    query = f"project:{gerrit_project} status:open"
+    query_path = (
+        f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT&n=100"
+    )
+
+    log.debug("Querying Gerrit for changes in %s", gerrit_project)
+    changes_data = gerrit_client.get(query_path)
+
+    if not isinstance(changes_data, list):
+        # The endpoint answers an empty query with []. Anything else
+        # is not "nothing found"; it is a response the caller cannot
+        # act on, and must not be reported as a clean no-match.
+        msg = (
+            f"Unexpected response from Gerrit change query for project "
+            f"{gerrit_project!r}: expected a list, got "
+            f"{type(changes_data).__name__}"
         )
+        raise GerritRestError(msg)
 
-        log.debug("Querying Gerrit for changes in %s", gerrit_project)
-        changes_data = gerrit_client.get(query_path)
-
-        if not changes_data or not isinstance(changes_data, list):
-            log.debug(
-                "No open Gerrit changes found for PR #%d",
-                pr_number,
-            )
-            return None
-
-        # Find the change with matching PR URL
-        matching_change = _find_matching_gerrit_change(changes_data, pr_url)
-
-        if not matching_change:
-            log.debug(
-                "No open Gerrit change found with GitHub-PR trailer for #%d",
-                pr_number,
-            )
-            return None
-
-        change_number = matching_change.get("_number", "")
-        subject = matching_change.get("subject", "")
-
+    if not changes_data:
         log.debug(
-            "Found Gerrit change %s (%s) for PR #%d",
-            change_number,
-            subject,
-            pr_number,
-        )
-
-        return _abandon_matched_change_for_closed_pr(
-            _GerritTarget(gerrit_client, gerrit_server, gerrit_project),
-            change_number,
-            pr_number,
-            pr_url,
-            repository,
-            dry_run=dry_run,
-        )
-
-    except Exception:
-        log.exception(
-            "Failed to abandon Gerrit change for closed PR #%d",
+            "No open Gerrit changes found for PR #%d",
             pr_number,
         )
         return None
+
+    # Find the change with matching PR URL
+    matching_change = _find_matching_gerrit_change(changes_data, pr_url)
+
+    if not matching_change:
+        log.debug(
+            "No open Gerrit change found with GitHub-PR trailer for #%d",
+            pr_number,
+        )
+        return None
+
+    change_number = matching_change.get("_number", "")
+    subject = matching_change.get("subject", "")
+
+    log.debug(
+        "Found Gerrit change %s (%s) for PR #%d",
+        change_number,
+        subject,
+        pr_number,
+    )
+
+    return _abandon_matched_change_for_closed_pr(
+        _GerritTarget(gerrit_client, gerrit_server, gerrit_project),
+        change_number,
+        pr_number,
+        pr_url,
+        repository,
+        dry_run=dry_run,
+    )
 
 
 def _extract_pr_url_from_change(

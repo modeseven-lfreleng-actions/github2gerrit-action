@@ -454,6 +454,136 @@ def fetch_gitreview(
     return None
 
 
+@dataclass(frozen=True)
+class ContextProvenance:
+    """What the environment says about the pull request being handled.
+
+    Read by parameter derivation, which runs before any
+    :class:`GitHubContext` exists, from the variables the composite
+    action exports.  Attributes:
+
+    in_pr_context
+        A pull request event, or a ``PR_NUMBER`` naming one.
+        ``PR_NUMBER=0`` is the bulk-mode sentinel and does not count.
+    trusted
+        The head is known to live in the base repository.  Unresolved
+        provenance counts as untrusted.
+    base_ref
+        The branch the pull request targets, or ``""`` when the run
+        does not know it yet (dispatch and direct-URL runs learn it
+        from the API later).
+    """
+
+    in_pr_context: bool
+    trusted: bool
+    base_ref: str
+
+    @property
+    def untrusted(self) -> bool:
+        """A pull request whose head is not known to be in-repo."""
+        return self.in_pr_context and not self.trusted
+
+    @property
+    def pinned(self) -> bool:
+        """Untrusted with a base ref to pin the ``.gitreview`` read to."""
+        return self.untrusted and bool(self.base_ref)
+
+    @property
+    def provisional(self) -> bool:
+        """Untrusted with no base ref yet.
+
+        A ``.gitreview`` read here can only come from a default branch,
+        which may not be the branch the pull request targets.  Its host
+        is still useful — servers do not vary by branch — but its
+        project must not be treated as this pull request's.
+        """
+        return self.untrusted and not self.base_ref
+
+
+def context_provenance(repository: str | None = None) -> ContextProvenance:
+    """Read :class:`ContextProvenance` from the environment."""
+    from .models import head_repo_is_trusted
+
+    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    head_repo = os.getenv("PR_HEAD_REPO", "").strip()
+    pr_number = os.getenv("PR_NUMBER", "").strip()
+    in_pr_context = os.getenv("GITHUB_EVENT_NAME", "").strip() in (
+        "pull_request",
+        "pull_request_target",
+    ) or bool(pr_number and pr_number != "0")
+    return ContextProvenance(
+        in_pr_context=in_pr_context,
+        trusted=head_repo_is_trusted(repo_full, head_repo),
+        base_ref=os.getenv("GITHUB_BASE_REF", "").strip(),
+    )
+
+
+def read_gitreview_for_context(
+    repository: str | None = None,
+) -> GitReviewInfo | None:
+    """Read ``.gitreview`` with the provenance the GitHub context implies.
+
+    Used by parameter derivation, which runs before the pull request
+    context exists, so provenance comes from ``PR_HEAD_REPO`` as the
+    composite action exports it.  ``GITHUB_HEAD_REF`` is consulted only
+    for a head known to live in the base repository: a fork picks its
+    own branch name, and one matching a real base branch would
+    otherwise select that branch's file.  Unresolved provenance counts
+    as untrusted.  :meth:`Orchestrator._read_gitreview` applies the same
+    rule later, and the two must agree or derivation records one target
+    while the pipeline pushes to another.
+
+    For the same reason an untrusted pull request is pinned to its base
+    ref: the ``master``/``main`` fallbacks would answer for a branch the
+    pull request does not target, and the orchestrator declines them
+    for such a tree.  The pin needs a base ref to pin to.  Pull request
+    events always carry one; dispatch and direct-URL runs carry no
+    payload, and the pipeline resolves their refs through the API
+    before it reads ``.gitreview`` itself.  Derivation keeps the
+    fallbacks there for the host, which local SSH-identity derivation
+    needs and which does not vary by branch; the caller checks
+    :attr:`ContextProvenance.provisional` and declines the project.
+
+    The local working-directory file is read only outside pull request
+    context or for a trusted head.  The action checks nothing out for
+    pull request runs, but a calling workflow may have checked the fork
+    head out into the workspace first, and the host read here reaches
+    the closed-pull-request handler's REST client.
+
+    Returns:
+        Host **and project**, or ``None`` when no file can be found.
+    """
+    repo_full = (repository or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    provenance = context_provenance(repository)
+
+    branches: list[str] = []
+    if provenance.trusted:
+        head_ref = os.getenv("GITHUB_HEAD_REF", "").strip()
+        if head_ref:
+            branches.append(head_ref)
+    if provenance.base_ref:
+        branches.append(provenance.base_ref)
+
+    if provenance.untrusted:
+        log.debug(
+            "Untrusted pull request head %r: ignoring any local .gitreview "
+            "and reading from %s",
+            os.getenv("PR_HEAD_REPO", "").strip() or "<unknown>",
+            f"base ref {provenance.base_ref!r} only"
+            if provenance.pinned
+            else "default branches",
+        )
+
+    return fetch_gitreview(
+        local_path=Path(".gitreview"),
+        skip_local=provenance.untrusted,
+        repo_full=repo_full,
+        branches=tuple(branches),
+        include_env_refs=False,
+        default_branches=() if provenance.pinned else ("master", "main"),
+    )
+
+
 def read_gitreview_host(
     repository: str | None = None,
     *,

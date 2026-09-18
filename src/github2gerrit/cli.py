@@ -120,6 +120,46 @@ def _exit_for_pr_state_error(pr_number: int, pr_state: str) -> None:
     exit_for_pr_state_error(pr_number, pr_state)
 
 
+def _stop_for_pr_state(
+    gh: GitHubContext, pr_state: str, progress_tracker: Any = None
+) -> NoReturn:
+    """Stop because the pull request is not open.
+
+    On a pull request event this is not an error. GitHub delivers
+    several events around a close — Dependabot edits the body before
+    closing, for instance — and any of them may land after the
+    ``closed`` event whose handler already ran. Such a run has nothing
+    to do, and a red check on the contributor's pull request would
+    misreport that. The report behind #441 cited exactly this run and
+    took it for the close handler failing.
+
+    A dispatch or direct invocation naming a closed pull request is
+    different: somebody asked for that one specifically, and being told
+    it cannot be processed is the useful answer.
+    """
+    if gh.event_name in ("pull_request", "pull_request_target"):
+        log.info(
+            "Pull request #%s is %s; nothing to do for a '%s' event. Cleanup "
+            "for a closed pull request runs on the 'closed' event itself.",
+            gh.pr_number,
+            pr_state,
+            gh.event_action or gh.event_name,
+        )
+        safe_console_print(
+            f"⏩ Pull request #{gh.pr_number} is {pr_state}; nothing to do",
+            style="yellow",
+            progress_tracker=progress_tracker,
+        )
+        # The caller's own stop() is downstream of this raise, and
+        # safe_console_print only suspends and resumes the display, so
+        # an in-process caller catching the exit would otherwise be
+        # left with an active Rich context.
+        if progress_tracker is not None:
+            progress_tracker.stop()
+        raise typer.Exit(int(ExitCode.SUCCESS))
+    exit_for_pr_state_error(gh.pr_number or 0, pr_state)
+
+
 def _exit_for_pr_not_found(pr_number: int, repository: str) -> None:
     """Exit with error message for PR not found."""
     exit_for_pr_not_found(pr_number, repository)
@@ -756,10 +796,10 @@ def _extract_and_display_pr_info(
         repo = get_repo_from_env(client)
         pr_obj = get_pull(repo, int(gh.pr_number))
 
-        # Check PR state and exit if not processable
+        # Check PR state and stop if not processable
         pr_state = getattr(pr_obj, "state", "unknown")
         if pr_state != "open":
-            _exit_for_pr_state_error(gh.pr_number, pr_state)
+            _stop_for_pr_state(gh, str(pr_state), progress_tracker)
 
         # Check if automation_only is enabled and reject non-automation PRs
         _check_automation_only(pr_obj, gh, progress_tracker)
@@ -791,6 +831,12 @@ def _extract_and_display_pr_info(
 
     except GitHub2GerritError:
         # Let our structured errors propagate
+        raise
+    except typer.Exit:
+        # display_and_exit and the clean stop above both raise this.
+        # It derives from Exception through click, so without this
+        # clause the handler below would swallow a deliberate exit 8
+        # and report "Failed to fetch PR details: 8" with exit 1.
         raise
     except Exception as exc:
         log.debug("Failed to display PR info: %s", exc)
@@ -1468,13 +1514,13 @@ def main(
         "",
         "--gerrit-project",
         envvar="GERRIT_PROJECT",
-        help="Gerrit project (optional; .gitreview preferred).",
+        help="Gerrit project (optional; overrides .gitreview when set).",
     ),
     gerrit_server: str = typer.Option(
         "",
         "--gerrit-server",
         envvar="GERRIT_SERVER",
-        help="Gerrit server hostname (optional; .gitreview preferred).",
+        help="Gerrit server hostname (optional; overrides .gitreview).",
     ),
     gerrit_server_port: int = typer.Option(
         29418,
@@ -3036,14 +3082,23 @@ def _log_abandoned_change_url(
 
 
 def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
-    """Abandon the Gerrit change associated with a closed pull request."""
+    """Abandon the Gerrit change associated with a closed pull request.
+
+    Three outcomes, reported distinctly: a change was abandoned, no
+    open change carries this pull request's trailer, or the lookup or
+    abandon itself failed. The last two used to share one message, and
+    a failed query read as a clean "nothing to do". A failure does not
+    say which side of the abandon it happened on -- Gerrit may have
+    applied it and the response been lost -- so the report says the
+    state is unconfirmed rather than claiming the change is open.
+    """
     if gh.pr_number is None:
         return
+    log.debug(
+        "Checking for Gerrit change to abandon for PR #%s",
+        gh.pr_number,
+    )
     try:
-        log.debug(
-            "Checking for Gerrit change to abandon for PR #%s",
-            gh.pr_number,
-        )
         change_number = abandon_gerrit_change_for_closed_pr(
             pr_number=gh.pr_number,
             gerrit_server=data.gerrit_server,
@@ -3052,21 +3107,46 @@ def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
             dry_run=data.dry_run,
             progress_tracker=None,
         )
-        if change_number:
-            _log_abandoned_change_url(data, gh, change_number)
-            # Console output already done by
-            # abandon_gerrit_change_for_closed_pr
-        else:
-            log.debug(
-                "No open Gerrit change found for pull request #%s",
-                gh.pr_number,
-            )
     except Exception as exc:
         log.warning(
-            "Failed to abandon Gerrit change for PR #%s: %s",
+            "Failed to look up or abandon the Gerrit change for pull "
+            "request #%s in project %r on %s: %s. Its state could not be "
+            "confirmed; check Gerrit.",
             gh.pr_number,
+            data.gerrit_project,
+            data.gerrit_server,
             exc,
         )
+        log.debug("Cleanup failure detail", exc_info=True)
+        safe_console_print(
+            f"⚠️  Could not confirm the Gerrit change state for PR "
+            f"#{gh.pr_number}: {exc}",
+            style="yellow",
+        )
+        return
+
+    if change_number:
+        _log_abandoned_change_url(data, gh, change_number)
+        # Console output already done by
+        # abandon_gerrit_change_for_closed_pr
+        return
+
+    # Audible on purpose. This is the outcome when the project name is
+    # wrong, and at debug level it hid 239 stranded changes on one
+    # server for six months (#441). Naming the project queried is what
+    # lets a reader spot the mismatch.
+    log.info(
+        "No open Gerrit change found for pull request #%s in "
+        "project %r on %s; nothing to abandon",
+        gh.pr_number,
+        data.gerrit_project,
+        data.gerrit_server,
+    )
+    safe_console_print(
+        f"⏩ No open Gerrit change for PR #{gh.pr_number} in "
+        f"project '{data.gerrit_project}'",
+        style="dim",
+    )
 
 
 def _handle_pr_closed(
@@ -3104,13 +3184,28 @@ def _handle_pr_closed(
 
     # First, abandon the specific Gerrit change for this closed PR
     # Skip in G2G_NO_GERRIT: no Gerrit server to query
-    if (
-        not no_gerrit
-        and gh.pr_number
+    if no_gerrit:
+        pass
+    elif not (
+        gh.pr_number
+        and gh.repository
         and data.gerrit_server
         and data.gerrit_project
-        and gh.repository
     ):
+        # Say so. Silently skipping here is indistinguishable from a
+        # successful cleanup that found nothing, and the change stays
+        # open with no trace of why.
+        log.warning(
+            "Cannot look for a Gerrit change to abandon for PR #%s: "
+            "repository=%r server=%r project=%r. Set GERRIT_SERVER and "
+            "GERRIT_PROJECT, or add a .gitreview so they can be derived; "
+            "the repository comes from GITHUB_REPOSITORY.",
+            gh.pr_number,
+            gh.repository,
+            data.gerrit_server,
+            data.gerrit_project,
+        )
+    else:
         _abandon_change_for_closed_pr(data, gh)
 
     _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)

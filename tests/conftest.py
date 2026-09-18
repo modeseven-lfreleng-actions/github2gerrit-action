@@ -189,6 +189,19 @@ def disable_github_ci_mode(
     # Also clear other GitHub-related vars that might interfere with tests
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY_OWNER", raising=False)
+    # Pull request context. Tests that drive the CLI's URL handling
+    # write these straight into os.environ, and a leaked PR_NUMBER
+    # would put every later .gitreview read into untrusted pull request
+    # mode, where the local file is declined.
+    monkeypatch.delenv("PR_NUMBER", raising=False)
+    monkeypatch.delenv("PR_HEAD_REPO", raising=False)
+    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    # Gerrit target. CLI tests export derived values straight into
+    # os.environ through apply_config_to_env, and a leaked
+    # GERRIT_PROJECT reads as operator intent to every later test.
+    monkeypatch.delenv("GERRIT_PROJECT", raising=False)
+    monkeypatch.delenv("GERRIT_SERVER", raising=False)
 
     # Ensure consistent test environment
     monkeypatch.setenv("G2G_ENABLE_DERIVATION", "true")
@@ -254,10 +267,29 @@ def reset_derived_key_provenance() -> Iterable[None]:
     stops one leaving a record behind.
     """
     from github2gerrit.config import DERIVED_KEYS_ENV
+    from github2gerrit.config import GUESSED_KEYS_ENV
 
     os.environ.pop(DERIVED_KEYS_ENV, None)
+    os.environ.pop(GUESSED_KEYS_ENV, None)
     yield
     os.environ.pop(DERIVED_KEYS_ENV, None)
+    os.environ.pop(GUESSED_KEYS_ENV, None)
+
+
+@pytest.fixture(autouse=True)
+def reset_gerrit_project_listings() -> Iterable[None]:
+    """Empty the per-process Gerrit project-listing memo around every test.
+
+    ``project_names`` remembers each ``/projects/?p=<prefix>`` answer by
+    host and prefix for the life of the process, so bulk runs ask once.
+    Tests stub that endpoint with different answers for the same host,
+    and one test's answer must not reach the next.
+    """
+    from github2gerrit import project_names
+
+    project_names._LISTINGS.clear()
+    yield
+    project_names._LISTINGS.clear()
 
 
 @pytest.fixture(autouse=True)
