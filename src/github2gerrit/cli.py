@@ -1523,10 +1523,10 @@ def main(
         help="Gerrit server hostname (optional; overrides .gitreview).",
     ),
     gerrit_server_port: int = typer.Option(
-        29418,
+        0,
         "--gerrit-server-port",
         envvar="GERRIT_SERVER_PORT",
-        help="Gerrit SSH port (default: 29418).",
+        help="Gerrit SSH port; .gitreview's when unset, else 29418.",
     ),
     gerrit_ssh_privkey_g2g: str = typer.Option(
         "",
@@ -1899,9 +1899,10 @@ def _build_inputs_from_env() -> Inputs:
         dry_run=env_bool("DRY_RUN", False),
         normalise_commit=env_bool("NORMALISE_COMMIT", True),
         gerrit_server=env_str("GERRIT_SERVER", ""),
-        gerrit_server_port=int(
-            env_str("GERRIT_SERVER_PORT", "29418") or "29418"
-        ),
+        # 0 means unset. A blank value is what the action passes when the
+        # caller gave none, and the distinction matters: an explicit
+        # port outranks .gitreview's, a defaulted one must not.
+        gerrit_server_port=int(env_str("GERRIT_SERVER_PORT", "").strip() or 0),
         gerrit_project=env_str("GERRIT_PROJECT"),
         issue_id=env_str("ISSUE_ID", ""),
         issue_id_lookup_json=env_str("ISSUE_ID_LOOKUP_JSON", ""),
@@ -4030,8 +4031,9 @@ def _add_full_config(
     # Show Gerrit settings if they have values
     if data.gerrit_server:
         config_info["GERRIT_SERVER"] = data.gerrit_server
-    # Only show non-default port (29418 is default)
-    if data.gerrit_server_port and data.gerrit_server_port != 29418:
+    # Any set port is shown: 0 is the unset sentinel, and an explicit
+    # 29418 is a real override of whatever .gitreview names.
+    if data.gerrit_server_port:
         config_info["GERRIT_SERVER_PORT"] = str(data.gerrit_server_port)
     if data.gerrit_project:
         config_info["GERRIT_PROJECT"] = data.gerrit_project

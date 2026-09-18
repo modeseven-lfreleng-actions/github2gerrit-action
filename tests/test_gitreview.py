@@ -199,6 +199,8 @@ class TestParseGitreview:
         info = parse_gitreview(NO_PORT)
         assert info is not None
         assert info.port == DEFAULT_GERRIT_PORT
+        # And says so: a default is not the file's word on the port.
+        assert info.port_given is False
 
     def test_no_project_ok(self) -> None:
         info = parse_gitreview(NO_PROJECT)
@@ -219,6 +221,7 @@ class TestParseGitreview:
         info = parse_gitreview(NON_DEFAULT_PORT)
         assert info is not None
         assert info.port == 29419
+        assert info.port_given is True
 
     def test_empty_string(self) -> None:
         assert parse_gitreview("") is None

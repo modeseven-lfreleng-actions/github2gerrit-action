@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
-"""INI parsing for the github2gerrit configuration file.
+"""INI reading and writing for the github2gerrit configuration file.
 
 The file format :mod:`github2gerrit.config` reads is INI with two
 liberties configparser does not take on its own: values may reference
 environment variables as ``${ENV:VAR}``, and a quoted value may span
 several lines, which is how SSH private keys and known-hosts entries
 are written inline.  This module turns such a file into a
-:class:`configparser.RawConfigParser` and normalises the values it
-yields.  It knows nothing about which keys mean what; that stays in
-:mod:`github2gerrit.config`.
+:class:`configparser.RawConfigParser`, normalises the values it yields,
+and writes derived parameters back into it.  It knows nothing about
+which keys mean what beyond the one it refuses to persist; that stays
+in :mod:`github2gerrit.config`.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from typing import cast
 
 
 log = logging.getLogger("github2gerrit.config")
+
+DEFAULT_CONFIG_PATH = "~/.config/github2gerrit/configuration.txt"
 
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -261,3 +264,92 @@ def _load_ini(path: Path) -> configparser.RawConfigParser:
     except Exception as exc:
         log.warning("Failed to read config file %s: %s", path, exc)
     return cp
+
+
+def save_derived_parameters_to_config(
+    organization: str,
+    derived_params: dict[str, str],
+    config_path: str | None = None,
+) -> None:
+    """Save derived parameters to the organization's configuration file.
+
+    This function updates the configuration file to include any derived
+    parameters that are not already present in the organization section.
+    This creates a persistent configuration that users can modify if needed.
+
+    Args:
+        organization: GitHub organization name for config section
+        derived_params: Dictionary of parameter names to values
+        config_path: Path to config file (optional, uses default if not
+            provided)
+    """
+    # Skip config file writes during dry-run mode
+    if os.getenv("DRY_RUN", "").lower() in ("true", "1", "yes"):
+        log.debug("Skipping config file write in dry-run mode")
+        return
+    if not organization or not derived_params:
+        return
+
+    # GERRIT_PROJECT is per-repository, but this file section is
+    # per-organization: persisting it would hand every other repository
+    # in the org one repository's project name, and would additionally
+    # come back on the next run as configuration indistinguishable from
+    # operator intent, defeating the provenance tracking that lets
+    # duplicate detection prefer a per-pull-request .gitreview.
+    derived_params = {
+        k: v for k, v in derived_params.items() if k != "GERRIT_PROJECT"
+    }
+    if not derived_params:
+        return
+
+    if config_path is None:
+        config_path = (
+            os.getenv("G2G_CONFIG_PATH", "").strip() or DEFAULT_CONFIG_PATH
+        )
+
+    config_file = Path(config_path).expanduser()
+
+    try:
+        # Only update when a configuration file already exists
+        if not config_file.exists():
+            log.debug(
+                "Configuration file does not exist; skipping auto-save of "
+                "derived parameters: %s",
+                config_file,
+            )
+            return
+
+        cp = _load_ini(config_file)
+
+        # Find or create the organization section
+        org_section = _select_section(cp, organization)
+        if org_section is None:
+            # Section doesn't exist, we'll need to add it
+            cp.add_section(organization)
+            org_section = organization
+
+        # Add derived parameters that don't already exist
+        params_added = []
+        for key, value in derived_params.items():
+            if not cp.has_option(org_section, key):
+                cp.set(org_section, key, f'"{value}"')
+                params_added.append(key)
+
+        # Only write if we added parameters
+        if params_added:
+            with config_file.open("w", encoding="utf-8") as f:
+                cp.write(f)
+
+            log.debug(
+                "Saved derived parameters to configuration file %s [%s]: %s",
+                config_file,
+                organization,
+                ", ".join(params_added),
+            )
+
+    except Exception as exc:
+        log.warning(
+            "Failed to save derived parameters to configuration file %s: %s",
+            config_file,
+            exc,
+        )

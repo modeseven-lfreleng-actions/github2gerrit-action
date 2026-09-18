@@ -419,7 +419,7 @@ class TestEnvironmentDefaults:
             "DUPLICATE_TYPES": "open",
             "NORMALISE_COMMIT": "false",
             "GERRIT_SERVER": "",
-            "GERRIT_SERVER_PORT": "29418",
+            "GERRIT_SERVER_PORT": "",
             "GERRIT_PROJECT": "",
             "GERRIT_HTTP_BASE_PATH": "",
             "GERRIT_HTTP_USER": "",
@@ -447,7 +447,10 @@ class TestEnvironmentDefaults:
         inputs = action_config["inputs"]
 
         port_input = inputs["GERRIT_SERVER_PORT"]
-        assert port_input["default"] == "29418"
+        # Blank, not 29418: a defaulted port would be indistinguishable
+        # from one the caller set, and an explicit port outranks the one
+        # in .gitreview while a defaulted one must not.
+        assert port_input["default"] == ""
         # Description may not contain the port number explicitly
         assert (
             "port" in port_input["description"].lower()
