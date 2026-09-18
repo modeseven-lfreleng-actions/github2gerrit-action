@@ -403,8 +403,11 @@ signal never earns a fork unwarranted trust.
 
 Resolution order for a fork pull request:
 
-1. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT` inputs,
-   each for its own field — an operator configured them for this run
+1. Explicit `GERRIT_SERVER` / `GERRIT_PROJECT` inputs, each for its own
+   field — an operator configured them for this run. When an explicit
+   server applies, its `GERRIT_SERVER_PORT` applies with it; otherwise
+   `.gitreview` owns the port along with the host, since an integer port
+   cannot signal whether the operator set it or the default applied.
 2. `.gitreview` from the base repository at the pull request's base branch,
    via the GitHub API or `raw.githubusercontent.com`
 3. Per-organization configuration file

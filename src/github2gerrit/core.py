@@ -3175,8 +3175,11 @@ class Orchestrator:
         The project is *repo*'s, settled by :meth:`_derive_repo_names`;
         only the host and port are resolved here. An explicit
         ``GERRIT_SERVER`` outranks ``.gitreview``, as an explicit
-        ``GERRIT_PROJECT`` does; otherwise the file's host and port
-        apply when there is a file, and the inputs' otherwise. A guessed
+        ``GERRIT_PROJECT`` does, and brings ``GERRIT_SERVER_PORT`` with
+        it; otherwise the file's host and port apply when there is a
+        file, and the inputs' otherwise. The port travels with the host
+        rather than following its own precedence because an integer
+        input cannot say whether it was set or defaulted. A guessed
         project is refused for any run that pushes, whichever supplied
         the host.
 

@@ -461,10 +461,12 @@ def derive_gerrit_parameters_detailed(
     """Derive Gerrit parameters using SSH config, git config, and org fallback.
 
     Priority order for server derivation:
-    1. .gitreview host field (local file or fetched from GitHub); this
-       is the host the orchestrator pushes to whenever there is a file
-    2. Per-org configuration file entry (GERRIT_SERVER)
-    3. Heuristic fallback: gerrit.[org].org
+    1. An explicit ``GERRIT_SERVER`` already in the environment (one the
+       operator set, not one an earlier derivation pass exported); this
+       is the host the orchestrator pushes to
+    2. .gitreview host field (local file or fetched from GitHub)
+    3. Per-org configuration file entry (GERRIT_SERVER)
+    4. Heuristic fallback: gerrit.[org].org
 
     The host and the project are exported as one target: the closed-
     pull-request handler and the cleanup sweeps query them together,
@@ -510,7 +512,8 @@ def derive_gerrit_parameters_detailed(
         among them is a guess:
         - GERRIT_SSH_USER_G2G: From SSH config or [org].gh2gerrit
         - GERRIT_SSH_USER_G2G_EMAIL: From git config or fallback email
-        - GERRIT_SERVER: Resolved from config, .gitreview, or gerrit.[org].org
+        - GERRIT_SERVER: An explicit environment value, else .gitreview,
+          else config, else gerrit.[org].org
         - GERRIT_PROJECT: From .gitreview or Gerrit, else guessed
     """
     if not organization:
@@ -521,6 +524,9 @@ def derive_gerrit_parameters_detailed(
     # Check if we have a config file entry for this organization
     config = load_org_config(org)
     configured_server = config.get("GERRIT_SERVER", "").strip()
+    explicit_server = (os.getenv("GERRIT_SERVER") or "").strip()
+    if explicit_server and is_derived_key("GERRIT_SERVER"):
+        explicit_server = ""
 
     # Read .gitreview once for both host and project. The project is
     # per-repository and the configuration file cannot supply it, so
@@ -535,22 +541,39 @@ def derive_gerrit_parameters_detailed(
     gitreview = _read_gitreview_info(repository) if not ci_testing else None
     gitreview_host = (gitreview.host if gitreview else "").strip()
 
-    # Priority: .gitreview > config file > heuristic fallback. The
-    # orchestrator pushes to the .gitreview host whenever there is a
-    # file, so the host exported here -- which the closed-pull-request
-    # handler and the cleanup sweeps query, paired with the project
-    # below -- has to be the same one, or they query the right project
-    # on the wrong server. The per-organization file is a fallback for
-    # repositories that carry no .gitreview.
-    gerrit_host = gitreview_host or configured_server or f"gerrit.{org}.org"
+    # One effective host, in the orchestrator's order: an explicit
+    # GERRIT_SERVER, else .gitreview, else the per-organization file,
+    # else the heuristic. It is the host the push will go to, so it is
+    # the host exported here -- paired with the project below for the
+    # closed-pull-request handler and the cleanup sweeps -- the host
+    # the project lookup asks, and the host SSH credentials are derived
+    # for. Confirming a project or picking an identity on any other
+    # host would be confirming or picking for the wrong server.
+    gerrit_host = (
+        explicit_server
+        or gitreview_host
+        or configured_server
+        or f"gerrit.{org}.org"
+    )
+    # Provenance follows the tier selected, not the value: an explicit
+    # server that happens to equal the file's host is still explicit.
+    host_from_gitreview = not explicit_server and bool(gitreview_host)
 
-    if gitreview_host:
+    if host_from_gitreview:
         log.debug(
             "Using Gerrit host from .gitreview: %s%s",
             gitreview_host,
             f" (over configured {configured_server})"
             if configured_server and configured_server != gitreview_host
             else "",
+        )
+    elif (
+        explicit_server and gitreview_host and gitreview_host != explicit_server
+    ):
+        log.debug(
+            "Using explicit GERRIT_SERVER %s over .gitreview host %s",
+            explicit_server,
+            gitreview_host,
         )
 
     # Derive GERRIT_PROJECT from .gitreview, else from the repository.
@@ -559,12 +582,10 @@ def derive_gerrit_parameters_detailed(
     # branch the pull request targets; its host is kept (servers do not
     # vary by branch, and local SSH-identity derivation needs one) but
     # its project is not this pull request's to export. Without a
-    # .gitreview project the lookup may ask Gerrit. The host asked is
-    # the one the push will go to, in the orchestrator's order: the
-    # file's when there is a file, else an explicit GERRIT_SERVER, else
-    # the host resolved above. The loaded configuration goes along
-    # because this runs before the file has been exported to the
-    # environment, and the paths that consume the result never see the
+    # .gitreview project the lookup may ask Gerrit, on the effective
+    # host settled above. The loaded configuration goes along because
+    # this runs before the file has been exported to the environment,
+    # and the paths that consume the result never see the
     # orchestrator's later, environment-only reading of the same
     # settings. An explicit GERRIT_PROJECT in the environment makes the
     # lookup moot, exactly as .gitreview does: apply_config_to_env
@@ -592,12 +613,7 @@ def derive_gerrit_parameters_detailed(
             gitreview_project=gitreview_project or None,
             list_projects=None
             if lookup_moot
-            else opted_in_gerrit_project_lister(
-                (gitreview.host if gitreview else "")
-                or os.getenv("GERRIT_SERVER", "").strip()
-                or gerrit_host,
-                config=config,
-            ),
+            else opted_in_gerrit_project_lister(gerrit_host, config=config),
         )
         gerrit_project = names.project_gerrit
         project_source = names.source
@@ -624,7 +640,7 @@ def derive_gerrit_parameters_detailed(
     return DerivedParameters(
         values=result,
         project_source=project_source,
-        host_from_gitreview=bool(gitreview_host),
+        host_from_gitreview=host_from_gitreview,
     )
 
 
@@ -674,19 +690,22 @@ def apply_parameter_derivation(
     # by releases before such writes stopped, and hand-written ones,
     # which are equally misscoped. Marking it derived keeps it usable as
     # a last resort while letting the per-pull-request .gitreview
-    # outrank it.
+    # outrank it. A GERRIT_SERVER from the file is marked the same way:
+    # it is a sensible per-organization default, but an explicit server
+    # now outranks .gitreview at the push, and a default must not carry
+    # that authority. Only a value the operator set for this run does.
     #
     # Recorded ahead of the early returns below, because this describes
     # what cfg already carries rather than anything derivation adds.
     # Neither a missing organization nor G2G_ENABLE_DERIVATION=false
-    # makes a config-file project any more like operator intent, and
+    # makes a config-file value any more like operator intent, and
     # apply_config_to_env still exports it in both cases.
-    if (
-        mark_derived
-        and cfg.get("GERRIT_PROJECT", "").strip()
-        and (os.getenv("GERRIT_PROJECT") or "").strip() == ""
-    ):
-        mark_derived_keys(["GERRIT_PROJECT"])
+    if mark_derived:
+        mark_derived_keys(
+            key
+            for key in ("GERRIT_PROJECT", "GERRIT_SERVER")
+            if cfg.get(key, "").strip() and (os.getenv(key) or "").strip() == ""
+        )
 
     if not organization:
         return cfg

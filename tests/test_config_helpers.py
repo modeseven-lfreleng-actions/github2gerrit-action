@@ -1467,6 +1467,46 @@ def test_config_file_server_survives_without_gitreview(
 
 @patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_server_is_recorded_as_derived(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-organization server is a default, not this run's intent.
+
+    An explicit server now outranks .gitreview at the push; a value
+    from the file must not carry that authority, or a later .gitreview
+    read would lose to a default.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.setenv("GERRIT_SERVER", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_SERVER": "legacy.gerrit.example"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_SERVER"] == "legacy.gerrit.example"
+    assert is_derived_key("GERRIT_SERVER")
+
+    # Still recorded with derivation switched off, as for the project.
+    monkeypatch.setenv("G2G_ENABLE_DERIVATION", "false")
+    monkeypatch.setenv("GERRIT_SERVER", "")
+    monkeypatch.delenv(DERIVED_KEYS_ENV, raising=False)
+    apply_parameter_derivation(
+        {"GERRIT_SERVER": "legacy.gerrit.example"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    assert is_derived_key("GERRIT_SERVER")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
 def test_hyphen_free_name_does_not_replace_config_file_project(
     mock_derive_creds,
     mock_gitreview,
@@ -1529,14 +1569,15 @@ def test_explicit_env_project_makes_the_lookup_moot(
 
 @patch("github2gerrit.config._read_gitreview_info")
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
-def test_early_lookup_asks_the_gitreview_host_first(
+def test_early_lookup_asks_the_effective_host(
     mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A host-only .gitreview names the push target; ask that server.
+    """One host for the lookup, the export and the credentials.
 
-    The orchestrator pushes to the file's host over an environment
-    GERRIT_SERVER, so a project confirmed on the environment's server
-    would be confirmed on the wrong one.
+    In the orchestrator's order: an explicit GERRIT_SERVER, else the
+    .gitreview host, else the per-organization file. A derived server
+    in the environment does not count as explicit. A project confirmed
+    on any other host would be confirmed for the wrong server.
     """
     from github2gerrit.gitreview import GitReviewInfo
 
@@ -1545,7 +1586,6 @@ def test_early_lookup_asks_the_gitreview_host_first(
         host="gerrit.onap.org", port=29418, project=""
     )
     monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
-    monkeypatch.setenv("GERRIT_SERVER", "gerrit.elsewhere.example")
     monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
     monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
     asked: list[str] = []
@@ -1562,9 +1602,54 @@ def test_early_lookup_asks_the_gitreview_host_first(
         "github2gerrit.gerrit_rest.build_client_for_host", _build
     )
 
+    # Explicit server: asked, exported, and used for credentials.
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.explicit.example")
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert asked == ["gerrit.explicit.example"]
+    assert derived["GERRIT_SERVER"] == "gerrit.explicit.example"
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+    mock_derive_creds.assert_called_with("gerrit.explicit.example", "onap")
+
+    # The same value marked derived: the file's host wins.
+    asked.clear()
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
     derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
     assert asked == ["gerrit.onap.org"]
-    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
+    mock_derive_creds.assert_called_with("gerrit.onap.org", "onap")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_host_provenance_follows_the_tier_not_the_value(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit server equal to the file's host is still explicit.
+
+    The flag decides whether a configuration-file server may be
+    displaced; inferring it from string equality would let an explicit
+    value be reported as file-derived whenever the two happen to agree.
+    """
+    from github2gerrit.config import derive_gerrit_parameters_detailed
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.onap.org")
+
+    derived = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/aai-aai-common"
+    )
+    assert derived.values["GERRIT_SERVER"] == "gerrit.onap.org"
+    assert derived.host_from_gitreview is False
+
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
+    derived = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/aai-aai-common"
+    )
+    assert derived.host_from_gitreview is True
 
 
 @patch("github2gerrit.config._read_gitreview_info")
