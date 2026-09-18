@@ -600,7 +600,7 @@ class TestOptedInGerritProjectLister:
         monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
         monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
         workers = 6
-        arrived = threading.Barrier(workers)
+        arrived = threading.Barrier(workers, timeout=10)
         fetches: list[str] = []
         fetch_lock = threading.Lock()
 
@@ -636,7 +636,8 @@ class TestOptedInGerritProjectLister:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=15)
+        assert not any(t.is_alive() for t in threads)
 
         assert len(results) == workers
         assert sorted(fetches) == ["/projects/?p=aai", "/projects/?p=sdc"]
