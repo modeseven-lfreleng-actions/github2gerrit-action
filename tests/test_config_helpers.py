@@ -15,12 +15,6 @@ from unittest.mock import patch
 import pytest
 
 from github2gerrit.config import DERIVED_KEYS_ENV
-from github2gerrit.config import _coerce_value
-from github2gerrit.config import _expand_env_refs
-from github2gerrit.config import _normalize_bool_like
-from github2gerrit.config import _sanitize_ssh_key_content
-from github2gerrit.config import _select_section
-from github2gerrit.config import _strip_quotes
 from github2gerrit.config import apply_config_to_env
 from github2gerrit.config import apply_parameter_derivation
 from github2gerrit.config import derive_gerrit_parameters
@@ -29,6 +23,12 @@ from github2gerrit.config import is_derived_key
 from github2gerrit.config import load_org_config
 from github2gerrit.config import mark_derived_keys
 from github2gerrit.config import overlay_missing
+from github2gerrit.config_ini import _coerce_value
+from github2gerrit.config_ini import _expand_env_refs
+from github2gerrit.config_ini import _normalize_bool_like
+from github2gerrit.config_ini import _sanitize_ssh_key_content
+from github2gerrit.config_ini import _select_section
+from github2gerrit.config_ini import _strip_quotes
 
 
 if TYPE_CHECKING:
@@ -376,9 +376,11 @@ def test_derive_gerrit_parameters_reads_gitreview_despite_configured_server(
 ) -> None:
     """A configured host does not excuse skipping the file.
 
-    The host may come from the per-organisation config file, but the
-    project is per-repository and that file cannot supply it, so
-    .gitreview must still be read for it.
+    The per-organisation config file may name a host, but the project
+    is per-repository and that file cannot supply it, so .gitreview
+    must still be read. And once read, its host travels with its
+    project: the close handler queries the pair together, and the
+    orchestrator pushes to the file's host whenever there is a file.
     """
     from github2gerrit.gitreview import GitReviewInfo
 
@@ -396,10 +398,118 @@ def test_derive_gerrit_parameters_reads_gitreview_despite_configured_server(
         "onap", repository="onap/multicloud-openstack"
     )
 
-    # Host from the config file, project from the repository.
-    assert derived["GERRIT_SERVER"] == "configured.example.org"
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
     assert derived["GERRIT_PROJECT"] == "multicloud/openstack"
     mock_gitreview.assert_called_once()
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_asks_gerrit_when_opted_in(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-in lookup applies here, not only in the orchestrator.
+
+    The CLOSE dispatch and the bulk sweeps consume what this function
+    derives and return before the orchestrator runs, so a lookup
+    honoured only there would leave them with the guess it exists to
+    avoid. The host asked is the one the run will talk to: an explicit
+    GERRIT_SERVER when set, else the host derived here.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.delenv("GERRIT_SERVER", raising=False)
+    monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
+
+    asked: list[str] = []
+
+    class _Client:
+        def get(self, path: str) -> dict[str, dict[str, str]]:
+            assert path == "/projects/?p=aai"
+            return {"aai/aai-common": {}}
+
+    def _build(host: str, **_: object) -> _Client:
+        asked.append(host)
+        return _Client()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _build
+    )
+
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+    assert asked == ["gerrit.onap.org"]
+
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.explicit.example")
+    derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert asked[-1] == "gerrit.explicit.example"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_gitreview_makes_the_lookup_moot(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+
+    asked: list[str] = []
+
+    class _Client:
+        def get(self, path: str) -> dict[str, object]:
+            return {"aai/aai-common": {}}
+
+    def _build(host: str, **_: object) -> _Client:
+        asked.append(host)
+        return _Client()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _build
+    )
+
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+    assert asked == []
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_derive_gerrit_parameters_detailed_reports_a_guess(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from github2gerrit.config import derive_gerrit_parameters_detailed
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+
+    mock_gitreview.return_value = None
+    guessed = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/multicloud-openstack"
+    )
+    assert guessed.values["GERRIT_PROJECT"] == "multicloud/openstack"
+    assert guessed.project_source == "guess"
+    assert guessed.project_guessed is True
+    assert guessed.project_confirmed is False
+
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+    known = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/multicloud-openstack"
+    )
+    assert known.project_source == "gitreview"
+    assert known.project_confirmed is True
+    assert known.project_guessed is False
+
+    assert derive_gerrit_parameters_detailed(None).values == {}
 
 
 @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
@@ -1248,6 +1358,491 @@ def test_apply_parameter_derivation_config_project_opt_out(
 
     assert result["GERRIT_PROJECT"] == "stale-org-project"
     assert not is_derived_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_gitreview_project_replaces_config_file_project(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative per-repository project displaces the file's.
+
+    The CLOSE dispatch consumes Inputs.gerrit_project before the
+    orchestrator runs and never consults provenance, so marking the
+    file's value derived is not enough on its own: left in cfg it would
+    keep cleanup on the wrong project despite the .gitreview read.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+
+    assert result["GERRIT_PROJECT"] == "multicloud/openstack"
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_PROJECT"] == "multicloud/openstack"
+    # Still a derived value as far as provenance goes: duplicate
+    # detection may yet resolve .gitreview for itself.
+    assert is_derived_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_gitreview_host_replaces_config_file_server_with_the_project(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host and project are exported as one target.
+
+    The close handler queries the pair together and the pipeline pushes
+    to the .gitreview host, so a per-organization GERRIT_SERVER left in
+    place beside a .gitreview project would have cleanup query the right
+    project on the wrong server. The replaced host is recorded as
+    derived; an explicit environment server is untouched.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+    monkeypatch.setenv("GERRIT_SERVER", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_SERVER": "legacy.gerrit.example"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    assert (result["GERRIT_SERVER"], result["GERRIT_PROJECT"]) == (
+        "gerrit.onap.org",
+        "multicloud/openstack",
+    )
+    apply_config_to_env(result)
+    assert is_derived_key("GERRIT_SERVER")
+
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.explicit.example")
+    result = apply_parameter_derivation(
+        {"GERRIT_SERVER": "legacy.gerrit.example"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    apply_config_to_env(result)
+    assert os.environ["GERRIT_SERVER"] == "gerrit.explicit.example"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_server_survives_without_gitreview(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.setenv("GERRIT_SERVER", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_SERVER": "legacy.gerrit.example"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    assert result["GERRIT_SERVER"] == "legacy.gerrit.example"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_hyphen_free_name_does_not_replace_config_file_project(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a guess, but not confirmed either.
+
+    A hyphen-free name has one reading, so it is no guess; nothing has
+    confirmed it against the repository or the server though, and the
+    configuration file's value ranks above the name alone, as
+    resolve_repo_names documents for its fallback.
+    """
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "legacy/value"},
+        "lfit",
+        repository="lfit/sandbox",
+        save_to_config=False,
+    )
+
+    assert result["GERRIT_PROJECT"] == "legacy/value"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_explicit_env_project_makes_the_lookup_moot(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # apply_config_to_env would discard the answer, so the authenticated
+    # request is not worth making; same short-circuit as the orchestrator.
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.onap.org")
+    monkeypatch.setenv("GERRIT_PROJECT", "operator/project")
+    monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
+
+    asked: list[str] = []
+
+    class _Client:
+        def get(self, path: str) -> dict[str, object]:
+            return {"aai/aai-common": {}}
+
+    def _build(host: str, **_: object) -> _Client:
+        asked.append(host)
+        return _Client()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _build
+    )
+
+    derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert asked == []
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_early_lookup_asks_the_gitreview_host_first(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host-only .gitreview names the push target; ask that server.
+
+    The orchestrator pushes to the file's host over an environment
+    GERRIT_SERVER, so a project confirmed on the environment's server
+    would be confirmed on the wrong one.
+    """
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project=""
+    )
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "true")
+    monkeypatch.setenv("GERRIT_SERVER", "gerrit.elsewhere.example")
+    monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
+    asked: list[str] = []
+
+    class _Client:
+        def get(self, path: str) -> dict[str, dict[str, str]]:
+            return {"aai/aai-common": {}}
+
+    def _build(host: str, **_: object) -> _Client:
+        asked.append(host)
+        return _Client()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _build
+    )
+
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert asked == ["gerrit.onap.org"]
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_provisional_gitreview_supplies_host_but_not_project(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No base ref yet: the file came from a default branch.
+
+    Direct-URL and dispatch runs know the pull request number before
+    they know its base ref. A .gitreview read then can only be a
+    default branch's, which may not be the branch the pull request
+    targets. Its host still serves derivation; its project, exported
+    as a confirmed fallback, would let the orchestrator push to a
+    project taken from the wrong branch, so it is declined and the
+    project falls through to the labelled guess.
+    """
+    from github2gerrit.config import derive_gerrit_parameters_detailed
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.setenv("PR_NUMBER", "29")
+    monkeypatch.setenv("PR_HEAD_REPO", "")
+    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+
+    derived = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/aai-aai-common"
+    )
+    assert derived.values["GERRIT_SERVER"] == "gerrit.onap.org"
+    assert derived.values["GERRIT_PROJECT"] == "aai/aai/common"
+    assert derived.project_guessed is True
+
+    # With the base ref known the read is pinned, and the project counts.
+    monkeypatch.setenv("GITHUB_BASE_REF", "master")
+    derived = derive_gerrit_parameters_detailed(
+        "onap", repository="onap/aai-aai-common"
+    )
+    assert derived.values["GERRIT_PROJECT"] == "aai/aai-common"
+    assert derived.project_confirmed is True
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_explicit_env_project_survives_a_differing_gitreview(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacement reaches the file's value only, never the operator's."""
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="multicloud/openstack"
+    )
+    monkeypatch.setenv("GERRIT_PROJECT", "operator/project")
+
+    result = apply_parameter_derivation(
+        {"GERRIT_PROJECT": "stale-org-project"},
+        "onap",
+        repository="onap/multicloud-openstack",
+        save_to_config=False,
+    )
+    apply_config_to_env(result)
+
+    assert os.environ["GERRIT_PROJECT"] == "operator/project"
+    assert not is_derived_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_guessed_project_is_recorded_as_a_guess(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guess crosses the environment handoff still labelled a guess.
+
+    is_derived_key alone cannot tell a confirmed derived project from a
+    name-only guess. The orchestrator refuses to push to a guess, and
+    that refusal is only as good as its ability to recognise one after
+    derivation has exported it through GERRIT_PROJECT.
+    """
+    from github2gerrit.config import is_guessed_key
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {}, "onap", repository="onap/aai-aai-common", save_to_config=False
+    )
+    apply_config_to_env(result)
+
+    assert os.environ["GERRIT_PROJECT"] == "aai/aai/common"
+    assert is_derived_key("GERRIT_PROJECT")
+    assert is_guessed_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_confirmed_project_is_not_recorded_as_a_guess(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from github2gerrit.config import is_guessed_key
+    from github2gerrit.gitreview import GitReviewInfo
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = GitReviewInfo(
+        host="gerrit.onap.org", port=29418, project="aai/aai-common"
+    )
+    monkeypatch.setenv("GERRIT_PROJECT", "")
+
+    result = apply_parameter_derivation(
+        {}, "onap", repository="onap/aai-aai-common", save_to_config=False
+    )
+    apply_config_to_env(result)
+
+    assert is_derived_key("GERRIT_PROJECT")
+    assert not is_guessed_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_explicit_project_shadows_the_guess_record(
+    mock_derive_creds,
+    mock_gitreview,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The guess never lands in the environment here, so it must not be
+    # recorded as what the environment holds.
+    from github2gerrit.config import is_guessed_key
+
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.setenv("GERRIT_PROJECT", "operator/project")
+
+    apply_parameter_derivation(
+        {}, "onap", repository="onap/aai-aai-common", save_to_config=False
+    )
+
+    assert not is_guessed_key("GERRIT_PROJECT")
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_ci_testing_skips_the_gitreview_read(
+    mock_derive_creds, mock_gitreview, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI_TESTING ignores .gitreview here as well as in the orchestrator.
+
+    What derivation reads is exported for the rest of the run, so a
+    project taken from the file here would reach the orchestrator as a
+    fallback after it had discarded its own read of the same file.
+    """
+    mock_derive_creds.return_value = (None, None)
+    monkeypatch.setenv("CI_TESTING", "true")
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+
+    derived = derive_gerrit_parameters(
+        "onap", repository="onap/multicloud-openstack"
+    )
+
+    mock_gitreview.assert_not_called()
+    assert derived["GERRIT_SERVER"] == "gerrit.onap.org"
+    assert derived["GERRIT_PROJECT"] == "multicloud/openstack"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_can_opt_in_to_the_gerrit_lookup(
+    mock_derive_creds,
+    mock_gitreview,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opt-in in a per-organization config file counts here.
+
+    Derivation runs before the loaded configuration has been exported
+    to the environment, and the cleanup paths that consume its result
+    return before the orchestrator would see the setting there.
+    """
+    config_file = tmp_path / "configuration.txt"
+    config_file.write_text(
+        "[onap]\nG2G_RESOLVE_PROJECT_VIA_GERRIT = true\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.delenv("GERRIT_SERVER", raising=False)
+    monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+
+    class _Client:
+        def get(self, path: str) -> dict[str, dict[str, str]]:
+            return {"aai/aai-common": {}}
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host",
+        lambda host, **_: _Client(),
+    )
+
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+
+    # A non-blank environment value still wins over the file.
+    monkeypatch.setenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", "false")
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai/common"
+
+
+@patch("github2gerrit.config._read_gitreview_info")
+@patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+def test_config_file_guards_and_credentials_reach_the_early_lookup(
+    mock_derive_creds,
+    mock_gitreview,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Everything the lookup reads, it reads from the file too.
+
+    A file that opts in and also promises no Gerrit calls is held to
+    the promise; a file that carries the HTTP credentials a server
+    demands for /projects/ gets them used. Both run before the file
+    has reached the environment.
+    """
+    monkeypatch.delenv("G2G_RESOLVE_PROJECT_VIA_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_NO_GERRIT", raising=False)
+    monkeypatch.delenv("G2G_DRYRUN_DISABLE_NETWORK", raising=False)
+    monkeypatch.delenv("GERRIT_HTTP_USER", raising=False)
+    monkeypatch.delenv("GERRIT_HTTP_PASSWORD", raising=False)
+    monkeypatch.delenv("GERRIT_SERVER", raising=False)
+    mock_derive_creds.return_value = (None, None)
+    mock_gitreview.return_value = None
+    built: list[dict[str, object]] = []
+
+    class _Client:
+        def get(self, path: str) -> dict[str, dict[str, str]]:
+            return {"aai/aai-common": {}}
+
+    def _build(host: str, **kwargs: object) -> _Client:
+        built.append(kwargs)
+        return _Client()
+
+    monkeypatch.setattr(
+        "github2gerrit.gerrit_rest.build_client_for_host", _build
+    )
+    config_file = tmp_path / "configuration.txt"
+    monkeypatch.setenv("G2G_CONFIG_PATH", str(config_file))
+
+    config_file.write_text(
+        "[onap]\nG2G_RESOLVE_PROJECT_VIA_GERRIT = true\nG2G_NO_GERRIT = true\n",
+        encoding="utf-8",
+    )
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai/common"
+    assert built == []
+
+    config_file.write_text(
+        "[onap]\nG2G_RESOLVE_PROJECT_VIA_GERRIT = true\n"
+        'GERRIT_HTTP_USER = "bot"\nGERRIT_HTTP_PASSWORD = "s3cret"\n'
+        'GERRIT_HTTP_BASE_PATH = "r"\n',
+        encoding="utf-8",
+    )
+    derived = derive_gerrit_parameters("onap", repository="onap/aai-aai-common")
+    assert derived["GERRIT_PROJECT"] == "aai/aai-common"
+    assert built == [
+        {"base_path": "r", "http_user": "bot", "http_password": "s3cret"}
+    ]
 
 
 def test_save_derived_parameters_omits_per_repository_project(

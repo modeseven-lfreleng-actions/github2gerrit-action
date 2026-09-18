@@ -274,7 +274,11 @@ class TestReadGitreviewHostRemote:
 class TestDeriveGerritParametersGitreview:
     """Verify the server derivation priority chain in derive_gerrit_parameters.
 
-    Priority: config file > .gitreview > heuristic gerrit.{org}.org
+    Priority: .gitreview > config file > heuristic gerrit.{org}.org
+
+    The orchestrator pushes to the .gitreview host whenever there is a
+    file, and the closed-pull-request handler queries the host derived
+    here together with the project, so the two have to agree.
     """
 
     @patch("github2gerrit.config._read_gitreview_info")
@@ -303,17 +307,44 @@ class TestDeriveGerritParametersGitreview:
     @patch("github2gerrit.config._read_gitreview_info")
     @patch("github2gerrit.config.load_org_config")
     @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
-    def test_config_file_beats_gitreview(
+    def test_gitreview_host_beats_config_file(
         self,
         mock_derive_creds: MagicMock,
         mock_load_org_config: MagicMock,
         mock_read_gitreview: MagicMock,
     ) -> None:
-        """Config file GERRIT_SERVER takes precedence over .gitreview."""
+        """.gitreview names the push target; the per-org file is a fallback.
+
+        Exporting the file's host alongside a project read from
+        .gitreview would have the close handler query the right
+        project on the wrong server.
+        """
         mock_derive_creds.return_value = (None, None)
         mock_read_gitreview.return_value = GitReviewInfo(
-            host="git.opendaylight.org"
+            host="git.opendaylight.org", project="l2switch"
         )
+        mock_load_org_config.return_value = {
+            "GERRIT_SERVER": "custom.gerrit.example.org",
+        }
+
+        derived = derive_gerrit_parameters(
+            "opendaylight", repository="opendaylight/l2switch"
+        )
+
+        assert derived["GERRIT_SERVER"] == "git.opendaylight.org"
+        assert derived["GERRIT_PROJECT"] == "l2switch"
+
+    @patch("github2gerrit.config._read_gitreview_info")
+    @patch("github2gerrit.config.load_org_config")
+    @patch("github2gerrit.ssh_config_parser.derive_gerrit_credentials")
+    def test_config_file_host_applies_without_gitreview(
+        self,
+        mock_derive_creds: MagicMock,
+        mock_load_org_config: MagicMock,
+        mock_read_gitreview: MagicMock,
+    ) -> None:
+        mock_derive_creds.return_value = (None, None)
+        mock_read_gitreview.return_value = None
         mock_load_org_config.return_value = {
             "GERRIT_SERVER": "custom.gerrit.example.org",
         }

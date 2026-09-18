@@ -403,16 +403,19 @@ signal never earns a fork unwarranted trust.
 
 Resolution order for a fork pull request:
 
-1. `.gitreview` from the base repository at the pull request's base branch,
+1. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT` inputs,
+   each for its own field — an operator configured them for this run
+2. `.gitreview` from the base repository at the pull request's base branch,
    via the GitHub API or `raw.githubusercontent.com`
-2. Explicit `GERRIT_SERVER` / `GERRIT_SERVER_PORT` / `GERRIT_PROJECT` inputs
 3. Per-organization configuration file
 4. Derivation from the organization name (`gerrit.[org].org`)
 
-The lookup stops at the base branch. It does not fall back to the repository
-default branch, and it does not read `.gitreview` through the API without an
-authoritative base ref, because either would answer for a branch the pull
-request does not target — and `.gitreview` outranks the explicit inputs.
+A value the tool's own derivation exported through those same variables does
+not count as explicit; the tool tracks which is which. The lookup stops at the
+base branch. It does not fall back to the repository default branch, and it
+does not read `.gitreview` through the API without an authoritative base ref,
+because either would answer for a branch the pull request does not target —
+and `.gitreview` outranks everything but an explicit input.
 
 The base repository's copy carries the same authority and lies outside an
 attacker's reach, so this costs no accuracy. Skipping straight to derivation
@@ -422,7 +425,9 @@ repositories whose name contains a hyphen that does not mark a path separator.
 For the same reason, the tool drops branch names that originate in the fork
 (`GITHUB_HEAD_REF` and the pull request head ref) from base-repository
 lookups. Duplicate detection, which resolves `.gitreview` independently and
-earlier, applies the same rule.
+earlier, applies the same rule, and so does parameter derivation: for an
+untrusted pull request it declines the workspace copy of `.gitreview` and the
+`master`/`main` fallbacks alike, reading the base branch only.
 
 Same-repository pull requests keep their previous behaviour and still read
 `.gitreview` from the pull request tree.
@@ -847,7 +852,9 @@ On gerrit.onap.org, `aai-aai-common` is `aai/aai-common`, not
 So the tool resolves the Gerrit project from the best source it has, in this
 order:
 
-1. An explicit `GERRIT_PROJECT` input — an operator said so.
+1. An explicit `GERRIT_PROJECT` input — an operator said so. A value the
+   tool's own parameter derivation exported through the same variable does
+   not count; the tool tracks which is which.
 2. The repository's `.gitreview` — the repository says so. For a pull request
    the tool reads this from the **base** repository at the base ref, never
    from a fork; see [Gerrit target resolution](#gerrit-target-resolution).
@@ -856,12 +863,29 @@ order:
    every reading of the hyphens against `GET /projects/?p=<first segment>`;
    exactly one match resolves it, and on two matches the tool refuses to
    choose.
-4. A guess that every hyphen is a separator, logged as a guess.
+4. A project from the per-organization configuration file, or one an earlier
+   derivation pass exported — somebody wrote it down, but nothing confirms
+   it for this repository.
+5. A guess that every hyphen is a separator, logged as a guess. A name with
+   no hyphens has only one reading and is not a guess.
+
+The tool resolves the project once per run and uses the result both for the
+Gerrit topic and for the push target, so the two cannot disagree. A real run
+refuses to push to a guess: with no `.gitreview`, no `GERRIT_PROJECT`, and a
+hyphenated name, it stops with an error naming the ambiguity and the three
+ways to settle it. This holds for direct URL invocations too, since a URL
+names the GitHub side and says nothing about the Gerrit project. Dry runs
+proceed on the guess, since they push nothing. Queries — the close handler,
+the sweeps — still use the guess, because a wrong query costs nothing.
 
 Every Linux Foundation repository carries a `.gitreview`, so in practice step
 2 answers. Step 3 is off by default because it adds a network call to name
 resolution; enable it for repositories that have no `.gitreview` and whose
-names contain hyphens inside segments.
+names contain hyphens inside segments. It applies wherever the tool resolves a
+project, including the closed-pull-request handler and the cleanup sweeps,
+reads the opt-in from the configuration file as well as the environment, asks
+each server once per prefix per run, and stays off under `G2G_NO_GERRIT`, which
+promises no Gerrit calls at all.
 
 ### Why this matters for cleanup
 
@@ -869,7 +893,9 @@ The close handler, the bulk sweep and duplicate detection all query Gerrit
 with `project:<name>`. A wrong name matches nothing and the tool reports
 "no change found" rather than an error — which is how 239 changes across 43
 ONAP projects stayed open after their pull requests closed (#441). The tool
-now resolves the project from `.gitreview` before any of those paths run.
+now resolves the project from `.gitreview` before any of those paths run,
+reports at INFO level when it finds no change, naming the project it asked
+about, and reports a failed lookup as a failure rather than as "no change".
 
 ## Configuration
 
@@ -983,7 +1009,12 @@ provided, the tool derives them from these sources, in priority order:
 
 Organization-based pattern, from the `ORGANIZATION` value:
 
-- Gerrit server: `gerrit.{organization}.org` (or from config file)
+- Gerrit server: the repository's `.gitreview` host when the file exists,
+  else the configuration file's `GERRIT_SERVER`, else
+  `gerrit.{organization}.org`. The derived host travels with the derived
+  project as one target, because the closed-pull-request handler queries
+  them together and the pipeline pushes to the `.gitreview` host whenever
+  the file exists.
 - SSH username: `{organization}.gh2gerrit`
 - Email: `releng+{organization}-gh2gerrit@linuxfoundation.org`
 

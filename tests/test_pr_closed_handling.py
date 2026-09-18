@@ -11,9 +11,11 @@ with exit 8, and that failure was what the report saw.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -86,6 +88,17 @@ class TestStopForPrState:
             _stop_for_pr_state(_ctx(event_name), "closed")
         assert exc.value.exit_code == int(ExitCode.PR_STATE_ERROR)
 
+    def test_clean_stop_releases_the_progress_display(self) -> None:
+        # The caller's own stop() is downstream of the raise. An
+        # in-process caller catching the exit would otherwise be left
+        # with a live Rich context.
+        tracker = MagicMock()
+        with pytest.raises(typer.Exit):
+            _stop_for_pr_state(
+                _ctx("pull_request", "edited"), "closed", tracker
+            )
+        tracker.stop.assert_called_once_with()
+
 
 class TestCloseHandlerDiagnostics:
     """Finding nothing must be audible, and must name the project."""
@@ -110,6 +123,54 @@ class TestCloseHandlerDiagnostics:
         assert "No open Gerrit change found" in caplog.text
         assert "'multicloud-openstack'" in caplog.text
         assert "gerrit.onap.org" in caplog.text
+
+    def test_a_failed_lookup_is_not_reported_as_no_change(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Authentication and network failures used to come back as
+        # None, and so as "nothing to abandon". The failure may have
+        # landed on either side of the abandon, so the report claims
+        # neither state; it says the state is unconfirmed.
+        with (
+            patch(
+                "github2gerrit.cli.abandon_gerrit_change_for_closed_pr",
+                side_effect=RuntimeError("HTTP 401"),
+            ),
+            caplog.at_level(logging.INFO, logger="github2gerrit"),
+        ):
+            _abandon_change_for_closed_pr(
+                _inputs(project="multicloud/openstack"),
+                _ctx("pull_request_target", "closed"),
+            )
+        assert "No open Gerrit change" not in caplog.text
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "HTTP 401" in warnings[0]
+        assert "could not be confirmed" in warnings[0]
+        assert "still open" not in warnings[0]
+        assert "'multicloud/openstack'" in warnings[0]
+
+    def test_missing_repository_is_a_warning_not_a_silent_skip(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The repository builds the pull request URL the trailer match
+        # needs. Falling through without it left no trace either.
+        gh = replace(_ctx("pull_request_target", "closed"), repository="")
+        with (
+            patch("github2gerrit.cli._run_gerrit_cleanup_tasks"),
+            patch("github2gerrit.cli._abandon_change_for_closed_pr") as abandon,
+            caplog.at_level(logging.WARNING, logger="github2gerrit"),
+        ):
+            _handle_pr_closed(
+                _inputs(project="multicloud/openstack"), gh, no_gerrit=False
+            )
+        abandon.assert_not_called()
+        assert "Cannot look for a Gerrit change" in caplog.text
+        assert "repository=''" in caplog.text
 
     def test_missing_project_is_a_warning_not_a_silent_skip(
         self, caplog: pytest.LogCaptureFixture

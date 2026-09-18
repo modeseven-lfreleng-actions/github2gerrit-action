@@ -150,6 +150,12 @@ def _stop_for_pr_state(
             style="yellow",
             progress_tracker=progress_tracker,
         )
+        # The caller's own stop() is downstream of this raise, and
+        # safe_console_print only suspends and resumes the display, so
+        # an in-process caller catching the exit would otherwise be
+        # left with an active Rich context.
+        if progress_tracker is not None:
+            progress_tracker.stop()
         raise typer.Exit(int(ExitCode.SUCCESS))
     exit_for_pr_state_error(gh.pr_number or 0, pr_state)
 
@@ -1508,13 +1514,13 @@ def main(
         "",
         "--gerrit-project",
         envvar="GERRIT_PROJECT",
-        help="Gerrit project (optional; .gitreview preferred).",
+        help="Gerrit project (optional; overrides .gitreview when set).",
     ),
     gerrit_server: str = typer.Option(
         "",
         "--gerrit-server",
         envvar="GERRIT_SERVER",
-        help="Gerrit server hostname (optional; .gitreview preferred).",
+        help="Gerrit server hostname (optional; overrides .gitreview).",
     ),
     gerrit_server_port: int = typer.Option(
         29418,
@@ -3076,14 +3082,23 @@ def _log_abandoned_change_url(
 
 
 def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
-    """Abandon the Gerrit change associated with a closed pull request."""
+    """Abandon the Gerrit change associated with a closed pull request.
+
+    Three outcomes, reported distinctly: a change was abandoned, no
+    open change carries this pull request's trailer, or the lookup or
+    abandon itself failed. The last two used to share one message, and
+    a failed query read as a clean "nothing to do". A failure does not
+    say which side of the abandon it happened on -- Gerrit may have
+    applied it and the response been lost -- so the report says the
+    state is unconfirmed rather than claiming the change is open.
+    """
     if gh.pr_number is None:
         return
+    log.debug(
+        "Checking for Gerrit change to abandon for PR #%s",
+        gh.pr_number,
+    )
     try:
-        log.debug(
-            "Checking for Gerrit change to abandon for PR #%s",
-            gh.pr_number,
-        )
         change_number = abandon_gerrit_change_for_closed_pr(
             pr_number=gh.pr_number,
             gerrit_server=data.gerrit_server,
@@ -3092,33 +3107,46 @@ def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
             dry_run=data.dry_run,
             progress_tracker=None,
         )
-        if change_number:
-            _log_abandoned_change_url(data, gh, change_number)
-            # Console output already done by
-            # abandon_gerrit_change_for_closed_pr
-        else:
-            # Audible on purpose. This is the outcome when the project
-            # name is wrong, and at debug level it hid 239 stranded
-            # changes on one server for six months (#441). Naming the
-            # project queried is what lets a reader spot the mismatch.
-            log.info(
-                "No open Gerrit change found for pull request #%s in "
-                "project %r on %s; nothing to abandon",
-                gh.pr_number,
-                data.gerrit_project,
-                data.gerrit_server,
-            )
-            safe_console_print(
-                f"⏩ No open Gerrit change for PR #{gh.pr_number} in "
-                f"project '{data.gerrit_project}'",
-                style="dim",
-            )
     except Exception as exc:
         log.warning(
-            "Failed to abandon Gerrit change for PR #%s: %s",
+            "Failed to look up or abandon the Gerrit change for pull "
+            "request #%s in project %r on %s: %s. Its state could not be "
+            "confirmed; check Gerrit.",
             gh.pr_number,
+            data.gerrit_project,
+            data.gerrit_server,
             exc,
         )
+        log.debug("Cleanup failure detail", exc_info=True)
+        safe_console_print(
+            f"⚠️  Could not confirm the Gerrit change state for PR "
+            f"#{gh.pr_number}: {exc}",
+            style="yellow",
+        )
+        return
+
+    if change_number:
+        _log_abandoned_change_url(data, gh, change_number)
+        # Console output already done by
+        # abandon_gerrit_change_for_closed_pr
+        return
+
+    # Audible on purpose. This is the outcome when the project name is
+    # wrong, and at debug level it hid 239 stranded changes on one
+    # server for six months (#441). Naming the project queried is what
+    # lets a reader spot the mismatch.
+    log.info(
+        "No open Gerrit change found for pull request #%s in "
+        "project %r on %s; nothing to abandon",
+        gh.pr_number,
+        data.gerrit_project,
+        data.gerrit_server,
+    )
+    safe_console_print(
+        f"⏩ No open Gerrit change for PR #{gh.pr_number} in "
+        f"project '{data.gerrit_project}'",
+        style="dim",
+    )
 
 
 def _handle_pr_closed(
@@ -3158,19 +3186,26 @@ def _handle_pr_closed(
     # Skip in G2G_NO_GERRIT: no Gerrit server to query
     if no_gerrit:
         pass
-    elif not (gh.pr_number and data.gerrit_server and data.gerrit_project):
+    elif not (
+        gh.pr_number
+        and gh.repository
+        and data.gerrit_server
+        and data.gerrit_project
+    ):
         # Say so. Silently skipping here is indistinguishable from a
         # successful cleanup that found nothing, and the change stays
         # open with no trace of why.
         log.warning(
             "Cannot look for a Gerrit change to abandon for PR #%s: "
-            "server=%r project=%r. Set GERRIT_SERVER and GERRIT_PROJECT, "
-            "or add a .gitreview so they can be derived.",
+            "repository=%r server=%r project=%r. Set GERRIT_SERVER and "
+            "GERRIT_PROJECT, or add a .gitreview so they can be derived; "
+            "the repository comes from GITHUB_REPOSITORY.",
             gh.pr_number,
+            gh.repository,
             data.gerrit_server,
             data.gerrit_project,
         )
-    elif gh.repository:
+    else:
         _abandon_change_for_closed_pr(data, gh)
 
     _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)

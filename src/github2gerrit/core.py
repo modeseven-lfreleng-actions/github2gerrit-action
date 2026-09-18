@@ -45,6 +45,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -54,6 +55,8 @@ from urllib.request import Request
 from urllib.request import urlopen
 
 from .commit_normalization import normalize_commit_title
+from .config import is_derived_key
+from .config import is_guessed_key
 from .gerrit_urls import create_gerrit_url_builder
 from .github_api import build_client
 from .github_api import close_pr
@@ -83,7 +86,7 @@ from .models import GitHubContext
 from .models import Inputs
 from .pr_content_filter import filter_pr_body
 from .project_names import RepoNames as RepoNames
-from .project_names import gerrit_project_lister
+from .project_names import opted_in_gerrit_project_lister
 from .project_names import resolve_repo_names
 from .reconcile_matcher import LocalCommit
 from .reconcile_matcher import create_local_commit
@@ -131,8 +134,78 @@ _MSG_MISSING_GERRIT_SERVER = (
     "Missing Gerrit host. Provide it via the GERRIT_SERVER "
     "input/environment variable, .gitreview file, or action configuration."
 )
-_MSG_MISSING_GERRIT_PROJECT = "missing GERRIT_PROJECT"
+_MSG_AMBIGUOUS_GERRIT_PROJECT = (
+    "missing GERRIT_PROJECT: no .gitreview names the Gerrit project, and "
+    "the GitHub name %r is ambiguous (%r?). Add a .gitreview to the "
+    "repository, set GERRIT_PROJECT, or enable G2G_RESOLVE_PROJECT_VIA_GERRIT."
+)
 _MSG_DNS_RESOLUTION_FAILED = "DNS resolution failed for '%s'"
+
+
+def _explicit_input(inputs: Inputs | None, key: str, value: str) -> str | None:
+    """Return *value* when an operator set it, else ``None``.
+
+    Parameter derivation exports its fallbacks through the same
+    variables :class:`Inputs` reads, so a non-empty value alone does not
+    mean an operator set it; the provenance record does.
+    """
+    if inputs is None:
+        return None
+    value = value.strip()
+    if not value or is_derived_key(key):
+        return None
+    return value
+
+
+def _split_gerrit_project_input(
+    inputs: Inputs | None,
+) -> tuple[str | None, str | None]:
+    """Sort ``inputs.gerrit_project`` into an explicit or a derived value.
+
+    Returns ``(explicit, fallback)`` with at most one of them set. An
+    explicit value outranks ``.gitreview``; a derived one is only a
+    fallback for when nothing authoritative names the project.
+
+    A derived value that derivation itself recorded as a *guess* is
+    dropped rather than offered as a fallback. Handing it back as one
+    would launder it: :func:`resolve_repo_names` treats a fallback as
+    confirmed, and the push-time guard that refuses to push to a guess
+    would never see it. This orchestrator makes the identical guess
+    from the same name if it comes to that, and marks it as such.
+    """
+    if inputs is None:
+        return None, None
+    project = inputs.gerrit_project.strip()
+    explicit = _explicit_input(inputs, "GERRIT_PROJECT", project)
+    if explicit is not None:
+        return explicit, None
+    if not project:
+        return None, None
+    if is_guessed_key("GERRIT_PROJECT"):
+        log.debug(
+            "GERRIT_PROJECT %r is derivation's own guess; not treating it "
+            "as a confirmed fallback",
+            project,
+        )
+        return None, None
+    return None, project
+
+
+def _push_host(gitreview: GerritInfo | None, inputs: Inputs | None) -> str:
+    """The host a push would go to, before any derived fallback.
+
+    An explicit ``GERRIT_SERVER`` outranks the ``.gitreview`` host, as
+    an explicit ``GERRIT_PROJECT`` outranks the file's project: the
+    operator configured it for this run. Returns ``""`` when neither
+    names one, and the caller falls back to derived inputs.
+    """
+    explicit = _explicit_input(
+        inputs, "GERRIT_SERVER", inputs.gerrit_server if inputs else ""
+    )
+    if explicit is not None:
+        return explicit
+    return (gitreview.host if gitreview else "").strip()
+
 
 # Removed _insert_issue_id_into_commit_message - dead code
 # All commit message building now uses _build_commit_message_with_trailers
@@ -2436,8 +2509,18 @@ class Orchestrator:
         if not (self.workspace / ".git").exists():
             self._prepare_workspace_checkout(inputs=inputs, gh=gh)
 
-        gitreview = self._read_gitreview(self.workspace / ".gitreview", gh)
-        repo_names = self._derive_repo_names(gitreview, gh)
+        gitreview = (
+            None
+            if inputs.ci_testing
+            else self._read_gitreview(self.workspace / ".gitreview", gh)
+        )
+        if inputs.ci_testing:
+            # Not read at all, rather than read and discarded: the mode
+            # is documented as ignoring the file, so a malformed local
+            # copy must not fail the run and a missing one must not
+            # trigger remote fetches.
+            log.info("CI_TESTING enabled: ignoring .gitreview file")
+        repo_names = self._derive_repo_names(gitreview, gh, inputs)
         # Retain resolved names for topic construction in query/recovery
         # paths so they always agree with the pushed topic.
         self._repo_names = repo_names
@@ -2818,7 +2901,10 @@ class Orchestrator:
         """Read and parse a workspace ``.gitreview``.
 
         IO failures and malformed content raise distinct messages so a
-        permissions problem is not mistaken for a bad file.
+        permissions problem is not mistaken for a bad file. A file that
+        names a host but no project is kept: the host is the push
+        target, and the project can still come from an explicit input,
+        the opt-in server lookup, or, for a dry run, the name.
         """
         from .gitreview import parse_gitreview
 
@@ -2829,9 +2915,15 @@ class Orchestrator:
             raise OrchestratorError(msg) from exc
 
         info_local = parse_gitreview(text)
-        if not info_local or not info_local.project:
-            msg = "invalid .gitreview: missing host/project"
+        if not info_local or not info_local.host:
+            msg = "invalid .gitreview: missing host"
             raise OrchestratorError(msg)
+        if not info_local.project:
+            log.info(
+                ".gitreview names host %s but no project; the project will "
+                "be resolved from inputs, Gerrit, or the repository name",
+                info_local.host,
+            )
 
         log.debug("Parsed .gitreview: %s", info_local)
         return info_local
@@ -2936,8 +3028,16 @@ class Orchestrator:
             default_branches=() if untrusted_tree else ("master", "main"),
         )
         if info and not info.project:
-            log.warning("Remote .gitreview missing project field; ignoring")
-            return None
+            # Kept rather than discarded: the host is the push target,
+            # and dropping it would let the project be confirmed on
+            # that host by the lookup and then pushed under a different
+            # host taken from the inputs.
+            log.info(
+                "Remote .gitreview names host %s but no project; the "
+                "project will be resolved from inputs, Gerrit, or the "
+                "repository name",
+                info.host,
+            )
         return info
 
     def _read_gitreview(
@@ -2998,59 +3098,71 @@ class Orchestrator:
         self,
         gitreview: GerritInfo | None,
         gh: GitHubContext,
+        inputs: Inputs | None = None,
     ) -> RepoNames:
         """Settle both names for the repository being processed.
 
+        This is the one place the Gerrit project is resolved for a run;
+        :meth:`_resolve_gerrit_info` takes the project from the result
+        rather than resolving it again, so the topic a change is filed
+        under and the project it is pushed to cannot disagree.
+
         Delegates to :func:`project_names.resolve_repo_names`, which
-        owns the mapping in both directions. ``.gitreview`` is
-        authoritative when present. Without it the Gerrit path has to
-        be inferred from the GitHub name, which is ambiguous —
-        ``aai-aai-common`` is ``aai/aai-common``, not ``aai/aai/common``
-        — so the fallback may consult Gerrit's project list when
+        owns the mapping in both directions and the order of trust. An
+        explicit ``GERRIT_PROJECT`` outranks ``.gitreview``; a value
+        that parameter derivation exported through the same variable
+        does not, and is offered only as a fallback below the server
+        lookup. Without either the Gerrit path has to be inferred from
+        the GitHub name, which is ambiguous — ``aai-aai-common`` is
+        ``aai/aai-common``, not ``aai/aai/common`` — so the fallback may
+        consult Gerrit's project list when
         ``G2G_RESOLVE_PROJECT_VIA_GERRIT`` is enabled, and otherwise
         guesses and says so.
         """
+        explicit, fallback = _split_gerrit_project_input(inputs)
         repo_full = gh.repository
-        if not gitreview and (not repo_full or "/" not in repo_full):
+        gitreview_project = (gitreview.project if gitreview else "").strip()
+        if (
+            not gitreview_project
+            and explicit is None
+            and (not repo_full or "/" not in repo_full)
+        ):
             raise OrchestratorError(_MSG_BAD_REPOSITORY_CONTEXT)
 
         names = resolve_repo_names(
             repo_full,
-            gitreview_project=gitreview.project if gitreview else None,
-            list_projects=self._gerrit_project_lister(gitreview),
+            explicit_project=explicit,
+            gitreview_project=gitreview_project or None,
+            list_projects=None
+            if explicit is not None
+            else self._gerrit_project_lister(gitreview, inputs),
+            fallback_project=fallback,
         )
-        log.debug(
-            "Derived names from %s: %s",
-            ".gitreview" if gitreview else "context",
-            names,
-        )
+        log.debug("Derived names: %s", names)
         return names
 
     def _gerrit_project_lister(
-        self, gitreview: GerritInfo | None
+        self, gitreview: GerritInfo | None, inputs: Inputs | None = None
     ) -> Callable[[str], list[str]] | None:
         """Return a Gerrit project lister for name disambiguation, or None.
 
-        Only offered when opted in and when there is no ``.gitreview``
-        to make the question moot. Needs a host to ask, which without
-        ``.gitreview`` can only come from ``GERRIT_SERVER``.
+        Only offered when ``.gitreview`` did not name the project; a
+        file that carries only connection details leaves the question
+        open. The shared helper applies the opt-in and the network
+        guards. The host asked is the host the push will go to, in the
+        order :meth:`_resolve_gerrit_info` settles it: an explicit
+        ``GERRIT_SERVER``, else the file's, else a derived input, else
+        the environment. A project confirmed on one server and pushed
+        to another would be no confirmation at all.
         """
-        if gitreview or not env_bool("G2G_RESOLVE_PROJECT_VIA_GERRIT", False):
+        if gitreview and gitreview.project.strip():
             return None
-        host = os.getenv("GERRIT_SERVER", "").strip()
-        if not host:
-            log.debug(
-                "G2G_RESOLVE_PROJECT_VIA_GERRIT set but no GERRIT_SERVER to "
-                "ask; falling back to the name guess"
-            )
-            return None
-        try:
-            from .gerrit_rest import build_client_for_host
-
-            return gerrit_project_lister(build_client_for_host(host))
-        except Exception as exc:
-            log.debug("Could not build a Gerrit client for %s: %s", host, exc)
-            return None
+        host = (
+            _push_host(gitreview, inputs)
+            or (inputs.gerrit_server if inputs else "")
+            or os.getenv("GERRIT_SERVER", "")
+        ).strip()
+        return opted_in_gerrit_project_lister(host)
 
     def _resolve_gerrit_info(
         self,
@@ -3059,6 +3171,14 @@ class Orchestrator:
         repo: RepoNames,
     ) -> GerritInfo:
         """Resolve Gerrit connection info from .gitreview or inputs.
+
+        The project is *repo*'s, settled by :meth:`_derive_repo_names`;
+        only the host and port are resolved here. An explicit
+        ``GERRIT_SERVER`` outranks ``.gitreview``, as an explicit
+        ``GERRIT_PROJECT`` does; otherwise the file's host and port
+        apply when there is a file, and the inputs' otherwise. A guessed
+        project is refused for any run that pushes, whichever supplied
+        the host.
 
         After resolution, the Gerrit host is validated via DNS to
         catch bogus hostnames early — regardless of whether the host
@@ -3073,40 +3193,59 @@ class Orchestrator:
         log.debug("_resolve_gerrit_info: gitreview=%s", gitreview)
 
         # If CI testing flag is set, ignore .gitreview and use environment
-        if inputs.ci_testing:
+        if inputs.ci_testing and gitreview:
             log.info("CI_TESTING enabled: ignoring .gitreview file")
             gitreview = None
 
-        if gitreview:
+        project = repo.project_gerrit
+        if repo.guessed:
+            # Nothing named the project: no .gitreview project, no
+            # input, no confirmed fallback, no server match, and the
+            # name has more than one reading. Pushing to a guess is
+            # acceptable only where nothing is pushed. A direct URL
+            # identifies the GitHub side, not the Gerrit project, so it
+            # earns no exception; nor does a .gitreview that supplied
+            # the host but not the project.
+            if not inputs.dry_run:
+                raise OrchestratorError(
+                    _MSG_AMBIGUOUS_GERRIT_PROJECT
+                    % (repo.project_github, project)
+                )
+            log.info("Dry run: using guessed Gerrit project '%s'", project)
+
+        explicit_host = _explicit_input(
+            inputs, "GERRIT_SERVER", inputs.gerrit_server
+        )
+        if gitreview and explicit_host is None:
             log.debug("Using .gitreview settings: %s", gitreview)
             self._validate_resolved_gerrit_host(gitreview.host)
-            return gitreview
+            if gitreview.project == project:
+                return gitreview
+            if gitreview.project.strip():
+                log.info(
+                    "Using Gerrit project %r over .gitreview's %r: an "
+                    "explicit GERRIT_PROJECT outranks the file",
+                    project,
+                    gitreview.project,
+                )
+            return dataclass_replace(gitreview, project=project)
 
         host = inputs.gerrit_server.strip()
         if not host:
             raise OrchestratorError(_MSG_MISSING_GERRIT_SERVER)
+        if gitreview and gitreview.host != host:
+            log.info(
+                "Using Gerrit server %r over .gitreview's %r: an explicit "
+                "GERRIT_SERVER outranks the file",
+                host,
+                gitreview.host,
+            )
         port_s = str(inputs.gerrit_server_port).strip() or "29418"
         try:
             port = int(port_s)
         except ValueError as exc:
             msg = "bad GERRIT_SERVER_PORT"
             raise OrchestratorError(msg) from exc
-
-        project = inputs.gerrit_project.strip()
-        if not project:
-            if inputs.dry_run:
-                project = repo.project_gerrit
-                log.info("Dry run: using derived Gerrit project '%s'", project)
-            # When a target URL was provided via CLI (G2G_TARGET_URL is set),
-            # use the derived Gerrit project name from the repository
-            elif os.getenv("G2G_TARGET_URL", "").strip():
-                project = repo.project_gerrit
-                log.info(
-                    "Using derived Gerrit project '%s' from repository name",
-                    project,
-                )
-            else:
-                raise OrchestratorError(_MSG_MISSING_GERRIT_PROJECT)
 
         info = make_gitreview_info(host=host, port=port, project=project)
         log.debug("Resolved Gerrit info: %s", info)

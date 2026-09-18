@@ -100,9 +100,9 @@ set by GitHub Actions) and undergo proper boolean parsing.
 
 | Flag(s)                              | Env var                     | Default | Description                                                  |
 | ------------------------------------ | --------------------------- | ------- | ------------------------------------------------------------ |
-| `--gerrit-server TEXT`               | `GERRIT_SERVER`             | `""`    | Gerrit server hostname (optional; `.gitreview` preferred)    |
+| `--gerrit-server TEXT`               | `GERRIT_SERVER`             | `""`    | Gerrit server hostname (optional; overrides `.gitreview`)    |
 | `--gerrit-server-port INTEGER`       | `GERRIT_SERVER_PORT`        | `29418` | Gerrit SSH port                                              |
-| `--gerrit-project TEXT`              | `GERRIT_PROJECT`            | `""`    | Gerrit project (optional; `.gitreview` preferred)            |
+| `--gerrit-project TEXT`              | `GERRIT_PROJECT`            | `""`    | Gerrit project (optional; overrides `.gitreview` when set)   |
 | `--gerrit-ssh-user-g2g TEXT`         | `GERRIT_SSH_USER_G2G`       | `""`    | Gerrit SSH username (e.g., automation bot account)           |
 | `--gerrit-ssh-user-g2g-email TEXT`   | `GERRIT_SSH_USER_G2G_EMAIL` | `""`    | Email address for the Gerrit SSH user                        |
 | `--gerrit-ssh-privkey-g2g TEXT`      | `GERRIT_SSH_PRIVKEY_G2G`    | `""`    | SSH private key content used to authenticate to Gerrit       |

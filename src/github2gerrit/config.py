@@ -45,17 +45,21 @@
 
 from __future__ import annotations
 
-import configparser
 import logging
 import os
-import re
 import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any
-from typing import cast
 
+from .config_ini import _coerce_value
+from .config_ini import _load_ini
+from .config_ini import _select_section
+from .project_names import ProjectSource
 from .utils import env_bool
+from .utils import setting_bool
 
 
 log = logging.getLogger("github2gerrit.config")
@@ -137,243 +141,6 @@ KNOWN_KEYS: set[str] = {
     "LOG_RECONCILE_JSON",
     "VERIFY_DIGEST_STRICT",
 }
-
-_ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
-
-
-def _expand_env_refs(value: str) -> str:
-    """Expand ${ENV:VAR} references using current environment."""
-
-    def repl(match: re.Match[str]) -> str:
-        var = match.group(1)
-        return os.getenv(var, "") or ""
-
-    return _ENV_REF.sub(repl, value)
-
-
-def _strip_quotes(value: str) -> str:
-    v = value.strip()
-    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
-        return v[1:-1]
-    return v
-
-
-def _normalize_bool_like(value: str) -> str | None:
-    """Return 'true'/'false' for boolean-like values, else None."""
-    s = value.strip().lower()
-    if s in {"1", "true", "yes", "on"}:
-        return "true"
-    if s in {"0", "false", "no", "off"}:
-        return "false"
-    return None
-
-
-def _coerce_value(raw: str) -> str:
-    """Coerce a raw string to normalized representation."""
-    expanded = _expand_env_refs(raw)
-    unquoted = _strip_quotes(expanded)
-    # Normalize escaped newline sequences into real newlines so that values
-    # like SSH keys or known_hosts entries can be specified inline using
-    # '\n' or '\r\n' in configuration files.
-    normalized_newlines = (
-        unquoted.replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\r\n", "\n")
-    )
-
-    # Additional sanitization for SSH private keys
-    if (
-        "-----BEGIN" in normalized_newlines
-        and "PRIVATE KEY-----" in normalized_newlines
-    ) or (
-        "ssh-" in normalized_newlines.lower()
-        and "key" in normalized_newlines.lower()
-    ):
-        # Clean up SSH key formatting: remove extra whitespace, normalize
-        # line endings
-        lines = normalized_newlines.split("\n")
-        sanitized_lines = []
-        for line in lines:
-            cleaned = line.strip()
-            if cleaned:
-                # Remove any stray quotes that might have been embedded in the
-                # key content
-                cleaned = cleaned.replace('"', "").replace("'", "")
-                sanitized_lines.append(cleaned)
-        normalized_newlines = "\n".join(sanitized_lines)
-
-    b = _normalize_bool_like(normalized_newlines)
-    return b if b is not None else normalized_newlines
-
-
-def _select_section(
-    cp: configparser.RawConfigParser,
-    org: str,
-) -> str | None:
-    """Find a section name case-insensitively."""
-    target = org.strip().lower()
-    for sec in cp.sections():
-        if sec.strip().lower() == target:
-            return sec
-    return None
-
-
-def _sanitize_ssh_key_content(content_lines: list[str]) -> str:
-    """Clean the base64 content of an inline multi-line SSH key value."""
-    sanitized_lines: list[str] = []
-    for content_line in content_lines:
-        cleaned = content_line.strip()
-        # Preserve SSH key headers/footers but clean base64 content
-        if cleaned.startswith("-----") or not cleaned:
-            sanitized_lines.append(cleaned)
-            continue
-        # Remove embedded quotes and all whitespace from base64 content.
-        # Base64 bodies contain no whitespace, so stripping any embedded
-        # spaces/tabs (e.g. from wrapped copy-paste) repairs the content
-        # rather than corrupting it. Headers/footers are preserved above.
-        cleaned = cleaned.replace('"', "").replace("'", "")
-        cleaned = "".join(cleaned.split())
-        if cleaned:
-            sanitized_lines.append(cleaned)
-    return "\\n".join(sanitized_lines)
-
-
-def _consume_multiline_quote(
-    lines: list[str],
-    start: int,
-    left: str,
-    out_lines: list[str],
-) -> int:
-    """Collapse a `key = "` ... `"` block into a single escaped line.
-
-    Returns the index of the next unprocessed line.
-    """
-    i = start + 1
-    block: list[str] = []
-    # Collect until a line with only a closing quote (ignoring spaces)
-    while i < len(lines) and lines[i].strip() != '"':
-        block.append(lines[i])
-        i += 1
-    if i < len(lines) and lines[i].strip() == '"':
-        joined = "\\n".join(block)
-        out_lines.append(f'{left} "{joined}"')
-        return i + 1
-    # No closing quote found; keep the original opening line.
-    log.debug(
-        "Multi-line quote not properly closed for line: %s",
-        lines[start][:50],
-    )
-    out_lines.append(lines[start])
-    return i
-
-
-def _consume_inline_quote(
-    lines: list[str],
-    start: int,
-    left: str,
-    rhs: str,
-    out_lines: list[str],
-) -> int:
-    """Collapse a value that opens with `"` but spans multiple lines.
-
-    Handles SSH private keys and other values that start with a quote but
-    contain embedded content that might otherwise confuse configparser.
-    Returns the index of the next unprocessed line.
-    """
-    content_lines = [rhs[1:]]  # Remove opening quote
-    i = start + 1
-    while i < len(lines):
-        current_line = lines[i]
-        stripped = current_line.strip()
-        if stripped.endswith('"') and not stripped.endswith('\\"'):
-            # Found closing quote - remove it and add final line
-            final_content = current_line.rstrip()
-            if final_content.endswith('"'):
-                final_content = final_content[:-1]
-            # Only add if there's content after removing quote
-            if final_content:
-                content_lines.append(final_content)
-            break
-        content_lines.append(current_line)
-        i += 1
-
-    # Join all content and sanitize for SSH keys
-    full_content = "\\n".join(content_lines)
-
-    # Special handling for SSH private keys - remove extra whitespace
-    # and line breaks
-    key_name = left.split("=")[0].strip().upper()
-    if "SSH" in key_name and "KEY" in key_name:
-        full_content = _sanitize_ssh_key_content(content_lines)
-
-    log.debug(
-        "Processed multi-line value for key %s (length: %d)",
-        left.split("=")[0].strip(),
-        len(full_content),
-    )
-    out_lines.append(f'{left} "{full_content}"')
-    return i + 1
-
-
-def _preprocess_config_text(raw_text: str) -> str:
-    """Collapse multi-line quoted values into single escaped lines.
-
-    Pre-process simple multi-line quoted values of the form::
-
-        key = "
-        line1
-        line2
-        "
-
-    We collapse these into a single line with '\\n' escapes so that
-    configparser can ingest them reliably; later, _coerce_value()
-    converts the escapes back to real newlines. SSH private keys and
-    other multi-line values with formatting inconsistencies are
-    sanitized as part of this process.
-    """
-    lines = raw_text.splitlines()
-    out_lines: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        eq_idx = line.find("=")
-        if eq_idx == -1:
-            out_lines.append(line)
-            i += 1
-            continue
-
-        left = line[: eq_idx + 1]
-        rhs = line[eq_idx + 1 :].strip()
-
-        # Handle standard multi-line quoted values: key = "
-        if rhs == '"':
-            i = _consume_multiline_quote(lines, i, left, out_lines)
-            continue
-
-        if rhs.startswith('"') and not rhs.endswith('"'):
-            i = _consume_inline_quote(lines, i, left, rhs, out_lines)
-            continue
-
-        out_lines.append(line)
-        i += 1
-
-    return "\n".join(out_lines) + ("\n" if out_lines else "")
-
-
-def _load_ini(path: Path) -> configparser.RawConfigParser:
-    cp = configparser.RawConfigParser()
-    # Preserve option case; mypy requires a cast for attribute requirement
-    cast(Any, cp).optionxform = str
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            raw_text = fh.read()
-        preprocessed = _preprocess_config_text(raw_text)
-        cp.read_string(preprocessed)
-    except FileNotFoundError as exc:
-        log.debug("Config file not found: %s (%s)", path, exc)
-    except Exception as exc:
-        log.warning("Failed to read config file %s: %s", path, exc)
-    return cp
 
 
 def _detect_org() -> str | None:
@@ -504,6 +271,15 @@ def apply_config_to_env(cfg: dict[str, str]) -> None:
 # otherwise overwrite one another's values.
 DERIVED_KEYS_ENV = "G2G_DERIVED_KEYS"
 
+# Which derived keys hold a *guess*: a value inferred with nothing to
+# confirm it, as opposed to one read from `.gitreview`, confirmed against
+# Gerrit, or written in a configuration file. A guess is worth exporting
+# where nothing else names a project, because a Gerrit query against it
+# costs nothing if wrong; a push against it does not, and the consumer
+# that pushes needs to be able to tell. Same scoping and same rules as
+# DERIVED_KEYS_ENV; a key recorded here is always also recorded there.
+GUESSED_KEYS_ENV = "G2G_GUESSED_KEYS"
+
 # Serialises the read-modify-write below.  The comment above explains
 # why the record is process-scoped rather than per-pull-request, and
 # that reasoning still holds -- but "established once before the pool
@@ -515,10 +291,26 @@ DERIVED_KEYS_ENV = "G2G_DERIVED_KEYS"
 _DERIVED_KEYS_LOCK = threading.Lock()
 
 
+def _keys_recorded_in(env_name: str) -> set[str]:
+    """Return the config keys currently recorded in *env_name*."""
+    raw = os.getenv(env_name, "")
+    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+
+def _record_keys_in(env_name: str, keys: Iterable[str]) -> None:
+    """Add *keys* to the record in *env_name*, under the lock."""
+    incoming = {k.strip().upper() for k in keys if k and k.strip()}
+    if not incoming:
+        return
+    with _DERIVED_KEYS_LOCK:
+        os.environ[env_name] = ",".join(
+            sorted(_keys_recorded_in(env_name) | incoming)
+        )
+
+
 def _derived_keys() -> set[str]:
     """Return the set of config keys currently recorded as derived."""
-    raw = os.getenv(DERIVED_KEYS_ENV, "")
-    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+    return _keys_recorded_in(DERIVED_KEYS_ENV)
 
 
 def mark_derived_keys(keys: Iterable[str]) -> None:
@@ -534,13 +326,16 @@ def mark_derived_keys(keys: Iterable[str]) -> None:
         keys: Config key names (case-insensitive).  Empty names are
             ignored.
     """
-    incoming = {k.strip().upper() for k in keys if k and k.strip()}
-    if not incoming:
-        return
-    with _DERIVED_KEYS_LOCK:
-        os.environ[DERIVED_KEYS_ENV] = ",".join(
-            sorted(_derived_keys() | incoming)
-        )
+    _record_keys_in(DERIVED_KEYS_ENV, keys)
+
+
+def mark_guessed_keys(keys: Iterable[str]) -> None:
+    """Record which derived keys hold a guess; see :data:`GUESSED_KEYS_ENV`.
+
+    Callers record a key here in addition to :func:`mark_derived_keys`,
+    never instead of it.
+    """
+    _record_keys_in(GUESSED_KEYS_ENV, keys)
 
 
 def is_derived_key(key: str) -> bool:
@@ -550,6 +345,11 @@ def is_derived_key(key: str) -> bool:
     at all", so callers should test the value's presence separately.
     """
     return key.strip().upper() in _derived_keys()
+
+
+def is_guessed_key(key: str) -> bool:
+    """Return ``True`` when ``key``'s derived value is a guess."""
+    return key.strip().upper() in _keys_recorded_in(GUESSED_KEYS_ENV)
 
 
 def filter_known(
@@ -609,20 +409,81 @@ def _read_gitreview_host(repository: str | None = None) -> str | None:
     return info.host if info else None
 
 
+@dataclass(frozen=True)
+class DerivedParameters:
+    """What :func:`derive_gerrit_parameters_detailed` worked out.
+
+    Attributes:
+        values: Config keys to their derived values, as
+            :func:`derive_gerrit_parameters` returns them.
+        project_source: Where ``GERRIT_PROJECT`` in *values* came from;
+            see :data:`project_names.ProjectSource`.  ``None`` when no
+            project was derived.  Two questions hang on it: only a
+            *confirmed* project (``.gitreview`` or Gerrit) may displace
+            one somebody wrote in a configuration file, and a *guess* is
+            worth exporting for queries but must stay labelled so the
+            push refuses it.
+        host_from_gitreview: ``True`` when ``GERRIT_SERVER`` in *values*
+            is the ``.gitreview`` host.  That host travels with the
+            project as one target and, like a confirmed project, may
+            displace a per-organization configuration value.
+    """
+
+    values: dict[str, str] = field(default_factory=dict)
+    project_source: ProjectSource | None = None
+    host_from_gitreview: bool = False
+
+    @property
+    def project_confirmed(self) -> bool:
+        """``True`` when ``.gitreview`` or Gerrit supplied the project."""
+        return self.project_source in ("gitreview", "gerrit")
+
+    @property
+    def project_guessed(self) -> bool:
+        """``True`` when the project is a reading of a hyphenated name."""
+        return self.project_source == "guess"
+
+
 def derive_gerrit_parameters(
     organization: str | None, repository: str | None = None
 ) -> dict[str, str]:
+    """Derive Gerrit parameters; see :func:`derive_gerrit_parameters_detailed`.
+
+    Returns only the derived values.  Callers that must know whether
+    the project is a guess use the detailed form.
+    """
+    return derive_gerrit_parameters_detailed(organization, repository).values
+
+
+def derive_gerrit_parameters_detailed(
+    organization: str | None, repository: str | None = None
+) -> DerivedParameters:
     """Derive Gerrit parameters using SSH config, git config, and org fallback.
 
     Priority order for server derivation:
-    1. Per-org configuration file entry (GERRIT_SERVER)
-    2. .gitreview host field (local file or fetched from GitHub)
+    1. .gitreview host field (local file or fetched from GitHub); this
+       is the host the orchestrator pushes to whenever there is a file
+    2. Per-org configuration file entry (GERRIT_SERVER)
     3. Heuristic fallback: gerrit.[org].org
+
+    The host and the project are exported as one target: the closed-
+    pull-request handler and the cleanup sweeps query them together,
+    so a project resolved from ``.gitreview`` (or confirmed against its
+    host) must travel with that host, not with one from a per-org file.
 
     Priority order for project derivation:
     1. .gitreview project field, from the same read as the host
-    2. A guess from the GitHub repository name, every hyphen read as a
-       path separator (see :mod:`github2gerrit.project_names`)
+    2. Gerrit's own project list, when ``G2G_RESOLVE_PROJECT_VIA_GERRIT``
+       is enabled and the run permits Gerrit calls
+    3. The GitHub repository name, every hyphen read as a path
+       separator (see :mod:`github2gerrit.project_names`); a guess when
+       the name has hyphens, and reported as one
+
+    An explicit ``GERRIT_PROJECT`` already in the environment outranks
+    all of these and survives :func:`apply_config_to_env` untouched, so
+    the Gerrit lookup is not made in that case: its answer would be
+    discarded, and the request would cost an authenticated round trip
+    on every such run.
 
     The project matters here, not only in the orchestrator, because the
     closed-pull-request handler and the cleanup sweeps query Gerrit
@@ -630,7 +491,10 @@ def derive_gerrit_parameters(
     orchestrator ever resolves ``.gitreview`` itself.  Deriving the raw
     GitHub name -- ``multicloud-openstack`` for a project that is
     really ``multicloud/openstack`` -- made those queries match nothing
-    and left every such change open (#441).
+    and left every such change open (#441).  The Gerrit lookup is
+    offered here for the same reason: those paths return before the
+    orchestrator runs, so an option honoured only there would leave
+    them with the guess the option exists to avoid.
 
     Priority order for credential derivation:
     1. SSH config user for gerrit.* hosts (checks generic and specific patterns)
@@ -642,14 +506,15 @@ def derive_gerrit_parameters(
         repository: GitHub repository in owner/repo format (optional)
 
     Returns:
-        Dict with derived parameter values:
+        The derived values, keyed as follows, and whether the project
+        among them is a guess:
         - GERRIT_SSH_USER_G2G: From SSH config or [org].gh2gerrit
         - GERRIT_SSH_USER_G2G_EMAIL: From git config or fallback email
         - GERRIT_SERVER: Resolved from config, .gitreview, or gerrit.[org].org
-        - GERRIT_PROJECT: From .gitreview, else guessed from the repository
+        - GERRIT_PROJECT: From .gitreview or Gerrit, else guessed
     """
     if not organization:
-        return {}
+        return DerivedParameters()
 
     org = organization.strip().lower()
 
@@ -657,39 +522,85 @@ def derive_gerrit_parameters(
     config = load_org_config(org)
     configured_server = config.get("GERRIT_SERVER", "").strip()
 
-    # Read .gitreview once for both host and project. The host is
-    # only needed when no config file entry names one, but the project
-    # is per-repository and the config file cannot supply it, so the
-    # file is worth reading whenever a repository is known.
-    gitreview = (
-        _read_gitreview_info(repository)
-        if repository or not configured_server
-        else None
-    )
-    gitreview_host = (
-        gitreview.host if gitreview and not configured_server else None
-    )
+    # Read .gitreview once for both host and project. The project is
+    # per-repository and the configuration file cannot supply it, so
+    # the file is worth reading whenever a repository is known.
+    # CI_TESTING is documented as ignoring the file altogether, and
+    # what is derived here is exported for the rest of the run, so the
+    # file is not read at all in that mode rather than read and
+    # discarded later.
+    ci_testing = setting_bool("CI_TESTING", config)
+    if ci_testing:
+        log.debug("CI_TESTING enabled: not reading .gitreview for derivation")
+    gitreview = _read_gitreview_info(repository) if not ci_testing else None
+    gitreview_host = (gitreview.host if gitreview else "").strip()
 
-    # Priority: config file > .gitreview > heuristic fallback
-    gerrit_host = configured_server or gitreview_host or f"gerrit.{org}.org"
+    # Priority: .gitreview > config file > heuristic fallback. The
+    # orchestrator pushes to the .gitreview host whenever there is a
+    # file, so the host exported here -- which the closed-pull-request
+    # handler and the cleanup sweeps query, paired with the project
+    # below -- has to be the same one, or they query the right project
+    # on the wrong server. The per-organization file is a fallback for
+    # repositories that carry no .gitreview.
+    gerrit_host = gitreview_host or configured_server or f"gerrit.{org}.org"
 
-    if gitreview_host and not configured_server:
+    if gitreview_host:
         log.debug(
-            "Using Gerrit host from .gitreview: %s (instead of heuristic "
-            "gerrit.%s.org)",
+            "Using Gerrit host from .gitreview: %s%s",
             gitreview_host,
-            org,
+            f" (over configured {configured_server})"
+            if configured_server and configured_server != gitreview_host
+            else "",
         )
 
-    # Derive GERRIT_PROJECT from .gitreview, else from the repository
+    # Derive GERRIT_PROJECT from .gitreview, else from the repository.
+    # A .gitreview read on behalf of a pull request whose base ref is
+    # not yet known came from a default branch, which may not be the
+    # branch the pull request targets; its host is kept (servers do not
+    # vary by branch, and local SSH-identity derivation needs one) but
+    # its project is not this pull request's to export. Without a
+    # .gitreview project the lookup may ask Gerrit. The host asked is
+    # the one the push will go to, in the orchestrator's order: the
+    # file's when there is a file, else an explicit GERRIT_SERVER, else
+    # the host resolved above. The loaded configuration goes along
+    # because this runs before the file has been exported to the
+    # environment, and the paths that consume the result never see the
+    # orchestrator's later, environment-only reading of the same
+    # settings. An explicit GERRIT_PROJECT in the environment makes the
+    # lookup moot, exactly as .gitreview does: apply_config_to_env
+    # would discard the answer.
     gerrit_project = ""
+    project_source: ProjectSource | None = None
     if repository and "/" in repository:
+        from .gitreview import context_provenance
+        from .project_names import opted_in_gerrit_project_lister
         from .project_names import resolve_repo_names
 
-        gerrit_project = resolve_repo_names(
+        gitreview_project = (gitreview.project if gitreview else "").strip()
+        if gitreview_project and context_provenance(repository).provisional:
+            log.debug(
+                "Base ref not yet known for this pull request; not taking "
+                "project %r from a default-branch .gitreview",
+                gitreview_project,
+            )
+            gitreview_project = ""
+        lookup_moot = bool(gitreview_project) or bool(
+            (os.getenv("GERRIT_PROJECT") or "").strip()
+        )
+        names = resolve_repo_names(
             repository,
-            gitreview_project=gitreview.project if gitreview else None,
-        ).project_gerrit
+            gitreview_project=gitreview_project or None,
+            list_projects=None
+            if lookup_moot
+            else opted_in_gerrit_project_lister(
+                (gitreview.host if gitreview else "")
+                or os.getenv("GERRIT_SERVER", "").strip()
+                or gerrit_host,
+                config=config,
+            ),
+        )
+        gerrit_project = names.project_gerrit
+        project_source = names.source
 
     # Try to use SSH config and git config for personalized credentials
     ssh_user: str | None = None
@@ -710,7 +621,11 @@ def derive_gerrit_parameters(
     }
     if gerrit_project:
         result["GERRIT_PROJECT"] = gerrit_project
-    return result
+    return DerivedParameters(
+        values=result,
+        project_source=project_source,
+        host_from_gitreview=bool(gitreview_host),
+    )
 
 
 def apply_parameter_derivation(
@@ -730,8 +645,8 @@ def apply_parameter_derivation(
     - gerrit_ssh_user_g2g: [org].gh2gerrit
     - gerrit_ssh_user_g2g_email: releng+[org]-gh2gerrit@linuxfoundation.org
     - gerrit_server: gerrit.[org].org
-    - gerrit_project: Derived from repository name
-      (e.g., lfit/sandbox -> sandbox)
+    - gerrit_project: From the repository's .gitreview, else guessed from
+      its name (see :func:`derive_gerrit_parameters_detailed`)
 
     Derivation behavior:
     - Default: Automatic derivation enabled (G2G_ENABLE_DERIVATION=true by
@@ -791,13 +706,51 @@ def apply_parameter_derivation(
         )
         return cfg
 
-    # Only derive parameters that are missing or empty
-    derived = derive_gerrit_parameters(organization, repository)
+    # Only derive parameters that are missing or empty -- with one
+    # exception, for the Gerrit target. A GERRIT_PROJECT that cfg
+    # carries from the configuration file is the per-organization
+    # fallback described above, and a project derived for this
+    # repository from its own .gitreview, or confirmed against Gerrit,
+    # outranks it: the CLOSE dispatch consumes the resulting Inputs
+    # before the orchestrator runs and never consults provenance, so
+    # leaving the file's value in place would keep cleanup on the wrong
+    # project despite the read. The .gitreview host displaces the
+    # file's GERRIT_SERVER for the same reason: host and project are
+    # queried together, and the pipeline pushes to the .gitreview host,
+    # so the pair has to come from one place. Nothing inferred from the
+    # name alone displaces a project, whether a guess or the one
+    # reading of a hyphen-free name; the file's value was at least
+    # written down by somebody. An explicit environment value is
+    # untouched either way, since apply_config_to_env never overwrites
+    # one and the provenance record above agrees.
+    derived = derive_gerrit_parameters_detailed(organization, repository)
     result = dict(cfg)
     newly_derived = {}
 
-    for key, value in derived.items():
-        if key not in result or not result[key].strip():
+    def _env_blank(key: str) -> bool:
+        return (os.getenv(key) or "").strip() == ""
+
+    replaceable = {
+        key
+        for key, confirmed in (
+            ("GERRIT_PROJECT", derived.project_confirmed),
+            ("GERRIT_SERVER", derived.host_from_gitreview),
+        )
+        if confirmed and cfg.get(key, "").strip() and _env_blank(key)
+    }
+
+    for key, value in derived.values.items():
+        replacing = key in replaceable
+        if key not in result or not result[key].strip() or replacing:
+            if replacing:
+                log.debug(
+                    "Replacing configuration-file %s %r with %r resolved "
+                    "for repository %s",
+                    key,
+                    result[key],
+                    value,
+                    repository,
+                )
             log.debug(
                 "Deriving %s from organization '%s': %s (context: %s)",
                 key,
@@ -823,11 +776,17 @@ def apply_parameter_derivation(
             # explicit environment value and must not be recorded as
             # derived.  Apply the same emptiness test the caller will
             # apply moments later; the two must agree.
-            mark_derived_keys(
+            landing = [
                 key
                 for key in newly_derived
                 if (os.getenv(key) or "").strip() == ""
-            )
+            ]
+            mark_derived_keys(landing)
+            # A guessed project is exported so that Gerrit queries have
+            # something to scope by, but the consumer that pushes must
+            # be able to tell it from a project somebody confirmed.
+            if derived.project_guessed and "GERRIT_PROJECT" in landing:
+                mark_guessed_keys(["GERRIT_PROJECT"])
 
     # Save newly derived parameters to configuration file for future use
     # Default to true for local CLI, false for GitHub Actions

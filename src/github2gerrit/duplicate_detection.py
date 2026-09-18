@@ -31,6 +31,7 @@ from .github_api import get_repo_from_env
 from .models import GitHubContext
 from .rich_display import safe_console_print
 from .trailers import extract_github_metadata
+from .utils import env_bool
 
 
 log = logging.getLogger(__name__)
@@ -227,6 +228,8 @@ class DuplicateDetector:
         ``.gitreview`` field by field, since derivation guesses
         ``GERRIT_PROJECT`` from the repository name. A derived pair is
         the last resort: a possibly-wrong project beats no query.
+        ``CI_TESTING`` ignores ``.gitreview`` here as everywhere else:
+        the environment pair stands as it is, or nothing does.
 
         Returns:
             Tuple of (host, project) if found, None otherwise
@@ -240,15 +243,11 @@ class DuplicateDetector:
         env_ok = bool(gerrit_host and gerrit_project)
         host_ok = bool(gerrit_host) and not is_derived_key("GERRIT_SERVER")
         proj_ok = bool(gerrit_project) and not is_derived_key("GERRIT_PROJECT")
-        if host_ok and proj_ok:
-            return (gerrit_host, gerrit_project)
+        if (host_ok and proj_ok) or env_bool("CI_TESTING", False):
+            return (gerrit_host, gerrit_project) if env_ok else None
 
-        # Skip local .gitreview check in composite action context.
-        # The duplicate detection runs before workspace setup, so there's no
-        # reliable local .gitreview file to check.  Instead, rely on
-        # environment variables or remote fetching.
-        log.debug("Skipping local .gitreview check (composite action context)")
-
+        # No local .gitreview check: duplicate detection runs before the
+        # workspace exists, so only the environment and a remote read apply.
         repo_full = gh.repository.strip() if gh.repository else ""
         if not repo_full:
             return (gerrit_host, gerrit_project) if env_ok else None

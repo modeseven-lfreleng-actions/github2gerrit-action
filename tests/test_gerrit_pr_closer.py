@@ -12,6 +12,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import pytest
+
 from github2gerrit.gerrit_pr_closer import _apply_pr_close_action
 from github2gerrit.gerrit_pr_closer import _build_closure_comment
 from github2gerrit.gerrit_pr_closer import _env_bool
@@ -958,31 +960,62 @@ class TestAbandonGerritChangeForClosedPr:
         mock_gerrit_client.post.assert_not_called()
 
     @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
-    def test_handles_gerrit_query_exception(
+    def test_gerrit_query_failure_propagates(
         self,
         mock_build_gerrit_client,
     ):
-        """Test handles exception during Gerrit query gracefully."""
+        """A failed query is not "no change found".
+
+        Swallowing the failure and returning None made the caller
+        report a clean "nothing to abandon" after an authentication or
+        network error, which is the outcome #441 needed to be able to
+        tell apart. The caller owns the reporting; the failure must
+        reach it.
+        """
         from github2gerrit.gerrit_pr_closer import (
             abandon_gerrit_change_for_closed_pr,
         )
 
-        # Setup Gerrit client mock to raise exception
         mock_gerrit_client = MagicMock()
         mock_build_gerrit_client.return_value = mock_gerrit_client
-        mock_gerrit_client.get.side_effect = Exception("Connection error")
+        mock_gerrit_client.get.side_effect = RuntimeError("Connection error")
 
-        # Call function
-        result = abandon_gerrit_change_for_closed_pr(
-            pr_number=42,
-            gerrit_server="gerrit.example.com",
-            gerrit_project="test-project",
-            repository="owner/repo",
-            dry_run=False,
+        with pytest.raises(RuntimeError, match="Connection error"):
+            abandon_gerrit_change_for_closed_pr(
+                pr_number=42,
+                gerrit_server="gerrit.example.com",
+                gerrit_project="test-project",
+                repository="owner/repo",
+                dry_run=False,
+            )
+
+    @pytest.mark.parametrize("response", [None, {}, "oops", 0])
+    @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
+    def test_non_list_response_is_an_error_not_an_empty_result(
+        self, mock_build_gerrit_client, response
+    ):
+        """The change query answers with a list, empty or not.
+
+        Anything else is a response the caller cannot act on, and
+        reporting it as "no change found" would hide it.
+        """
+        from github2gerrit.gerrit_pr_closer import (
+            abandon_gerrit_change_for_closed_pr,
         )
+        from github2gerrit.gerrit_rest import GerritRestError
 
-        # Verify result is None
-        assert result is None
+        mock_gerrit_client = MagicMock()
+        mock_build_gerrit_client.return_value = mock_gerrit_client
+        mock_gerrit_client.get.return_value = response
+
+        with pytest.raises(GerritRestError, match="expected a list"):
+            abandon_gerrit_change_for_closed_pr(
+                pr_number=42,
+                gerrit_server="gerrit.example.com",
+                gerrit_project="test-project",
+                repository="owner/repo",
+                dry_run=False,
+            )
 
     @patch("github2gerrit.gerrit_pr_closer.build_client_for_host")
     @patch("github2gerrit.gerrit_pr_closer.build_client")
