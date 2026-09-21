@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 """
-Tests holding the mypy pre-commit hook's pins to ``uv.lock``.
+Tests holding the mypy pre-commit hook's dependency list to its contract.
 
 The ``mirrors-mypy`` hook runs in an isolated environment built from
 PyPI, not from ``uv.lock``, so nothing in pre-commit itself ties the two
@@ -9,16 +9,20 @@ together.  Left to resolve freely the hook reports on a dependency set
 no developer is running, and the results diverge from a local ``uv run
 mypy`` for reasons the diff never shows.
 
-These tests close that gap from both sides: the hook must pin every
-dependency exactly, and each pinned version must be the one the
-lockfile records.  Changing either file alone fails here.
+The hook must therefore pin every dependency exactly, and the list must
+cover every third-party import under the checked paths.  These tests
+hold both.  They do **not** compare the pinned versions to the lockfile:
+a pull request is tested as merged into ``main``, so that comparison
+reads ``main``'s lockfile and fails the branch for a dependency that
+moved elsewhere (#433).  ``scripts/sync_mypy_pins.py``, run as a
+pre-commit hook, keeps the versions equal instead, and
+``tests/test_sync_mypy_pins.py`` covers it.
 """
 
 from __future__ import annotations
 
 import re
 import subprocess
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -27,7 +31,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
-UV_LOCK = REPO_ROOT / "uv.lock"
 
 MYPY_MIRROR_URL = "https://github.com/pre-commit/mirrors-mypy"
 MYPY_HOOK_ID = "mypy"
@@ -102,42 +105,14 @@ def _load_hook_dependencies() -> list[str]:
     return [str(entry) for entry in dependencies]
 
 
-def _load_locked_versions() -> dict[str, set[str]]:
-    """Return every version ``uv.lock`` records, keyed by package."""
-    with UV_LOCK.open("rb") as handle:
-        document = tomllib.load(handle)
-    packages = document.get("package")
-    assert isinstance(packages, list), (
-        f"{UV_LOCK.name} declares no [[package]] entries"
-    )
-
-    locked: dict[str, set[str]] = {}
-    for package in packages:
-        if not isinstance(package, dict):
-            continue
-        name = package.get("name")
-        version = package.get("version")
-        # A resolution may fork a package across markers, and the local
-        # project itself is listed without a version.
-        if isinstance(name, str) and isinstance(version, str):
-            locked.setdefault(_canonical(name), set()).add(version)
-    return locked
-
-
 @pytest.fixture(scope="module")
 def hook_dependencies() -> list[str]:
     """Provide the mypy hook's declared dependencies."""
     return _load_hook_dependencies()
 
 
-@pytest.fixture(scope="module")
-def locked_versions() -> dict[str, set[str]]:
-    """Provide the versions recorded in the lockfile."""
-    return _load_locked_versions()
-
-
 class TestPrecommitMypyPins:
-    """Check the mypy hook environment against the lockfile."""
+    """Check the shape of the mypy hook's dependency list."""
 
     def test_hook_declares_dependencies(self, hook_dependencies):
         """The hook lists dependencies, so the checks below have input."""
@@ -157,45 +132,12 @@ class TestPrecommitMypyPins:
         assert not loose, (
             "the {hook} hook in {config} must pin every dependency "
             "exactly, because its environment resolves from PyPI rather "
-            "than {lock}; a floor such as '>=' still installs whatever is "
+            "than uv.lock; a floor such as '>=' still installs whatever is "
             "newest when the environment is built. Not exact pins: "
             "{loose}".format(
                 hook=MYPY_HOOK_ID,
                 config=PRE_COMMIT_CONFIG.name,
-                lock=UV_LOCK.name,
                 loose=", ".join(loose),
-            )
-        )
-
-    def test_pins_match_uv_lock(self, hook_dependencies, locked_versions):
-        """Each pinned version is the one the lockfile resolves to."""
-        problems: list[str] = []
-        for entry in hook_dependencies:
-            match = EXACT_PIN.fullmatch(entry)
-            if match is None:
-                problems.append(f"{entry}: not an exact '==' pin")
-                continue
-            name = _canonical(match.group("name"))
-            pinned = match.group("version")
-            recorded = locked_versions.get(name)
-            if recorded is None:
-                problems.append(
-                    f"{name}: pinned at {pinned}, absent from {UV_LOCK.name}"
-                )
-            elif pinned not in recorded:
-                problems.append(
-                    f"{name}: {PRE_COMMIT_CONFIG.name} pins {pinned}, "
-                    f"{UV_LOCK.name} records {', '.join(sorted(recorded))}"
-                )
-
-        assert not problems, (
-            "the {hook} hook pins versions {lock} does not resolve to, so "
-            "the hook checks code against dependencies nobody runs. Update "
-            "{config} and {lock} together:\n  {problems}".format(
-                hook=MYPY_HOOK_ID,
-                config=PRE_COMMIT_CONFIG.name,
-                lock=UV_LOCK.name,
-                problems="\n  ".join(problems),
             )
         )
 
