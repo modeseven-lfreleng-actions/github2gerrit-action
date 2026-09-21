@@ -279,7 +279,7 @@ def test_explicit_project_input_outranks_gitreview(
     """
     # The project is explicit; the stand-in server is a derived value,
     # so the file's host and port still apply.
-    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER,GERRIT_SERVER_PORT")
     monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
     repo = init_repo(tmp_path / "r", default_branch="main")
     write_gitreview(
@@ -306,7 +306,9 @@ def test_derived_project_input_does_not_outrank_gitreview(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A value derivation exported through GERRIT_PROJECT is no input."""
-    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_PROJECT,GERRIT_SERVER")
+    monkeypatch.setenv(
+        DERIVED_KEYS_ENV, "GERRIT_PROJECT,GERRIT_SERVER,GERRIT_SERVER_PORT"
+    )
     monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
     repo = init_repo(tmp_path / "r", default_branch="main")
     write_gitreview(
@@ -592,7 +594,7 @@ def test_resolve_gerrit_info_prefers_gitreview(
     # Skip DNS validation — fake hostname is not resolvable
     monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
     # The stand-in inputs server is a derived value.
-    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER,GERRIT_SERVER_PORT")
     info = orch._resolve_gerrit_info(gitreview, _minimal_inputs(), names)
     # Should return the gitreview values directly
     assert info.host == "gerrit.example.net"
@@ -635,6 +637,89 @@ def test_ci_testing_does_not_read_gitreview_at_all(
         "explicit/project",
     )
     assert names.project_gerrit == "explicit/project"
+
+
+def test_port_follows_its_own_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit port outranks the file's; an unset one yields to it.
+
+    The action and the CLI pass no port when the caller gave none, so
+    ``Inputs.gerrit_server_port == 0`` means unset and a set value is
+    distinguishable from a default. 29418 applies only when nothing
+    names a port.
+    """
+    monkeypatch.delenv(DERIVED_KEYS_ENV, raising=False)
+    monkeypatch.setenv("G2G_DRYRUN_DISABLE_NETWORK", "true")
+    repo = init_repo(tmp_path / "r", default_branch="main")
+    write_gitreview(
+        repo, host="gerrit.example.net", port=29420, project="apps/service"
+    )
+    orch = Orchestrator(workspace=repo.path)
+    gitreview = orch._read_gitreview(repo.path / ".gitreview")
+    names = orch._derive_repo_names(gitreview, _gh_ctx())
+
+    # Unset port, derived server: the file's port.
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER")
+    unset = replace(_minimal_inputs(), gerrit_server_port=0)
+    assert orch._resolve_gerrit_info(gitreview, unset, names).port == 29420
+
+    # Explicit port, derived server: the file's host, the operator's port.
+    explicit_port = replace(_minimal_inputs(), gerrit_server_port=2222)
+    info = orch._resolve_gerrit_info(gitreview, explicit_port, names)
+    assert (info.host, info.port) == ("gerrit.example.net", 2222)
+
+    # Explicit server, unset port, file present: the file's port still
+    # applies, since the port has its own precedence.
+    monkeypatch.delenv(DERIVED_KEYS_ENV, raising=False)
+    explicit_host = replace(
+        _minimal_inputs(),
+        gerrit_server="gerrit.explicit.example",
+        gerrit_server_port=0,
+    )
+    info = orch._resolve_gerrit_info(gitreview, explicit_host, names)
+    assert (info.host, info.port) == ("gerrit.explicit.example", 29420)
+
+    # Explicit server, *derived* port (a per-organization default that
+    # derivation exported), file present: still the file's port.
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER_PORT")
+    derived_port = replace(
+        _minimal_inputs(),
+        gerrit_server="gerrit.explicit.example",
+        gerrit_server_port=29418,
+    )
+    info = orch._resolve_gerrit_info(gitreview, derived_port, names)
+    assert (info.host, info.port) == ("gerrit.explicit.example", 29420)
+
+    # Explicit server, derived port, no file: the derived port.
+    assert orch._resolve_gerrit_info(None, derived_port, names).port == 29418
+
+    # A file that omits port= has no port tier: the parser's 29418 is
+    # not the file's word, so a derived 2222 outranks it, in both the
+    # file-host and the explicit-host branches.
+    (repo.path / ".gitreview").write_text(
+        "[gerrit]\nhost=gerrit.example.net\nproject=apps/service\n"
+    )
+    portless = orch._read_gitreview(repo.path / ".gitreview")
+    assert portless is not None and portless.port_given is False
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER,GERRIT_SERVER_PORT")
+    configured = replace(_minimal_inputs(), gerrit_server_port=2222)
+    assert orch._resolve_gerrit_info(portless, configured, names).port == 2222
+    monkeypatch.setenv(DERIVED_KEYS_ENV, "GERRIT_SERVER_PORT")
+    configured_explicit_host = replace(
+        configured, gerrit_server="gerrit.explicit.example"
+    )
+    assert (
+        orch._resolve_gerrit_info(
+            portless, configured_explicit_host, names
+        ).port
+        == 2222
+    )
+
+    # Nothing names a port: the Gerrit default.
+    monkeypatch.delenv(DERIVED_KEYS_ENV, raising=False)
+    info = orch._resolve_gerrit_info(None, explicit_host, names)
+    assert info.port == 29418
 
 
 def test_explicit_server_input_outranks_gitreview_host(

@@ -133,9 +133,9 @@ inputs:
     required: false
     default: ""
   GERRIT_SERVER_PORT:
-    description: "Gerrit server SSH TCP port"
+    description: "Gerrit server SSH TCP port; .gitreview's when unset, else 29418"
     required: false
-    default: "29418"
+    default: ""
   GERRIT_PROJECT:
     description: "Gerrit project; optional if .gitreview exists"
     required: false

@@ -101,7 +101,7 @@ set by GitHub Actions) and undergo proper boolean parsing.
 | Flag(s)                              | Env var                     | Default | Description                                                  |
 | ------------------------------------ | --------------------------- | ------- | ------------------------------------------------------------ |
 | `--gerrit-server TEXT`               | `GERRIT_SERVER`             | `""`    | Gerrit server hostname (optional; overrides `.gitreview`)    |
-| `--gerrit-server-port INTEGER`       | `GERRIT_SERVER_PORT`        | `29418` | Gerrit SSH port                                              |
+| `--gerrit-server-port INTEGER`       | `GERRIT_SERVER_PORT`        | unset   | Gerrit SSH port; `.gitreview`'s when unset, else 29418       |
 | `--gerrit-project TEXT`              | `GERRIT_PROJECT`            | `""`    | Gerrit project (optional; overrides `.gitreview` when set)   |
 | `--gerrit-ssh-user-g2g TEXT`         | `GERRIT_SSH_USER_G2G`       | `""`    | Gerrit SSH username (e.g., automation bot account)           |
 | `--gerrit-ssh-user-g2g-email TEXT`   | `GERRIT_SSH_USER_G2G_EMAIL` | `""`    | Email address for the Gerrit SSH user                        |

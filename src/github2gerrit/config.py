@@ -54,17 +54,19 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 
+from .config_ini import DEFAULT_CONFIG_PATH as DEFAULT_CONFIG_PATH
 from .config_ini import _coerce_value
 from .config_ini import _load_ini
 from .config_ini import _select_section
+from .config_ini import (
+    save_derived_parameters_to_config as save_derived_parameters_to_config,
+)
 from .project_names import ProjectSource
 from .utils import env_bool
 from .utils import setting_bool
 
 
 log = logging.getLogger("github2gerrit.config")
-
-DEFAULT_CONFIG_PATH = "~/.config/github2gerrit/configuration.txt"
 
 # Recognized keys. Unknown keys will be reported as warnings to help
 # users catch typos and missing functionality.
@@ -424,14 +426,22 @@ class DerivedParameters:
             worth exporting for queries but must stay labelled so the
             push refuses it.
         host_from_gitreview: ``True`` when ``GERRIT_SERVER`` in *values*
-            is the ``.gitreview`` host.  That host travels with the
-            project as one target and, like a confirmed project, may
-            displace a per-organization configuration value.
+            is the ``.gitreview`` host.  It travels with the project as
+            one target and, like a confirmed project, may displace a
+            per-organization configuration value.
+        port_from_gitreview: ``True`` when ``GERRIT_SERVER_PORT`` in
+            *values* is the ``.gitreview`` port.  Tracked apart from the
+            host: each field has its own precedence, so the file can win
+            the port while an explicit server wins the host.  The port
+            is exported only when the file supplies it; without a file
+            there is nothing to derive it from, and the Gerrit default
+            applies downstream.
     """
 
     values: dict[str, str] = field(default_factory=dict)
     project_source: ProjectSource | None = None
     host_from_gitreview: bool = False
+    port_from_gitreview: bool = False
 
     @property
     def project_confirmed(self) -> bool:
@@ -453,6 +463,59 @@ def derive_gerrit_parameters(
     the project is a guess use the detailed form.
     """
     return derive_gerrit_parameters_detailed(organization, repository).values
+
+
+def _derive_gerrit_project(
+    repository: str | None,
+    gitreview: Any,
+    gerrit_host: str,
+    config: dict[str, str],
+) -> tuple[str, ProjectSource | None]:
+    """Derive ``GERRIT_PROJECT`` from ``.gitreview``, else the repository.
+
+    A ``.gitreview`` read on behalf of a pull request whose base ref is
+    not yet known came from a default branch, which may not be the
+    branch the pull request targets; its host is kept (servers do not
+    vary by branch, and local SSH-identity derivation needs one) but
+    its project is not this pull request's to export.  Without a
+    ``.gitreview`` project the lookup may ask Gerrit, on *gerrit_host*,
+    the effective host the caller settled.  The loaded configuration
+    goes along because this runs before the file has been exported to
+    the environment, and the paths that consume the result never see
+    the orchestrator's later, environment-only reading of the same
+    settings.  An explicit ``GERRIT_PROJECT`` in the environment makes
+    the lookup moot, exactly as ``.gitreview`` does:
+    :func:`apply_config_to_env` would discard the answer.
+
+    Returns the project (``""`` when the repository is unusable) and its
+    :data:`project_names.ProjectSource`.
+    """
+    if not repository or "/" not in repository:
+        return "", None
+
+    from .gitreview import context_provenance
+    from .project_names import opted_in_gerrit_project_lister
+    from .project_names import resolve_repo_names
+
+    gitreview_project = (gitreview.project if gitreview else "").strip()
+    if gitreview_project and context_provenance(repository).provisional:
+        log.debug(
+            "Base ref not yet known for this pull request; not taking "
+            "project %r from a default-branch .gitreview",
+            gitreview_project,
+        )
+        gitreview_project = ""
+    lookup_moot = bool(gitreview_project) or bool(
+        (os.getenv("GERRIT_PROJECT") or "").strip()
+    )
+    names = resolve_repo_names(
+        repository,
+        gitreview_project=gitreview_project or None,
+        list_projects=None
+        if lookup_moot
+        else opted_in_gerrit_project_lister(gerrit_host, config=config),
+    )
+    return names.project_gerrit, names.source
 
 
 def derive_gerrit_parameters_detailed(
@@ -527,6 +590,9 @@ def derive_gerrit_parameters_detailed(
     explicit_server = (os.getenv("GERRIT_SERVER") or "").strip()
     if explicit_server and is_derived_key("GERRIT_SERVER"):
         explicit_server = ""
+    explicit_port = (os.getenv("GERRIT_SERVER_PORT") or "").strip()
+    if explicit_port and is_derived_key("GERRIT_SERVER_PORT"):
+        explicit_port = ""
 
     # Read .gitreview once for both host and project. The project is
     # per-repository and the configuration file cannot supply it, so
@@ -576,47 +642,9 @@ def derive_gerrit_parameters_detailed(
             gitreview_host,
         )
 
-    # Derive GERRIT_PROJECT from .gitreview, else from the repository.
-    # A .gitreview read on behalf of a pull request whose base ref is
-    # not yet known came from a default branch, which may not be the
-    # branch the pull request targets; its host is kept (servers do not
-    # vary by branch, and local SSH-identity derivation needs one) but
-    # its project is not this pull request's to export. Without a
-    # .gitreview project the lookup may ask Gerrit, on the effective
-    # host settled above. The loaded configuration goes along because
-    # this runs before the file has been exported to the environment,
-    # and the paths that consume the result never see the
-    # orchestrator's later, environment-only reading of the same
-    # settings. An explicit GERRIT_PROJECT in the environment makes the
-    # lookup moot, exactly as .gitreview does: apply_config_to_env
-    # would discard the answer.
-    gerrit_project = ""
-    project_source: ProjectSource | None = None
-    if repository and "/" in repository:
-        from .gitreview import context_provenance
-        from .project_names import opted_in_gerrit_project_lister
-        from .project_names import resolve_repo_names
-
-        gitreview_project = (gitreview.project if gitreview else "").strip()
-        if gitreview_project and context_provenance(repository).provisional:
-            log.debug(
-                "Base ref not yet known for this pull request; not taking "
-                "project %r from a default-branch .gitreview",
-                gitreview_project,
-            )
-            gitreview_project = ""
-        lookup_moot = bool(gitreview_project) or bool(
-            (os.getenv("GERRIT_PROJECT") or "").strip()
-        )
-        names = resolve_repo_names(
-            repository,
-            gitreview_project=gitreview_project or None,
-            list_projects=None
-            if lookup_moot
-            else opted_in_gerrit_project_lister(gerrit_host, config=config),
-        )
-        gerrit_project = names.project_gerrit
-        project_source = names.source
+    gerrit_project, project_source = _derive_gerrit_project(
+        repository, gitreview, gerrit_host, config
+    )
 
     # Try to use SSH config and git config for personalized credentials
     ssh_user: str | None = None
@@ -635,13 +663,95 @@ def derive_gerrit_parameters_detailed(
         or f"releng+{org}-gh2gerrit@linuxfoundation.org",
         "GERRIT_SERVER": gerrit_host,
     }
+    # The port has its own tier, settled by the same rule as the host:
+    # an explicit input, else the file, else nothing here (the Gerrit
+    # default applies downstream). The closed-pull-request handler
+    # abandons over SSH on whatever port the environment holds, so the
+    # file's port is exported whenever it is the winning tier -- with an
+    # explicit host too, since the orchestrator pairs that host with the
+    # file's port in exactly that case. A file that omits port= has
+    # nothing to say about it; the parser's default is not the file's
+    # word and must not displace a configured port.
+    port_from_gitreview = (
+        not explicit_port and gitreview is not None and gitreview.port_given
+    )
+    if port_from_gitreview and gitreview is not None:
+        result["GERRIT_SERVER_PORT"] = str(gitreview.port)
     if gerrit_project:
         result["GERRIT_PROJECT"] = gerrit_project
     return DerivedParameters(
         values=result,
         project_source=project_source,
         host_from_gitreview=host_from_gitreview,
+        port_from_gitreview=port_from_gitreview,
     )
+
+
+def _merge_derived(
+    cfg: dict[str, str],
+    derived: DerivedParameters,
+    *,
+    organization: str,
+    repository: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fill *cfg*'s missing keys from *derived*, displacing the target.
+
+    Only missing or empty keys are filled -- with one exception, for the
+    Gerrit target.  A ``GERRIT_PROJECT`` that *cfg* carries from the
+    configuration file is a per-organization fallback, and a project
+    derived for this repository from its own ``.gitreview``, or
+    confirmed against Gerrit, outranks it: the CLOSE dispatch consumes
+    the resulting inputs before the orchestrator runs and never
+    consults provenance, so leaving the file's value in place would
+    keep cleanup on the wrong project despite the read.  The
+    ``.gitreview`` host and port displace the file's ``GERRIT_SERVER``
+    and ``GERRIT_SERVER_PORT`` for the same reason: the three are
+    queried together, and the pipeline pushes to the ``.gitreview``
+    target, so they have to come from one place.  Nothing inferred from
+    the name alone displaces a project, whether a guess or the one
+    reading of a hyphen-free name; the file's value was at least written
+    down by somebody.  An explicit environment value is untouched either
+    way, since :func:`apply_config_to_env` never overwrites one.
+
+    Returns the merged mapping and the keys derivation supplied.
+    """
+    result = dict(cfg)
+    newly_derived: dict[str, str] = {}
+
+    def _env_blank(key: str) -> bool:
+        return (os.getenv(key) or "").strip() == ""
+
+    replaceable = {
+        key
+        for key, confirmed in (
+            ("GERRIT_PROJECT", derived.project_confirmed),
+            ("GERRIT_SERVER", derived.host_from_gitreview),
+            ("GERRIT_SERVER_PORT", derived.port_from_gitreview),
+        )
+        if confirmed and cfg.get(key, "").strip() and _env_blank(key)
+    }
+
+    for key, value in derived.values.items():
+        replacing = key in replaceable
+        if key not in result or not result[key].strip() or replacing:
+            if replacing:
+                log.debug(
+                    "Replacing configuration-file %s %r with %r resolved "
+                    "for repository %s",
+                    key,
+                    result[key],
+                    value,
+                    repository,
+                )
+            log.debug(
+                "Deriving %s from organization '%s': %s",
+                key,
+                organization,
+                value,
+            )
+            result[key] = value
+            newly_derived[key] = value
+    return result, newly_derived
 
 
 def apply_parameter_derivation(
@@ -690,10 +800,11 @@ def apply_parameter_derivation(
     # by releases before such writes stopped, and hand-written ones,
     # which are equally misscoped. Marking it derived keeps it usable as
     # a last resort while letting the per-pull-request .gitreview
-    # outrank it. A GERRIT_SERVER from the file is marked the same way:
-    # it is a sensible per-organization default, but an explicit server
-    # now outranks .gitreview at the push, and a default must not carry
-    # that authority. Only a value the operator set for this run does.
+    # outrank it. A GERRIT_SERVER, and a GERRIT_SERVER_PORT, from the
+    # file are marked the same way: sensible per-organization defaults,
+    # but an explicit server or port now outranks .gitreview at the
+    # push, and a default must not carry that authority. Only a value
+    # the operator set for this run does.
     #
     # Recorded ahead of the early returns below, because this describes
     # what cfg already carries rather than anything derivation adds.
@@ -703,7 +814,7 @@ def apply_parameter_derivation(
     if mark_derived:
         mark_derived_keys(
             key
-            for key in ("GERRIT_PROJECT", "GERRIT_SERVER")
+            for key in ("GERRIT_PROJECT", "GERRIT_SERVER", "GERRIT_SERVER_PORT")
             if cfg.get(key, "").strip() and (os.getenv(key) or "").strip() == ""
         )
 
@@ -725,60 +836,12 @@ def apply_parameter_derivation(
         )
         return cfg
 
-    # Only derive parameters that are missing or empty -- with one
-    # exception, for the Gerrit target. A GERRIT_PROJECT that cfg
-    # carries from the configuration file is the per-organization
-    # fallback described above, and a project derived for this
-    # repository from its own .gitreview, or confirmed against Gerrit,
-    # outranks it: the CLOSE dispatch consumes the resulting Inputs
-    # before the orchestrator runs and never consults provenance, so
-    # leaving the file's value in place would keep cleanup on the wrong
-    # project despite the read. The .gitreview host displaces the
-    # file's GERRIT_SERVER for the same reason: host and project are
-    # queried together, and the pipeline pushes to the .gitreview host,
-    # so the pair has to come from one place. Nothing inferred from the
-    # name alone displaces a project, whether a guess or the one
-    # reading of a hyphen-free name; the file's value was at least
-    # written down by somebody. An explicit environment value is
-    # untouched either way, since apply_config_to_env never overwrites
-    # one and the provenance record above agrees.
+    # Only derive parameters that are missing or empty, except for the
+    # Gerrit target; _merge_derived explains the exception.
     derived = derive_gerrit_parameters_detailed(organization, repository)
-    result = dict(cfg)
-    newly_derived = {}
-
-    def _env_blank(key: str) -> bool:
-        return (os.getenv(key) or "").strip() == ""
-
-    replaceable = {
-        key
-        for key, confirmed in (
-            ("GERRIT_PROJECT", derived.project_confirmed),
-            ("GERRIT_SERVER", derived.host_from_gitreview),
-        )
-        if confirmed and cfg.get(key, "").strip() and _env_blank(key)
-    }
-
-    for key, value in derived.values.items():
-        replacing = key in replaceable
-        if key not in result or not result[key].strip() or replacing:
-            if replacing:
-                log.debug(
-                    "Replacing configuration-file %s %r with %r resolved "
-                    "for repository %s",
-                    key,
-                    result[key],
-                    value,
-                    repository,
-                )
-            log.debug(
-                "Deriving %s from organization '%s': %s (context: %s)",
-                key,
-                organization,
-                value,
-                "GitHub Actions" if is_github_actions else "Local CLI",
-            )
-            result[key] = value
-            newly_derived[key] = value
+    result, newly_derived = _merge_derived(
+        cfg, derived, organization=organization, repository=repository
+    )
 
     if newly_derived:
         log.debug(
@@ -833,95 +896,6 @@ def apply_parameter_derivation(
             log.warning("Failed to save derived parameters to config: %s", exc)
 
     return result
-
-
-def save_derived_parameters_to_config(
-    organization: str,
-    derived_params: dict[str, str],
-    config_path: str | None = None,
-) -> None:
-    """Save derived parameters to the organization's configuration file.
-
-    This function updates the configuration file to include any derived
-    parameters that are not already present in the organization section.
-    This creates a persistent configuration that users can modify if needed.
-
-    Args:
-        organization: GitHub organization name for config section
-        derived_params: Dictionary of parameter names to values
-        config_path: Path to config file (optional, uses default if not
-            provided)
-    """
-    # Skip config file writes during dry-run mode
-    if os.getenv("DRY_RUN", "").lower() in ("true", "1", "yes"):
-        log.debug("Skipping config file write in dry-run mode")
-        return
-    if not organization or not derived_params:
-        return
-
-    # GERRIT_PROJECT is per-repository, but this file section is
-    # per-organization: persisting it would hand every other repository
-    # in the org one repository's project name, and would additionally
-    # come back on the next run as configuration indistinguishable from
-    # operator intent, defeating the provenance tracking that lets
-    # duplicate detection prefer a per-pull-request .gitreview.
-    derived_params = {
-        k: v for k, v in derived_params.items() if k != "GERRIT_PROJECT"
-    }
-    if not derived_params:
-        return
-
-    if config_path is None:
-        config_path = (
-            os.getenv("G2G_CONFIG_PATH", "").strip() or DEFAULT_CONFIG_PATH
-        )
-
-    config_file = Path(config_path).expanduser()
-
-    try:
-        # Only update when a configuration file already exists
-        if not config_file.exists():
-            log.debug(
-                "Configuration file does not exist; skipping auto-save of "
-                "derived parameters: %s",
-                config_file,
-            )
-            return
-
-        cp = _load_ini(config_file)
-
-        # Find or create the organization section
-        org_section = _select_section(cp, organization)
-        if org_section is None:
-            # Section doesn't exist, we'll need to add it
-            cp.add_section(organization)
-            org_section = organization
-
-        # Add derived parameters that don't already exist
-        params_added = []
-        for key, value in derived_params.items():
-            if not cp.has_option(org_section, key):
-                cp.set(org_section, key, f'"{value}"')
-                params_added.append(key)
-
-        # Only write if we added parameters
-        if params_added:
-            with config_file.open("w", encoding="utf-8") as f:
-                cp.write(f)
-
-            log.debug(
-                "Saved derived parameters to configuration file %s [%s]: %s",
-                config_file,
-                organization,
-                ", ".join(params_added),
-            )
-
-    except Exception as exc:
-        log.warning(
-            "Failed to save derived parameters to configuration file %s: %s",
-            config_file,
-            exc,
-        )
 
 
 def overlay_missing(

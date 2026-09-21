@@ -230,7 +230,7 @@ uvx github2gerrit https://github.com/onap/portal-ng-bff/pull/33
 | `GERRIT_SSH_USER_G2G`          | No       | `""`             | Gerrit SSH username; derived when not supplied                 |
 | `GERRIT_SSH_USER_G2G_EMAIL`    | No       | `""`             | Gerrit user email address; derived when not supplied           |
 | `GERRIT_SERVER`                | No       | `""`             | Gerrit server hostname; overrides `.gitreview` when set        |
-| `GERRIT_SERVER_PORT`           | No       | `"29418"`        | Gerrit SSH port                                                |
+| `GERRIT_SERVER_PORT`           | No       | `""`             | Gerrit SSH port; `.gitreview`'s when unset, else 29418         |
 | `GERRIT_PROJECT`               | No       | `""`             | Gerrit project name; overrides `.gitreview` when set           |
 | `GERRIT_HTTP_BASE_PATH`        | No       | `""`             | HTTP base path for Gerrit REST API (e.g. `/r`)                 |
 | `GERRIT_HTTP_USER`             | No       | `""`             | Gerrit HTTP user for REST queries                              |
@@ -330,7 +330,7 @@ Input defaults match the composite action defaults.
 | `GERRIT_SSH_USER_G2G`          | string  | `""`             | Gerrit SSH username                              |
 | `GERRIT_SSH_USER_G2G_EMAIL`    | string  | `""`             | Gerrit user email address                        |
 | `GERRIT_SERVER`                | string  | `""`             | Gerrit server hostname                           |
-| `GERRIT_SERVER_PORT`           | string  | `"29418"`        | Gerrit SSH port                                  |
+| `GERRIT_SERVER_PORT`           | string  | `""`             | Gerrit SSH port; `.gitreview`'s when unset       |
 | `GERRIT_PROJECT`               | string  | `""`             | Gerrit project name                              |
 | `GERRIT_HTTP_BASE_PATH`        | string  | `""`             | HTTP base path for Gerrit REST                   |
 | `GERRIT_HTTP_USER`             | string  | `""`             | Gerrit HTTP user for REST queries                |

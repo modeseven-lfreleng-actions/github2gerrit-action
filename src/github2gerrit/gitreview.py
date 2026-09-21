@@ -72,12 +72,19 @@ class GitReviewInfo:
             ``gerrit.linuxfoundation.org``).  ``None`` when the host is
             not in the known-hosts table — callers may fall back to
             dynamic discovery (see ``gerrit_urls.py``).
+        port_given: Whether the source named the port, or *port* is the
+            parser's default.  A file that omits ``port=`` has nothing
+            to say about the port and must not outrank a configured
+            one.  Defaults to ``True``: a caller constructing an
+            instance with a port is stating it.  :func:`parse_gitreview`
+            sets it from the file.
     """
 
     host: str
     port: int = DEFAULT_GERRIT_PORT
     project: str = ""
     base_path: str | None = None
+    port_given: bool = True
 
     @property
     def is_valid(self) -> bool:
@@ -174,6 +181,7 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
         port=port,
         project=project,
         base_path=base_path,
+        port_given=port_match is not None,
     )
     log.debug(
         "Parsed .gitreview: host=%s, port=%d, project=%s, base_path=%s",
