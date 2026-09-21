@@ -120,9 +120,13 @@ class TestCloseHandlerDiagnostics:
                 _inputs(project="multicloud-openstack"),
                 _ctx("pull_request_target", "closed"),
             )
-        assert "No open Gerrit change found" in caplog.text
-        assert "'multicloud-openstack'" in caplog.text
-        assert "gerrit.onap.org" in caplog.text
+        # The whole rendered line, not the host as a bare substring: a
+        # host name found anywhere in the log proves little, and CodeQL
+        # reads the bare form as incomplete URL sanitisation.
+        assert (
+            "No open Gerrit change found for pull request #19 in project "
+            "'multicloud-openstack' on gerrit.onap.org; nothing to abandon"
+        ) in caplog.messages
 
     def test_a_failed_lookup_is_not_reported_as_no_change(
         self, caplog: pytest.LogCaptureFixture
