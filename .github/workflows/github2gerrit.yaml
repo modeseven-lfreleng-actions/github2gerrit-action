@@ -12,6 +12,8 @@ name: "GitHub2Gerrit [R]"
 # runs it as a local action. Workflow and action therefore always
 # ship as one unit with matching input interfaces, and the Python tool
 # itself installs as the latest release from PyPI at runtime (uvx).
+# The bulk sweep's legs are the exception: they rely on tool behaviour
+# from this same commit, and install the tool from it instead.
 #
 # Supported caller trigger events:
 #
@@ -20,9 +22,9 @@ name: "GitHub2Gerrit [R]"
 #   - push: closes GitHub PRs whose Gerrit changes have merged
 #     (CLOSE_MERGED_PRS flow)
 #   - workflow_dispatch: manual runs (PR_NUMBER selects a single PR;
-#     0 processes all open PRs) and Gerrit-event dispatches
-#     (GERRIT_CHANGE_URL/GERRIT_EVENT_TYPE close the source PR of a
-#     merged or abandoned Gerrit change)
+#     0 sweeps all open PRs, fanned out to one job per PR) and
+#     Gerrit-event dispatches (GERRIT_CHANGE_URL/GERRIT_EVENT_TYPE
+#     close the source PR of a merged or abandoned Gerrit change)
 #
 # Callers with a workflow_dispatch trigger should forward their
 # dispatch inputs, for example:
@@ -315,6 +317,16 @@ jobs:
     # from the default branch, holds the credentials, and is the
     # trigger that applies the approval gate.
     #
+    # A bulk workflow_dispatch (PR_NUMBER of 0 or unset) does not run
+    # here. One job covering every pull request cannot share a lock
+    # with the per-pull-request runs below, so the sweep fans out to
+    # the github2gerrit-sweep job instead, one leg per pull request
+    # (#422). A Gerrit-event dispatch still runs here whatever its
+    # PR_NUMBER: the tool returns after closing the source pull
+    # request and never reaches bulk mode once GERRIT_CHANGE_URL is
+    # set. The enumerate job's condition is this clause's exact
+    # complement, so every dispatch is handled once.
+    #
     # issue_comment fires for issues, for open pull requests and for
     # closed ones. The issue payload must carry a pull_request member
     # and still be open: admitting a bare issue.number would treat a
@@ -339,7 +351,7 @@ jobs:
     # is guarded by tests/test_action_step_validation.py, which
     # requires every phrase of every open command to appear below.
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || inputs.G2G_NO_GERRIT || inputs.DRY_RUN || vars.G2G_NO_GERRIT == 'true' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && ((inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0') || inputs.GERRIT_CHANGE_URL != '')) || (github.event.pull_request.number && github.event_name != 'pull_request_review' && github.event_name != 'pull_request_review_comment' && (github.event_name != 'pull_request' || inputs.G2G_NO_GERRIT || inputs.DRY_RUN || vars.G2G_NO_GERRIT == 'true' || github.event.pull_request.head.repo.full_name == github.repository)) || (github.event.issue.number && github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.comment.body, '@github2gerrit') && (contains(github.event.comment.body, 'check') || contains(github.event.comment.body, 'recheck') || contains(github.event.comment.body, 'retry'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -365,9 +377,11 @@ jobs:
     # normalisation step, whose pattern admits only canonical numbers.
     # A run that cannot start cannot race.
     #
-    # '0' is a bulk sweep and '' is unset, neither of which names a
-    # pull request, so both fall through to the event name rather than
-    # collapsing every run into one group.
+    # '0' and '' name no pull request, so both fall through to the
+    # event name rather than collapsing every run into one group. A
+    # dispatch carrying either reaches this job only as a Gerrit-event
+    # dispatch; a bulk sweep runs in github2gerrit-sweep, whose legs
+    # key on the pull request each one processes.
     concurrency:
       # yamllint disable-line rule:line-length
       group: g2g-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || ((inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0') && inputs.PR_NUMBER) || github.event_name }}
@@ -454,7 +468,10 @@ jobs:
 
       - name: Run github2gerrit composite action
         id: g2g
-        uses: ./.g2g-action
+        # The $/ self-repository syntax zizmor suggests would resolve
+        # the same commit, but GitHub Enterprise Server lacks it, and
+        # the workflow-source step above exists to support that server
+        uses: ./.g2g-action  # zizmor: ignore[self-repository]
         env:
           # Gerrit event dispatch context: when GERRIT_CHANGE_URL and
           # GERRIT_EVENT_TYPE carry values, the tool closes the source
@@ -505,6 +522,296 @@ jobs:
           # yamllint enable rule:line-length
         with:
           PR_NUMBER: ${{ inputs.PR_NUMBER }}
+          SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
+          USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
+          FETCH_DEPTH: ${{ inputs.FETCH_DEPTH }}
+          PRESERVE_GITHUB_PRS: ${{ inputs.PRESERVE_GITHUB_PRS }}
+          CLOSE_MERGED_PRS: ${{ inputs.CLOSE_MERGED_PRS }}
+          CLEANUP_ABANDONED: ${{ inputs.CLEANUP_ABANDONED }}
+          CLEANUP_GERRIT: ${{ inputs.CLEANUP_GERRIT }}
+          CREATE_MISSING: ${{ inputs.CREATE_MISSING }}
+          AUTOMATION_ONLY: ${{ inputs.AUTOMATION_ONLY }}
+          NORMALISE_COMMIT: ${{ inputs.NORMALISE_COMMIT }}
+          COMMIT_RULES_JSON: ${{ inputs.COMMIT_RULES_JSON }}
+          ALLOW_DUPLICATES: ${{ inputs.ALLOW_DUPLICATES }}
+          DUPLICATE_TYPES: ${{ inputs.DUPLICATE_TYPES }}
+          FORCE: ${{ inputs.FORCE }}
+          DRY_RUN: ${{ inputs.DRY_RUN }}
+          VERBOSE: ${{ inputs.VERBOSE }}
+          ALLOW_GHE_URLS: ${{ inputs.ALLOW_GHE_URLS }}
+          GERRIT_KNOWN_HOSTS: ${{ inputs.GERRIT_KNOWN_HOSTS }}
+          GERRIT_SSH_PRIVKEY_G2G: ${{ secrets.GERRIT_SSH_PRIVKEY_G2G }}
+          GERRIT_SERVER: ${{ inputs.GERRIT_SERVER }}
+          GERRIT_SERVER_PORT: ${{ inputs.GERRIT_SERVER_PORT }}
+          GERRIT_PROJECT: ${{ inputs.GERRIT_PROJECT }}
+          GERRIT_SSH_USER_G2G: ${{ inputs.GERRIT_SSH_USER_G2G }}
+          GERRIT_SSH_USER_G2G_EMAIL: ${{ inputs.GERRIT_SSH_USER_G2G_EMAIL }}
+          GERRIT_HTTP_BASE_PATH: ${{ inputs.GERRIT_HTTP_BASE_PATH }}
+          GERRIT_HTTP_USER: ${{ inputs.GERRIT_HTTP_USER }}
+          GERRIT_HTTP_PASSWORD: ${{ inputs.GERRIT_HTTP_PASSWORD }}
+          G2G_USE_SSH_AGENT: ${{ inputs.G2G_USE_SSH_AGENT }}
+          G2G_APPROVER_LOGINS: ${{ inputs.G2G_APPROVER_LOGINS }}
+          # yamllint disable-line rule:line-length
+          G2G_APPROVERS_FROM_INFO_YAML: ${{ inputs.G2G_APPROVERS_FROM_INFO_YAML }}
+          G2G_INFO_YAML_MATCH_LFID: ${{ inputs.G2G_INFO_YAML_MATCH_LFID }}
+          ORGANIZATION: ${{ inputs.ORGANIZATION || github.repository_owner }}
+          REVIEWERS_EMAIL: ${{ inputs.REVIEWERS_EMAIL }}
+          ISSUE_ID: ${{ inputs.ISSUE_ID }}
+          ISSUE_ID_LOOKUP_JSON: ${{ inputs.ISSUE_ID_LOOKUP_JSON }}
+          G2G_NO_GERRIT: ${{ inputs.G2G_NO_GERRIT || vars.G2G_NO_GERRIT }}
+          G2G_DISABLED: ${{ vars.G2G_DISABLED }}
+
+  # A bulk workflow_dispatch (PR_NUMBER of 0 or unset) fans out: this
+  # job lists the open pull requests, and github2gerrit-sweep below
+  # runs one leg per pull request (#422).
+  #
+  # One job processing every pull request cannot serialise against the
+  # runs events start for each of them. GitHub concurrency is per job
+  # and cancel-in-progress: false does not serialise *different*
+  # groups, so a bulk run and a pull_request_target run for the same
+  # pull request could both find no Gerrit change and create one each;
+  # ALLOW_DUPLICATES defaults to true, so nothing downstream stops
+  # them. A leg per pull request can take that pull request's own lock.
+  #
+  # The condition is the exact complement of the dispatch clause in
+  # github2gerrit's: a bulk dispatch that names no Gerrit change.
+  enumerate:
+    name: "Enumerate open pull requests"
+    # yamllint disable-line rule:line-length
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.PR_NUMBER == '' || inputs.PR_NUMBER == '0') && inputs.GERRIT_CHANGE_URL == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read  # List the open pull requests to fan out to
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      # Emits the sweep's matrix: a leg per open pull request, plus one
+      # with pr 0 that runs the repository-wide cleanup once, as the
+      # single bulk job did after processing, rather than once per leg.
+      #
+      # GitHub caps a matrix at 256 jobs, which leaves room for 255
+      # pull requests beside the cleanup leg. Beyond that the sweep
+      # fails rather than processing a subset, since dispatching again
+      # would pick the same subset and never reach the rest.
+      #
+      # The listing pages by GraphQL cursor, oldest first, not by REST
+      # offset. A pull request closing on a page already read shifts
+      # every later offset back by one, which would silently skip an
+      # open pull request at the page boundary; a cursor marks a
+      # position instead, and one opened meanwhile lands at the end.
+      #
+      # G2G_DISABLED is honoured here too, with the action's truthy
+      # set, so a disabled repository starts no legs at all.
+      - name: List open pull requests
+        id: list
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          G2G_DISABLED: ${{ vars.G2G_DISABLED }}
+        run: |
+          # List open pull requests
+          set -euo pipefail
+          case "$(printf '%s' "${G2G_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | xargs)" in
+            1|true|yes|on)
+              echo "🛑 GitHub2Gerrit is disabled by the G2G_DISABLED variable"
+              echo "matrix=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # The $ names are GraphQL variables, not shell ones
+          # shellcheck disable=SC2016
+          query='query($owner: String!, $name: String!, $after: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: OPEN, first: 100, after: $after,
+                           orderBy: {field: CREATED_AT, direction: ASC}) {
+                nodes { number }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }'
+          numbers='[]'
+          after=''
+          while :; do
+            request="$(jq -nc \
+              --arg query "${query}" \
+              --arg owner "${GITHUB_REPOSITORY%%/*}" \
+              --arg name "${GITHUB_REPOSITORY#*/}" \
+              --arg after "${after}" \
+              '{query: $query, variables: {owner: $owner, name: $name,
+                after: (if $after == "" then null else $after end)}}')"
+            response="$(curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "${request}" \
+              "${GITHUB_GRAPHQL_URL}")"
+            # GraphQL reports most failures in a 200 response
+            if ! jq -e '.errors == null and .data.repository.pullRequests != null' \
+                <<< "${response}" > /dev/null; then
+              echo "::error::Listing open pull requests failed:" \
+                "$(jq -c '.errors // .' <<< "${response}")"
+              exit 1
+            fi
+            connection="$(jq -c '.data.repository.pullRequests' <<< "${response}")"
+            numbers="$(jq -c --argjson page "${connection}" \
+              '. + [$page.nodes[].number]' <<< "${numbers}")"
+            if [[ "$(jq '.pageInfo.hasNextPage' <<< "${connection}")" != "true" ]]; then
+              break
+            fi
+            after="$(jq -r '.pageInfo.endCursor' <<< "${connection}")"
+          done
+          # Defensive: a pull request should appear once, but a leg
+          # listed twice would submit its head twice. unique also sorts.
+          numbers="$(jq -c 'unique' <<< "${numbers}")"
+          count="$(jq 'length' <<< "${numbers}")"
+          if (( count > 255 )); then
+            echo "::error::${count} open pull requests exceed the 255 one bulk" \
+              "dispatch can fan out to (GitHub caps a matrix at 256 jobs, one" \
+              "of them the cleanup). Dispatch individual PR_NUMBER values instead."
+            exit 1
+          fi
+          echo "Fanning out to ${count} pull request(s) and one cleanup leg"
+          echo "matrix=$(jq -c '{pr: (. + [0])}' <<< "${numbers}")" >> "$GITHUB_OUTPUT"
+
+  # One leg per open pull request from the enumerate job, each taking
+  # that pull request's own lock, so a sweep and an event-driven run for
+  # the same pull request queue behind each other instead of racing.
+  # Unrelated pull requests still run in parallel.
+  #
+  # The steps are github2gerrit's, less its push-only seed checkout,
+  # and must stay so: tests/test_bulk_fan_out.py holds the two equal
+  # apart from the lines that make this a leg. Each leg dispatches the
+  # action with its pull request's number, runs the tool from this
+  # workflow's commit, and sets G2G_SWEEP_LEG to tell the tool it is
+  # part of a sweep. A leg therefore:
+  #
+  #   - passes over a fork pull request already transferred at its
+  #     current head (#419), as the single bulk job did;
+  #   - stops cleanly if its pull request closed after enumeration,
+  #     rather than failing as a dispatch naming a closed one does;
+  #   - counts an AUTOMATION_ONLY rejection, or a duplicate that
+  #     ALLOW_DUPLICATES=false blocks, as a skip, as the single bulk
+  #     job did, rather than failing the sweep;
+  #   - leaves the repository-wide cleanup to the pr 0 leg, which runs
+  #     only that. Parallel copies of it would race to close and
+  #     abandon the same things.
+  #
+  # Unlike the single bulk job, the cleanup no longer waits for the
+  # pull requests or depends on them all succeeding. It is independent
+  # of them, and runs alongside transfers after every event anyway.
+  #
+  # The workflow's outputs come from github2gerrit alone, so a bulk
+  # sweep reports none: matrix job outputs keep whichever leg finished
+  # last, which would misreport the sweep rather than summarise it.
+  github2gerrit-sweep:
+    name: "GitHub2Gerrit sweep"
+    needs: enumerate
+    if: ${{ needs.enumerate.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read  # Read repository contents (checkout, etc.)
+      pull-requests: write  # Comment on and update the mirrored PR
+      issues: write  # Post status/back-reference comments on issues
+    strategy:
+      # A failed pull request must not cancel the others; the single
+      # bulk job carried on past a failure too.
+      fail-fast: false
+      # The bound the single bulk job placed on its worker threads.
+      # Each leg is a runner of its own, drawn from a pool that other
+      # repositories in the organisation share.
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.enumerate.outputs.matrix) }}
+    # The group github2gerrit uses for the same pull request, so a leg
+    # queues behind an event-driven run for it and vice versa. The pr 0
+    # cleanup leg names none and keys on the event name, the group the
+    # single bulk job used, which Gerrit-event dispatches share.
+    #
+    # As in every per-pull-request group, GitHub keeps one pending run
+    # and cancels the older, so a leg can displace a pending event run
+    # for its pull request, or be displaced by one. Either does the same
+    # transfer, except where the pull request closed after enumeration:
+    # the leg then stops without work, and a `closed` run it displaced
+    # leaves the Gerrit change to CLEANUP_GERRIT's next pass.
+    concurrency:
+      group: g2g-${{ github.repository }}-${{ matrix.pr || github.event_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve workflow source repository
+        id: workflow-source
+        shell: bash
+        env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+          LEGACY_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+        run: |
+          # Resolve the workflow source repository and commit
+          source="job context"
+          repository="$JOB_WORKFLOW_REPOSITORY"
+          workflow_sha="$JOB_WORKFLOW_SHA"
+          if [[ -z "$repository" ]]; then
+            # Fall back to extracting owner/repo from a ref such as:
+            # owner/repo/.github/workflows/github2gerrit.yaml@refs/tags/v1.4.2
+            source="legacy github context"
+            repository="${JOB_WORKFLOW_REF%%/.github/*}"
+            workflow_sha="$LEGACY_WORKFLOW_SHA"
+          fi
+          if [[ ! "$repository" =~ ^[^/@]+/[^/@]+$ ]]; then
+            echo "Error: cannot derive owner/repo (source: ${source};" \
+              "job.workflow_repository: '${JOB_WORKFLOW_REPOSITORY}';" \
+              "github.job_workflow_ref: '${JOB_WORKFLOW_REF}')" >&2
+            exit 1
+          fi
+          if [[ -z "$workflow_sha" ]]; then
+            echo "Error: cannot derive workflow commit SHA (source:" \
+              "${source}; job.workflow_sha: '${JOB_WORKFLOW_SHA}';" \
+              "github.job_workflow_sha: '${LEGACY_WORKFLOW_SHA}')" >&2
+            exit 1
+          fi
+          echo "Workflow source: ${repository}@${workflow_sha} (${source})"
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "sha=$workflow_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout github2gerrit action at workflow SHA
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow-source.outputs.repository }}
+          ref: ${{ steps.workflow-source.outputs.sha }}
+          path: .g2g-action
+          persist-credentials: false
+
+      - name: Run github2gerrit composite action
+        id: g2g
+        # As in github2gerrit: $/ is unavailable on Enterprise Server
+        uses: ./.g2g-action  # zizmor: ignore[self-repository]
+        env:
+          # The lines that make this a leg (with USE_LOCAL_ACTION and
+          # PR_NUMBER below); everything else matches github2gerrit's
+          G2G_SWEEP_LEG: "true"
+          GERRIT_CHANGE_URL: ${{ inputs.GERRIT_CHANGE_URL }}
+          GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE }}
+          GERRIT_BRANCH: ${{ inputs.GERRIT_BRANCH }}
+          # yamllint disable rule:line-length
+          G2G_TRUSTED_ASSOCIATIONS: ${{ vars.G2G_TRUSTED_ASSOCIATIONS }}
+          G2G_TOPIC_PREFIX: ${{ vars.G2G_TOPIC_PREFIX }}
+          G2G_RESOLVE_PROJECT_VIA_GERRIT: ${{ vars.G2G_RESOLVE_PROJECT_VIA_GERRIT }}
+          G2G_SKIP_GERRIT_COMMENTS: ${{ vars.G2G_SKIP_GERRIT_COMMENTS }}
+          G2G_ENABLE_DERIVATION: ${{ vars.G2G_ENABLE_DERIVATION }}
+          G2G_ANON_SUPERSEDE_FALLBACK: ${{ vars.G2G_ANON_SUPERSEDE_FALLBACK }}
+          G2G_SHOW_PROGRESS: ${{ vars.G2G_SHOW_PROGRESS }}
+          G2G_LOG_LEVEL: ${{ vars.G2G_LOG_LEVEL }}
+          # yamllint enable rule:line-length
+        with:
+          PR_NUMBER: ${{ matrix.pr }}
+          # A leg depends on G2G_SWEEP_LEG, which a tool older than this
+          # workflow ignores: the pr 0 leg would then sweep every pull
+          # request in one job alongside the legs doing the same, the
+          # race this job exists to remove. So legs run the tool from
+          # this workflow's own commit rather than the latest PyPI
+          # release, which can lag it; github2gerrit keeps the release.
+          USE_LOCAL_ACTION: "true"
           SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
           USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
           FETCH_DEPTH: ${{ inputs.FETCH_DEPTH }}

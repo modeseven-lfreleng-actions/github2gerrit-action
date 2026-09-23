@@ -70,6 +70,7 @@ class _DummyOrchestrator:
                 self.change_urls = ["https://gerrit.example.org/c/p/+/12345"]
                 self.change_numbers = ["12345"]
                 self.commit_shas = ["deadbeef"]
+                self.pushed = False
 
         return _Result()
 

@@ -534,8 +534,10 @@ nothing to unblock.
 A zero-touch variant — a periodic sweep that notices the approval without
 anyone commenting — remains open as
 [#421](https://github.com/lfreleng-actions/github2gerrit-action/issues/421).
-A repository-wide job needs cross-run serialisation that GitHub's per-job
-concurrency groups cannot express, so this mechanism deliberately omits it.
+It can build on two pieces that bulk dispatch now uses: a job per pull
+request, so each transfer takes that pull request's own lock, and the
+transfer record described below, so an already-transferred head gets no
+second visit.
 
 `pull_request_review` should be **removed** from any workflow that still
 carries it. It can no longer transfer anything: on a fork pull request it runs
@@ -592,7 +594,26 @@ covers an earlier commit, the comment says so, so a maintainer who did approve
 is not told that nobody has.
 
 Once approval arrives, the tool edits that comment again to record it, so a
-transferred pull request does not keep displaying a stale block.
+transferred pull request does not keep displaying a stale block. After the
+transfer succeeds it edits the comment once more to say so, recording the
+transferred commit in a hidden marker.
+
+A bulk sweep (`PR_NUMBER` of `0`) reads that marker and passes over a pull
+request whose current head it names, rather than submitting the same commit
+again. Through the reusable workflow each pull request in a sweep runs as a
+job of its own, and the marker behaves the same there. Anything less means the sweep processes the pull request as before:
+no comment, no marker, a comment it cannot read, or a head that has moved
+since. Only a run that pushes records anything: a dry run does not, nor does
+one that finds the pull request's changes already merged or abandoned and
+acts on GitHub instead. Neither does a pull request approved before its
+first run, which never had a comment to edit. Only sweeps consult
+the marker. A dispatch naming the pull request, a push and a
+`@github2gerrit check` comment transfer whatever it says.
+
+The marker proves nothing about who wrote it, and the tool does not assume it
+did. Believing a pasted copy is harmless: skipping transfers nothing, it
+delays only the sweep, and the tool reads the marker only on pull requests
+the gate applies to.
 
 #### If the head moves mid-run
 

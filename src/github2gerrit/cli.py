@@ -84,8 +84,10 @@ from .pr_approval import APPROVAL_MARKER
 from .pr_approval import ApprovalStatus
 from .pr_approval import describe_approver_policy
 from .pr_approval import evaluate_fork_approval
+from .pr_approval import recorded_transfer
 from .pr_approval import render_blocked_comment
 from .pr_approval import render_cleared_comment
+from .pr_approval import render_transferred_comment
 from .pr_commands import CMD_CHECK
 from .pr_commands import MENTION_PREFIX
 from .pr_commands import find_open_command
@@ -120,6 +122,18 @@ def _exit_for_pr_state_error(pr_number: int, pr_state: str) -> None:
     exit_for_pr_state_error(pr_number, pr_state)
 
 
+def _is_sweep_leg() -> bool:
+    """Report whether this run is one leg of a fanned-out bulk sweep.
+
+    The reusable workflow splits a bulk dispatch into a leg per open
+    pull request, plus a leg that runs only the repository-wide cleanup
+    (#422). ``G2G_SWEEP_LEG`` marks those legs. A leg naming a pull
+    request is still a sweep, not a request for that pull request, so
+    it keeps the bulk semantics the single-job sweep had.
+    """
+    return env_bool("G2G_SWEEP_LEG", False)
+
+
 def _stop_for_pr_state(
     gh: GitHubContext, pr_state: str, progress_tracker: Any = None
 ) -> NoReturn:
@@ -133,11 +147,17 @@ def _stop_for_pr_state(
     misreport that. The report behind #441 cited exactly this run and
     took it for the close handler failing.
 
+    A sweep leg is the same case: the pull request was open when the
+    sweep listed it and closed before its leg ran.
+
     A dispatch or direct invocation naming a closed pull request is
     different: somebody asked for that one specifically, and being told
     it cannot be processed is the useful answer.
     """
-    if gh.event_name in ("pull_request", "pull_request_target"):
+    if _is_sweep_leg() or gh.event_name in (
+        "pull_request",
+        "pull_request_target",
+    ):
         log.info(
             "Pull request #%s is %s; nothing to do for a '%s' event. Cleanup "
             "for a closed pull request runs on the 'closed' event itself.",
@@ -266,7 +286,9 @@ def _check_automation_only(
 
             close_pr(pr_obj, comment=comment)
 
-            sys.exit(1)
+            # A sweep leg counts this as the single bulk job did: a
+            # pull request skipped, not the sweep failed.
+            sys.exit(0 if _is_sweep_leg() else 1)
         except Exception:
             log.exception("Failed to close non-automation PR")
             raise
@@ -684,6 +706,25 @@ def _check_fork_approval(
     return False, ""
 
 
+def _marker_comments_newest_first(pr_obj: Any) -> list[Any]:
+    """Return the comments carrying the approval marker, newest first.
+
+    Empty when the comments cannot be read, which every caller treats
+    as "no notice": the edit then falls back to posting one, and a
+    sweep to processing the pull request.
+    """
+    try:
+        comments = list(pr_obj.as_issue().get_comments())
+    except Exception as exc:
+        log.debug("Could not read comments for approval notice: %s", exc)
+        return []
+    return [
+        comment
+        for comment in reversed(comments)
+        if APPROVAL_MARKER in (getattr(comment, "body", "") or "")
+    ]
+
+
 def _edit_owned_marker_comment(pr_obj: Any, body: str) -> bool:
     """Replace the tool's own approval notice, if one exists.
 
@@ -695,17 +736,8 @@ def _edit_owned_marker_comment(pr_obj: Any, body: str) -> bool:
     Returns:
         ``True`` when a notice of ours was updated.
     """
-    try:
-        issue = pr_obj.as_issue()
-        comments = list(issue.get_comments())
-    except Exception as exc:
-        log.debug("Could not read comments for approval notice: %s", exc)
-        return False
-
     # Newest first: if several carry the marker, keep the most recent.
-    for comment in reversed(comments):
-        if APPROVAL_MARKER not in (getattr(comment, "body", "") or ""):
-            continue
+    for comment in _marker_comments_newest_first(pr_obj):
         try:
             comment.edit(body)
         except Exception as exc:
@@ -739,6 +771,74 @@ def _clear_fork_approval_notice(
     _edit_owned_marker_comment(
         pr_obj, render_cleared_comment(status, head_sha=head_sha)
     )
+
+
+def _record_fork_transfer(
+    pr_obj: Any | None, approved_sha: str, *, pushed: bool
+) -> None:
+    """Note on the approval notice that the approved head transferred.
+
+    Gives a later sweep a way to tell that this head has already gone
+    to Gerrit (#419). Only a gated pull request carries an approved
+    commit, and only a run that pushed transferred one: a dry run, and
+    a pull request reconciled against changes already merged or
+    abandoned, both succeed without pushing, and recording either
+    would have sweeps skip a head that never reached Gerrit. Called
+    after the push, never before, for the same reason.
+
+    Edits the existing notice without creating one, like the
+    retraction. Best-effort: the transfer has happened, and a missing
+    record only costs a later sweep a redundant visit.
+    """
+    if not approved_sha or not pushed or pr_obj is None:
+        return
+    if env_bool("CI_TESTING", False):
+        return
+    _edit_owned_marker_comment(
+        pr_obj, render_transferred_comment(head_sha=approved_sha)
+    )
+
+
+def _sweep_can_skip(pr_obj: Any | None, gh: GitHubContext) -> bool:
+    """Report whether a sweep may pass over an already-transferred PR.
+
+    True only when the newest approval notice records the pull
+    request's current head as transferred (#419). Anything less — no
+    notice, no record, an unreadable comment list, a head that has
+    moved since — means "process it", so a record that failed to be
+    written degrades to visiting the pull request as before rather
+    than stranding it.
+
+    Sweeps alone consult this. A dispatch naming the pull request, a
+    push and a comment are each somebody asking for this pull request,
+    and must work whatever a comment says.
+
+    The record is not proof of authorship, and nothing here assumes the
+    tool wrote it: anyone may paste one into a comment. Believing a
+    forgery is safe because skipping is the harmless direction. It
+    transfers nothing and delays only the sweep, which the explicit
+    routes above still override. The record is read only for heads the
+    approval gate applies to, so a forgery cannot keep a
+    same-repository pull request out of a sweep either.
+    """
+    if gh.head_is_trusted or pr_obj is None:
+        return False
+    head_sha = str(
+        getattr(getattr(pr_obj, "head", None), "sha", "") or ""
+    ).strip()
+    if not head_sha:
+        return False
+    notices = _marker_comments_newest_first(pr_obj)
+    body = str(getattr(notices[0], "body", "") or "") if notices else ""
+    if recorded_transfer(body) != head_sha.lower():
+        return False
+    log.info(
+        "⏩ Pull request #%s already transferred at %s; nothing for a "
+        "sweep to add",
+        gh.pr_number,
+        head_sha[:7],
+    )
+    return True
 
 
 def _post_fork_approval_notice(
@@ -2115,6 +2215,10 @@ def _process_bulk_pr(
         log.debug("PR #%d rejected by automation_only check", pr_number)
         return "skipped", None, None
 
+    # A sweep has nothing to add for a head already transferred
+    if _sweep_can_skip(pr, per_ctx):
+        return "skipped", None, None
+
     # Fork PRs need a maintainer's approval before anything is fetched
     allowed, approved_sha = _check_fork_approval(pr, per_ctx, progress_tracker)
     if not allowed:
@@ -2126,9 +2230,13 @@ def _process_bulk_pr(
     if skip_result is not None:
         return skip_result
 
-    return _submit_bulk_pr(
+    result = _submit_bulk_pr(
         data, per_ctx, pr_number, progress_tracker, approved_sha
     )
+    status, submission, _exc = result
+    if status == "success" and submission is not None:
+        _record_fork_transfer(pr, approved_sha, pushed=submission.pushed)
+    return result
 
 
 def _record_bulk_success(
@@ -3322,6 +3430,18 @@ def _handle_bulk_mode(
     ):
         return False
 
+    if _is_sweep_leg():
+        # The reusable workflow gave every pull request a leg of its
+        # own (#422); this one keeps only the repository-wide part.
+        log.info(
+            "Bulk sweep fanned out per pull request; running the "
+            "repository-wide cleanup only"
+        )
+        _run_gerrit_cleanup_tasks(
+            data, gh, no_gerrit=no_gerrit, gerrit_cleanup_info_log=True
+        )
+        return True
+
     bulk_success = _process_bulk(data, gh)
 
     try:
@@ -3445,7 +3565,33 @@ def _check_single_pr_duplicates(
                 gh.pr_number,
             )
     except DuplicateChangeError as exc:
+        if _is_sweep_leg():
+            _skip_duplicate_in_sweep(exc, gh, progress_tracker)
         _handle_single_pr_duplicate_error(exc, progress_tracker)
+
+
+def _skip_duplicate_in_sweep(
+    exc: DuplicateChangeError,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> NoReturn:
+    """End a sweep leg cleanly on a blocked duplicate.
+
+    With ``ALLOW_DUPLICATES`` off, the single bulk job skipped a
+    duplicate and carried on; a run naming the pull request fails on
+    one, which is the answer somebody asking for it needs. A leg is a
+    sweep, so it keeps the bulk behaviour rather than marking the
+    whole sweep failed.
+    """
+    progress_tracker.duplicate_skipped()
+    progress_tracker.stop()
+    log.warning(
+        "Skipping PR #%s due to duplicate detection: %s. Use "
+        "--allow-duplicates to override this check.",
+        gh.pr_number,
+        exc,
+    )
+    sys.exit(int(ExitCode.SUCCESS))
 
 
 def _print_single_pr_summary(
@@ -3478,6 +3624,62 @@ def _print_single_pr_summary(
     if pipeline_success and result.change_urls:
         for url in result.change_urls:
             safe_console_print(f"🔗 Gerrit change: {url}", style="green")
+
+
+def _gate_single_pr(
+    gh: GitHubContext,
+    data: Inputs,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> tuple[GitHubContext, Any | None, str]:
+    """Resolve the pull request and run every check ahead of transfer.
+
+    Exits successfully when there is nothing to transfer: a re-check
+    with no gate to lift, a sweep leg whose head already transferred,
+    or a fork pull request still awaiting approval.
+
+    Returns:
+        The context with any metadata recovered from the pull request,
+        the pull request itself, and the commit the approval gate
+        authorised (empty when no gate applied).
+    """
+    pr_obj = _extract_and_display_pr_info(gh, data, progress_tracker)
+
+    # Fork PRs need a maintainer's approval before anything is
+    # fetched and before the Gerrit key is materialised. Resolve
+    # the PR here when the display step could not, so a missing
+    # token cannot skip the gate.
+    if pr_obj is None:
+        pr_obj = _resolve_pr_for_gate(gh, data)
+
+    # Second chance at the pull request's own metadata, and a
+    # second look at the short-circuit above. An issue_comment
+    # payload carries none of it, so the check before this
+    # depended on _augment_pr_refs_if_needed's API call; that
+    # helper swallows a failure and returns the context
+    # unresolved, while the fetch just above is a separate call
+    # that may well have succeeded. Without this, one transient
+    # failure would let a commenter resubmit an unchanged
+    # same-repository pull request — exactly what the
+    # short-circuit exists to prevent — and would leave the base
+    # ref empty for the transfer that followed.
+    gh = _recover_pr_metadata(gh, pr_obj)
+    if _recheck_has_nothing_to_unblock(gh):
+        log.info(
+            "Re-check (%s) for PR #%s, whose head is in this "
+            "repository; nothing to unblock, so no transfer is needed",
+            gh.event_name,
+            gh.pr_number,
+        )
+        sys.exit(int(ExitCode.SUCCESS))
+
+    # A sweep leg has nothing to add for a head already transferred
+    if _is_sweep_leg() and _sweep_can_skip(pr_obj, gh):
+        sys.exit(int(ExitCode.SUCCESS))
+
+    allowed, approved_sha = _check_fork_approval(pr_obj, gh, progress_tracker)
+    if not allowed:
+        sys.exit(int(ExitCode.SUCCESS))
+    return gh, pr_obj, approved_sha
 
 
 def _handle_single_pr(
@@ -3539,42 +3741,9 @@ def _handle_single_pr(
 
     # Display PR information with Rich formatting
     approved_sha = ""
+    pr_obj: Any | None = None
     if gh.pr_number:
-        pr_obj = _extract_and_display_pr_info(gh, data, progress_tracker)
-
-        # Fork PRs need a maintainer's approval before anything is
-        # fetched and before the Gerrit key is materialised. Resolve
-        # the PR here when the display step could not, so a missing
-        # token cannot skip the gate.
-        if pr_obj is None:
-            pr_obj = _resolve_pr_for_gate(gh, data)
-
-        # Second chance at the pull request's own metadata, and a
-        # second look at the short-circuit above. An issue_comment
-        # payload carries none of it, so the check before this
-        # depended on _augment_pr_refs_if_needed's API call; that
-        # helper swallows a failure and returns the context
-        # unresolved, while the fetch just above is a separate call
-        # that may well have succeeded. Without this, one transient
-        # failure would let a commenter resubmit an unchanged
-        # same-repository pull request — exactly what the
-        # short-circuit exists to prevent — and would leave the base
-        # ref empty for the transfer that followed.
-        gh = _recover_pr_metadata(gh, pr_obj)
-        if _recheck_has_nothing_to_unblock(gh):
-            log.info(
-                "Re-check (%s) for PR #%s, whose head is in this "
-                "repository; nothing to unblock, so no transfer is needed",
-                gh.event_name,
-                gh.pr_number,
-            )
-            sys.exit(int(ExitCode.SUCCESS))
-
-        allowed, approved_sha = _check_fork_approval(
-            pr_obj, gh, progress_tracker
-        )
-        if not allowed:
-            sys.exit(int(ExitCode.SUCCESS))
+        gh, pr_obj, approved_sha = _gate_single_pr(gh, data, progress_tracker)
 
     # Check for duplicates in single-PR mode (before workspace setup)
     if gh.pr_number and not env_bool("SYNC_ALL_OPEN_PRS", False):
@@ -3591,9 +3760,13 @@ def _handle_single_pr(
     )
 
     # Run abandoned-PR and Gerrit cleanup if the pipeline was successful
-    # Skip in G2G_NO_GERRIT: no Gerrit server to query
+    # Skip in G2G_NO_GERRIT: no Gerrit server to query. A sweep leg
+    # leaves it to the sweep's cleanup leg, rather than every leg
+    # racing to close and abandon the same things.
     if pipeline_success:
-        _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
+        _record_fork_transfer(pr_obj, approved_sha, pushed=result.pushed)
+        if not _is_sweep_leg():
+            _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
 
     try:
         log_api_metrics_summary()

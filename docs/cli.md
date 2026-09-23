@@ -206,6 +206,7 @@ forwarded setting treats blank as unset and keeps its documented default.
 | `CLEANUP_GERRIT`                 | `true`                                      | Abandon Gerrit changes for closed GitHub PRs                                      |
 | `PR_NUMBER`                      | unset                                       | Pull request number to process in CI/CD mode (`0` means bulk mode)                |
 | `SYNC_ALL_OPEN_PRS`              | `false`                                     | Process all open PRs in the repository (bulk mode)                                |
+| `G2G_SWEEP_LEG`                  | `false`                                     | Set by the reusable workflow on each job of a fanned-out bulk sweep               |
 | `GERRIT_HTTP_USER`               | unset                                       | Username for the Gerrit REST API (when required)                                  |
 | `GERRIT_HTTP_PASSWORD`           | unset                                       | HTTP password/token for the Gerrit REST API                                       |
 | `GERRIT_HTTP_BASE_PATH`          | unset                                       | Gerrit REST base path for non-standard deployments (e.g., `/r`)                   |
