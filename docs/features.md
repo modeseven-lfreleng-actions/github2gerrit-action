@@ -534,8 +534,10 @@ nothing to unblock.
 A zero-touch variant — a periodic sweep that notices the approval without
 anyone commenting — remains open as
 [#421](https://github.com/lfreleng-actions/github2gerrit-action/issues/421).
-A repository-wide job needs cross-run serialisation that GitHub's per-job
-concurrency groups cannot express, so this mechanism deliberately omits it.
+It can build on two pieces that bulk dispatch now uses: a job per pull
+request, so each transfer takes that pull request's own lock, and the
+transfer record described below, so an already-transferred head gets no
+second visit.
 
 `pull_request_review` should be **removed** from any workflow that still
 carries it. It can no longer transfer anything: on a fork pull request it runs
@@ -598,7 +600,8 @@ transferred commit in a hidden marker.
 
 A bulk sweep (`PR_NUMBER` of `0`) reads that marker and passes over a pull
 request whose current head it names, rather than submitting the same commit
-again. Anything less means the sweep processes the pull request as before:
+again. Through the reusable workflow each pull request in a sweep runs as a
+job of its own, and the marker behaves the same there. Anything less means the sweep processes the pull request as before:
 no comment, no marker, a comment it cannot read, or a head that has moved
 since. A dry run records nothing, and neither does a pull request approved
 before its first run, which never had a comment to edit. Only sweeps consult

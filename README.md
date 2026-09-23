@@ -148,11 +148,14 @@ as dispatch inputs and forward them the same way.
 
 Pin `@main` to a release tag or commit SHA for production use.
 
-A bulk `workflow_dispatch` (`PR_NUMBER` of `0`) processes every open
-pull request in one run, which does not serialise against the
-per-pull-request runs that events start. Avoid triggering one while
-pull request activity is in flight; see
-[#422](https://github.com/lfreleng-actions/github2gerrit-action/issues/422).
+A bulk `workflow_dispatch` (`PR_NUMBER` of `0`) fans out: the reusable
+workflow lists the open pull requests and runs one job per pull request,
+four at a time, each in that pull request's own concurrency group, so a sweep
+queues behind the runs that events start for the same pull request
+instead of racing them. One further job runs the repository-wide cleanup once.
+A sweep covers at most 255 open pull requests, one fewer than GitHub's 256-job
+matrix limit; beyond that it fails, and you dispatch individual `PR_NUMBER`
+values instead. A bulk dispatch sets no workflow outputs.
 
 ### Option B: composite action
 
@@ -208,6 +211,12 @@ jobs:
           # human-authored PR before the approval gate sees it
           AUTOMATION_ONLY: false
 ```
+
+A composite action cannot start jobs, so here a bulk `workflow_dispatch`
+(`PR_NUMBER` of `0`) still processes every open pull request in one job. That
+job does not serialise against the per-pull-request runs events start, so
+avoid triggering one while pull request activity is in flight, or use the
+reusable workflow, which fans the sweep out.
 
 ### Option C: command-line tool
 

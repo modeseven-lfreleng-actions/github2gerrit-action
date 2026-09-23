@@ -1,0 +1,790 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+"""Bulk dispatch fans out to one leg per pull request (#422).
+
+A bulk ``workflow_dispatch`` used to process every open pull request in
+one job, in the group ``g2g-<repo>-workflow_dispatch``, while events for
+those pull requests ran in ``g2g-<repo>-<number>``. GitHub does not
+serialise different groups, so both could find no Gerrit change and
+create one each.
+
+The reusable workflow now lists the open pull requests and runs a leg
+per pull request in that pull request's own group. These tests hold it
+to that by evaluating the workflow's own expressions, not by matching
+strings, and run the enumeration script straight out of the workflow.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+import typer
+import yaml
+
+from github2gerrit.cli import _handle_bulk_mode
+from github2gerrit.cli import _handle_single_pr
+from github2gerrit.cli import _stop_for_pr_state
+from github2gerrit.models import GitHubContext
+from github2gerrit.models import PROperationMode
+from github2gerrit.pr_approval import render_transferred_comment
+
+
+WORKFLOW = (
+    Path(__file__).parent.parent
+    / ".github"
+    / "workflows"
+    / "github2gerrit.yaml"
+)
+REPO = "opendaylight/mdsal"
+HEAD_SHA = "0b2abdcf7bb2fb5ed6620f214968ae2b3c5e70e6"
+ACTION_STEP = "Run github2gerrit composite action"
+LEG_ONLY = {("with", "PR_NUMBER"), ("env", "G2G_SWEEP_LEG")}
+"""The action-step keys that make a sweep leg, and all that may differ."""
+
+
+# ---------------------------------------------------------------------
+# A small evaluator for the subset of GitHub expressions the workflow's
+# conditions and concurrency groups use. Comparing the expressions as
+# strings could not tell whether two groups actually render the same.
+# ---------------------------------------------------------------------
+
+_TOKEN = re.compile(
+    r"\s*(?:(?P<op>\|\||&&|==|!=|!|\(|\)|,)"
+    r"|'(?P<str>(?:[^']|'')*)'"
+    r"|(?P<num>\d+)"
+    r"|(?P<name>[A-Za-z_][\w-]*(?:\.[\w-]+)*))"
+)
+_TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    return value not in (None, False, 0, "")
+
+
+def _as_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip() or 0)
+    except ValueError:
+        return math.nan
+
+
+def _equal(left: Any, right: Any) -> bool:
+    # GitHub compares strings case-insensitively and coerces mixed types
+    # to numbers.
+    if isinstance(left, str) and isinstance(right, str):
+        return left.lower() == right.lower()
+    if type(left) is type(right):
+        return bool(left == right)
+    return _as_number(left) == _as_number(right)
+
+
+def _contains(haystack: Any, needle: Any) -> bool:
+    if isinstance(haystack, list):
+        return any(_equal(item, needle) for item in haystack)
+    return str(needle or "").lower() in str(haystack or "").lower()
+
+
+def _format(template: str, *args: Any) -> str:
+    return re.sub(
+        r"\{(\d+)\}", lambda m: _render_value(args[int(m.group(1))]), template
+    )
+
+
+_FUNCTIONS: dict[str, Callable[..., Any]] = {
+    "contains": _contains,
+    "format": _format,
+    "fromJSON": json.loads,
+}
+
+
+class _Expression:
+    """Recursive descent over ``||``, ``&&``, ``==``/``!=``, ``!``."""
+
+    def __init__(self, text: str, context: dict[str, Any]) -> None:
+        self.tokens = [m for m in _TOKEN.finditer(text) if m.group().strip()]
+        assert "".join(m.group() for m in self.tokens).strip() == text.strip()
+        self.pos = 0
+        self.context = context
+
+    def evaluate(self) -> Any:
+        value = self._or()
+        assert self.pos == len(self.tokens), "trailing tokens"
+        return value
+
+    def _peek(self, op: str) -> bool:
+        return (
+            self.pos < len(self.tokens)
+            and self.tokens[self.pos].group("op") == op
+        )
+
+    def _take(self, op: str) -> None:
+        assert self._peek(op), f"expected {op!r}"
+        self.pos += 1
+
+    def _or(self) -> Any:
+        value = self._and()
+        while self._peek("||"):
+            self._take("||")
+            right = self._and()
+            value = value if _truthy(value) else right
+        return value
+
+    def _and(self) -> Any:
+        value = self._compare()
+        while self._peek("&&"):
+            self._take("&&")
+            right = self._compare()
+            value = right if _truthy(value) else value
+        return value
+
+    def _compare(self) -> Any:
+        value = self._unary()
+        while self._peek("==") or self._peek("!="):
+            negate = self._peek("!=")
+            self.pos += 1
+            right = self._unary()
+            value = _equal(value, right) != negate
+        return value
+
+    def _unary(self) -> Any:
+        if self._peek("!"):
+            self._take("!")
+            return not _truthy(self._unary())
+        return self._primary()
+
+    def _primary(self) -> Any:
+        if self._peek("("):
+            self._take("(")
+            value = self._or()
+            self._take(")")
+            return value
+        token = self.tokens[self.pos]
+        self.pos += 1
+        if token.group("str") is not None:
+            return token.group("str").replace("''", "'")
+        if token.group("num") is not None:
+            return int(token.group("num"))
+        name = token.group("name")
+        if self._peek("("):
+            return _FUNCTIONS[name](*self._arguments())
+        literals = {"true": True, "false": False, "null": None}
+        return literals.get(name, self.context.get(name))
+
+    def _arguments(self) -> list[Any]:
+        self._take("(")
+        args = [self._or()]
+        while self._peek(","):
+            self._take(",")
+            args.append(self._or())
+        self._take(")")
+        return args
+
+
+def _evaluate(expression: str, context: dict[str, Any]) -> Any:
+    match = _TEMPLATE.fullmatch(expression.strip())
+    inner = match.group(1) if match else expression
+    return _Expression(inner, {"github.repository": REPO, **context}).evaluate()
+
+
+def _render_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _render(template: str, context: dict[str, Any]) -> str:
+    return _TEMPLATE.sub(
+        lambda m: _render_value(_evaluate(m.group(1), context)), template
+    )
+
+
+class TestTheEvaluatorItself:
+    """Enough confidence in the evaluator for the tests built on it."""
+
+    def test_or_returns_the_first_truthy_operand(self) -> None:
+        assert _evaluate("a || b || 'c'", {"a": 0, "b": ""}) == "c"
+        assert _evaluate("a || b", {"a": 29, "b": "x"}) == 29
+
+    def test_and_returns_the_deciding_operand(self) -> None:
+        assert _evaluate("a && 'x'", {"a": "y"}) == "x"
+        assert _evaluate("a && 'x'", {"a": ""}) == ""
+
+    def test_string_comparison_ignores_case(self) -> None:
+        assert _evaluate("a == 'TRUE'", {"a": "true"}) is True
+
+    def test_missing_names_are_null(self) -> None:
+        assert _evaluate("a.b != ''", {}) is False
+
+    def test_functions(self) -> None:
+        assert _evaluate("contains(a, 'check')", {"a": "@x CHECK"}) is True
+        assert _evaluate("fromJSON(a)", {"a": '{"pr": [1]}'}) == {"pr": [1]}
+
+
+# ---------------------------------------------------------------------
+# The workflow
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def jobs() -> dict[str, Any]:
+    return dict(yaml.safe_load(WORKFLOW.read_text())["jobs"])
+
+
+def _dispatch(pr_number: str, change_url: str = "") -> dict[str, Any]:
+    return {
+        "github.event_name": "workflow_dispatch",
+        "inputs.PR_NUMBER": pr_number,
+        "inputs.GERRIT_CHANGE_URL": change_url,
+    }
+
+
+_DISPATCHES = [
+    pytest.param(_dispatch("0"), True, id="bulk"),
+    pytest.param(_dispatch(""), True, id="bulk-unset"),
+    pytest.param(_dispatch("29"), False, id="single"),
+    pytest.param(
+        _dispatch("0", "https://gerrit.example.org/c/p/+/1"),
+        False,
+        id="gerrit-event",
+    ),
+    pytest.param(
+        _dispatch("29", "https://gerrit.example.org/c/p/+/1"),
+        False,
+        id="gerrit-event-with-pr",
+    ),
+]
+
+
+class TestEveryDispatchIsHandledOnce:
+    """A dispatch runs the single job or the sweep, never both or neither."""
+
+    @pytest.mark.parametrize(("context", "bulk"), _DISPATCHES)
+    def test_bulk_dispatches_fan_out_and_nothing_else_does(
+        self, jobs: dict[str, Any], context: dict[str, Any], bulk: bool
+    ) -> None:
+        enumerate_runs = _truthy(_evaluate(jobs["enumerate"]["if"], context))
+        single_runs = _truthy(_evaluate(jobs["github2gerrit"]["if"], context))
+        assert enumerate_runs is bulk
+        assert single_runs is not bulk
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            {
+                "github.event_name": "pull_request_target",
+                "github.event.pull_request.number": 29,
+                "github.event.pull_request.head.repo.full_name": REPO,
+            },
+            {"github.event_name": "push"},
+        ],
+        ids=["pull_request_target", "push"],
+    )
+    def test_events_never_start_a_sweep(
+        self, jobs: dict[str, Any], context: dict[str, Any]
+    ) -> None:
+        assert not _truthy(_evaluate(jobs["enumerate"]["if"], context))
+        assert _truthy(_evaluate(jobs["github2gerrit"]["if"], context))
+
+    def test_the_sweep_needs_the_enumeration(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        sweep = jobs["github2gerrit-sweep"]
+        assert sweep["needs"] == "enumerate"
+        # An empty matrix is the disabled case: start no legs at all.
+        assert not _truthy(
+            _evaluate(sweep["if"], {"needs.enumerate.outputs.matrix": ""})
+        )
+
+
+def _event_contexts(number: int) -> dict[str, dict[str, Any]]:
+    """Every route by which an event-driven run reaches pull request N."""
+    return {
+        "pull_request_target": {
+            "github.event_name": "pull_request_target",
+            "github.event.pull_request.number": number,
+        },
+        "issue_comment": {
+            "github.event_name": "issue_comment",
+            "github.event.issue.number": number,
+        },
+        "single dispatch": _dispatch(str(number)),
+    }
+
+
+def _leg_context(number: int) -> dict[str, Any]:
+    return {**_dispatch("0"), "matrix.pr": number}
+
+
+def _group(job: dict[str, Any], context: dict[str, Any]) -> str:
+    return _render(job["concurrency"]["group"], context)
+
+
+class TestALegTakesItsPullRequestsLock:
+    """The acceptance criterion: a leg and an event run cannot overlap."""
+
+    @pytest.mark.parametrize(
+        "route", ["pull_request_target", "issue_comment", "single dispatch"]
+    )
+    def test_a_leg_queues_behind_every_event_route(
+        self, jobs: dict[str, Any], route: str
+    ) -> None:
+        event = _group(jobs["github2gerrit"], _event_contexts(29)[route])
+        leg = _group(jobs["github2gerrit-sweep"], _leg_context(29))
+        assert leg == event == f"g2g-{REPO}-29"
+
+    def test_unrelated_pull_requests_do_not_share_a_lock(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        sweep = jobs["github2gerrit-sweep"]
+        legs = {_group(sweep, _leg_context(n)) for n in (29, 30, 31)}
+        assert len(legs) == 3
+        assert _group(sweep, _leg_context(29)) != _group(
+            jobs["github2gerrit"], _event_contexts(30)["pull_request_target"]
+        )
+
+    def test_legs_run_in_parallel(self, jobs: dict[str, Any]) -> None:
+        strategy = jobs["github2gerrit-sweep"]["strategy"]
+        assert strategy["max-parallel"] > 1
+        # One pull request failing must not cancel the others.
+        assert strategy["fail-fast"] is False
+
+    def test_the_cleanup_leg_keeps_the_repository_wide_group(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        # The group the single bulk job used, which Gerrit-event
+        # dispatches share.
+        cleanup = _group(jobs["github2gerrit-sweep"], _leg_context(0))
+        gerrit_event = _group(
+            jobs["github2gerrit"],
+            _dispatch("0", "https://gerrit.example.org/c/p/+/1"),
+        )
+        assert cleanup == gerrit_event == f"g2g-{REPO}-workflow_dispatch"
+
+    def test_in_flight_legs_are_queued_not_cancelled(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        concurrency = jobs["github2gerrit-sweep"]["concurrency"]
+        assert concurrency["cancel-in-progress"] is False
+
+
+def _action_step(job: dict[str, Any]) -> dict[str, Any]:
+    return next(s for s in job["steps"] if s.get("name") == ACTION_STEP)
+
+
+def _without_leg_keys(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    steps = copy.deepcopy(steps)
+    step = next(s for s in steps if s.get("name") == ACTION_STEP)
+    for block, key in LEG_ONLY:
+        step.get(block, {}).pop(key, None)
+    return steps
+
+
+class TestTheLegIsTheSingleJob:
+    """The sweep must not drift from the job it replaces for bulk runs.
+
+    Its steps are a copy, since GitHub offers no way to share a job
+    body across two jobs that works on every server. Anything that
+    reaches the action one way must reach it the other.
+    """
+
+    def test_the_steps_match_apart_from_the_leg_keys(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        single = [
+            step
+            for step in jobs["github2gerrit"]["steps"]
+            if "github.event_name == 'push'" not in str(step.get("if", ""))
+        ]
+        assert _without_leg_keys(
+            jobs["github2gerrit-sweep"]["steps"]
+        ) == _without_leg_keys(single)
+
+    @pytest.mark.parametrize(
+        "key", ["runs-on", "timeout-minutes", "permissions"]
+    )
+    def test_the_job_settings_match(
+        self, jobs: dict[str, Any], key: str
+    ) -> None:
+        assert jobs["github2gerrit-sweep"][key] == jobs["github2gerrit"][key]
+
+    def test_a_leg_names_its_pull_request_and_says_it_is_a_leg(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        step = _action_step(jobs["github2gerrit-sweep"])
+        assert step["with"]["PR_NUMBER"] == "${{ matrix.pr }}"
+        assert step["env"]["G2G_SWEEP_LEG"] == "true"
+
+    def test_the_single_job_is_never_a_leg(self, jobs: dict[str, Any]) -> None:
+        assert "G2G_SWEEP_LEG" not in _action_step(jobs["github2gerrit"]).get(
+            "env", {}
+        )
+
+
+# ---------------------------------------------------------------------
+# The enumeration script, executed out of the workflow
+# ---------------------------------------------------------------------
+
+_CURL_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${CURL_LOG}"
+if [[ -n "${CURL_FAIL:-}" ]]; then
+  echo '{"message": "Bad credentials"}'
+  exit 22
+fi
+url="${@: -1}"
+page="${url##*page=}"
+cat "${CURL_PAGES}/${page}.json" 2>/dev/null || echo '[]'
+"""
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="needs jq")
+class TestTheEnumeration:
+    """The step that builds the sweep's matrix."""
+
+    def _script(self, jobs: dict[str, Any]) -> str:
+        return str(jobs["enumerate"]["steps"][0]["run"])
+
+    def _run(
+        self,
+        jobs: dict[str, Any],
+        tmp_path: Path,
+        pages: list[list[int]],
+        **env: str,
+    ) -> tuple[subprocess.CompletedProcess[str], str, list[str]]:
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        curl = stub_dir / "curl"
+        curl.write_text(_CURL_STUB)
+        curl.chmod(0o755)
+        page_dir = tmp_path / "pages"
+        page_dir.mkdir()
+        for index, numbers in enumerate(pages, start=1):
+            (page_dir / f"{index}.json").write_text(
+                json.dumps([{"number": n, "title": "t"} for n in numbers])
+            )
+        output = tmp_path / "github_output"
+        output.touch()
+        log = tmp_path / "curl.log"
+        log.touch()
+        result = subprocess.run(
+            ["bash", "-c", self._script(jobs)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                "PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}",
+                "GITHUB_TOKEN": "t0ken",
+                "GITHUB_API_URL": "https://api.github.example",
+                "GITHUB_REPOSITORY": REPO,
+                "GITHUB_OUTPUT": str(output),
+                "G2G_DISABLED": "",
+                "CURL_PAGES": str(page_dir),
+                "CURL_LOG": str(log),
+                **env,
+            },
+        )
+        return result, output.read_text(), log.read_text().splitlines()
+
+    @staticmethod
+    def _matrix(output: str) -> str:
+        return next(
+            line.split("=", 1)[1]
+            for line in output.splitlines()
+            if line.startswith("matrix=")
+        )
+
+    def test_a_leg_per_pull_request_and_one_cleanup(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        result, output, _ = self._run(jobs, tmp_path, [[31, 29, 30]])
+        assert result.returncode == 0, result.stderr
+        assert json.loads(self._matrix(output)) == {"pr": [29, 30, 31, 0]}
+
+    def test_the_matrix_drives_the_legs_end_to_end(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        # From the script's output through the sweep's own matrix
+        # expression to each leg's lock and PR_NUMBER.
+        _result, output, _ = self._run(jobs, tmp_path, [[29, 30]])
+        sweep = jobs["github2gerrit-sweep"]
+        matrix = _evaluate(
+            sweep["strategy"]["matrix"],
+            {"needs.enumerate.outputs.matrix": self._matrix(output)},
+        )
+        for number in matrix["pr"]:
+            leg = _leg_context(number)
+            pr_input = _render(_action_step(sweep)["with"]["PR_NUMBER"], leg)
+            assert pr_input == str(number)
+            if number:
+                event = _event_contexts(number)["pull_request_target"]
+                assert _group(sweep, leg) == _group(
+                    jobs["github2gerrit"], event
+                )
+
+    def test_every_page_is_read(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        pages = [list(range(1, 101)), [101, 102]]
+        result, output, calls = self._run(jobs, tmp_path, pages)
+        assert result.returncode == 0, result.stderr
+        assert len(json.loads(self._matrix(output))["pr"]) == 103
+        assert len(calls) == 2
+
+    def test_a_full_last_page_asks_once_more(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        result, output, calls = self._run(jobs, tmp_path, [list(range(1, 101))])
+        assert result.returncode == 0, result.stderr
+        assert len(json.loads(self._matrix(output))["pr"]) == 101
+        assert len(calls) == 2
+
+    def test_no_open_pull_requests_still_cleans_up(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        # The single bulk job ran the cleanup even with nothing to
+        # process.
+        result, output, _ = self._run(jobs, tmp_path, [[]])
+        assert result.returncode == 0, result.stderr
+        assert json.loads(self._matrix(output)) == {"pr": [0]}
+
+    def test_the_request_is_authenticated_and_scoped(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        _result, _output, calls = self._run(jobs, tmp_path, [[29]])
+        assert "Authorization: Bearer t0ken" in calls[0]
+        assert (
+            f"https://api.github.example/repos/{REPO}/pulls?state=open"
+            in calls[0]
+        )
+
+    def test_the_largest_matrix_github_allows(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        pages = [
+            list(range(1, 101)),
+            list(range(101, 201)),
+            list(range(201, 256)),
+        ]
+        result, output, _ = self._run(jobs, tmp_path, pages)
+        assert result.returncode == 0, result.stderr
+        assert len(json.loads(self._matrix(output))["pr"]) == 256
+
+    def test_more_than_github_allows_fails_rather_than_truncating(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        # Processing a subset would pick the same subset on every
+        # dispatch and never reach the rest.
+        pages = [
+            list(range(1, 101)),
+            list(range(101, 201)),
+            list(range(201, 257)),
+        ]
+        result, output, _ = self._run(jobs, tmp_path, pages)
+        assert result.returncode == 1
+        assert "256 open pull requests exceed" in result.stdout
+        assert "matrix=" not in output
+
+    @pytest.mark.parametrize("value", ["true", "True", " yes ", "1", "ON"])
+    def test_a_disabled_repository_starts_no_legs(
+        self, jobs: dict[str, Any], tmp_path: Path, value: str
+    ) -> None:
+        result, output, calls = self._run(
+            jobs, tmp_path, [[29]], G2G_DISABLED=value
+        )
+        assert result.returncode == 0, result.stderr
+        assert self._matrix(output) == ""
+        assert calls == []
+
+    def test_an_api_failure_fails_the_sweep(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        result, output, _ = self._run(jobs, tmp_path, [[29]], CURL_FAIL="1")
+        assert result.returncode != 0
+        assert "matrix=" not in output
+
+
+# ---------------------------------------------------------------------
+# The tool's side of a leg
+# ---------------------------------------------------------------------
+
+
+def _ctx(*, head_repo: str = "contributor/mdsal") -> GitHubContext:
+    return GitHubContext(
+        event_name="workflow_dispatch",
+        event_action="",
+        event_path=None,
+        repository=REPO,
+        repository_owner="opendaylight",
+        server_url="https://github.com",
+        run_id="1",
+        sha=HEAD_SHA,
+        base_ref="master",
+        head_ref="topic/fix",
+        pr_number=29,
+        head_repo=head_repo,
+    )
+
+
+class TestAClosedPullRequestEndsALegCleanly:
+    """Open when listed, closed before its leg ran: nothing to do."""
+
+    def test_a_leg_stops_without_failing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("G2G_SWEEP_LEG", "true")
+        with pytest.raises(typer.Exit) as exc:
+            _stop_for_pr_state(_ctx(), "closed")
+        assert exc.value.exit_code == 0
+
+    def test_a_dispatch_naming_it_still_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("G2G_SWEEP_LEG", raising=False)
+        with pytest.raises(typer.Exit) as exc:
+            _stop_for_pr_state(_ctx(), "closed")
+        assert exc.value.exit_code != 0
+
+
+class TestTheCleanupLeg:
+    """The pr 0 leg runs the repository-wide part and nothing else."""
+
+    def _handle(self, monkeypatch: pytest.MonkeyPatch, *, leg: bool) -> Any:
+        monkeypatch.setenv("SYNC_ALL_OPEN_PRS", "true")
+        monkeypatch.setenv("G2G_SWEEP_LEG", "true" if leg else "false")
+        with (
+            patch("github2gerrit.cli._process_bulk", return_value=True) as bulk,
+            patch("github2gerrit.cli._run_gerrit_cleanup_tasks") as cleanup,
+            patch("github2gerrit.cli.log_api_metrics_summary"),
+        ):
+            assert _handle_bulk_mode(MagicMock(), _ctx(), no_gerrit=False)
+        return bulk, cleanup
+
+    def test_it_processes_no_pull_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bulk, cleanup = self._handle(monkeypatch, leg=True)
+        bulk.assert_not_called()
+        cleanup.assert_called_once()
+
+    def test_the_single_bulk_job_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The composite action cannot fan out, so a caller using it
+        # directly still sweeps in one job.
+        bulk, cleanup = self._handle(monkeypatch, leg=False)
+        bulk.assert_called_once()
+        cleanup.assert_called_once()
+
+
+def _notice_pr(body: str) -> Any:
+    comment = MagicMock()
+    comment.body = body
+    issue = MagicMock()
+    issue.get_comments.return_value = [comment]
+    pr = MagicMock()
+    pr.as_issue.return_value = issue
+    pr.head = MagicMock()
+    pr.head.sha = HEAD_SHA
+    return pr
+
+
+class TestAPullRequestLeg:
+    """A leg is a sweep of one pull request, not a request for it."""
+
+    def _run(
+        self, pr: Any, monkeypatch: pytest.MonkeyPatch, *, leg: bool
+    ) -> dict[str, Any]:
+        monkeypatch.setenv("G2G_SHOW_PROGRESS", "false")
+        monkeypatch.setenv("G2G_SWEEP_LEG", "true" if leg else "false")
+        monkeypatch.setenv("CI_TESTING", "true")
+        ctx = _ctx()
+        data = MagicMock()
+        data.dry_run = False
+        with (
+            patch(
+                "github2gerrit.cli._augment_pr_refs_if_needed", return_value=ctx
+            ),
+            patch(
+                "github2gerrit.cli._extract_and_display_pr_info",
+                return_value=pr,
+            ),
+            patch("github2gerrit.cli._recover_pr_metadata", return_value=ctx),
+            patch(
+                "github2gerrit.cli._check_fork_approval",
+                return_value=(True, HEAD_SHA),
+            ) as gate,
+            patch("github2gerrit.cli._check_single_pr_duplicates"),
+            patch(
+                "github2gerrit.cli._process_single",
+                return_value=(True, MagicMock(change_urls=[])),
+            ) as pipeline,
+            patch("github2gerrit.cli._run_gerrit_cleanup_tasks") as cleanup,
+            patch("github2gerrit.cli.log_api_metrics_summary"),
+        ):
+            try:
+                _handle_single_pr(
+                    data, ctx, PROperationMode.UNKNOWN, no_gerrit=False
+                )
+                exit_code = None
+            except SystemExit as exc:
+                exit_code = exc.code
+        return {
+            "gate": gate,
+            "pipeline": pipeline,
+            "cleanup": cleanup,
+            "exit": exit_code,
+        }
+
+    def test_a_transferred_head_is_passed_over(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pr = _notice_pr(render_transferred_comment(head_sha=HEAD_SHA))
+        calls = self._run(pr, monkeypatch, leg=True)
+        assert calls["exit"] == 0
+        calls["gate"].assert_not_called()
+        calls["pipeline"].assert_not_called()
+
+    def test_an_untransferred_head_is_processed_without_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The cleanup is the cleanup leg's; a copy per leg would race.
+        calls = self._run(_notice_pr("unrelated"), monkeypatch, leg=True)
+        calls["pipeline"].assert_called_once()
+        calls["cleanup"].assert_not_called()
+
+    def test_a_run_that_is_not_a_leg_still_cleans_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._run(_notice_pr("unrelated"), monkeypatch, leg=False)
+        calls["pipeline"].assert_called_once()
+        calls["cleanup"].assert_called_once()
+
+    def test_a_run_that_is_not_a_leg_ignores_the_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pr = _notice_pr(render_transferred_comment(head_sha=HEAD_SHA))
+        calls = self._run(pr, monkeypatch, leg=False)
+        calls["gate"].assert_called_once()
+        calls["pipeline"].assert_called_once()
