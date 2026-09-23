@@ -84,8 +84,10 @@ from .pr_approval import APPROVAL_MARKER
 from .pr_approval import ApprovalStatus
 from .pr_approval import describe_approver_policy
 from .pr_approval import evaluate_fork_approval
+from .pr_approval import recorded_transfer
 from .pr_approval import render_blocked_comment
 from .pr_approval import render_cleared_comment
+from .pr_approval import render_transferred_comment
 from .pr_commands import CMD_CHECK
 from .pr_commands import MENTION_PREFIX
 from .pr_commands import find_open_command
@@ -684,6 +686,25 @@ def _check_fork_approval(
     return False, ""
 
 
+def _marker_comments_newest_first(pr_obj: Any) -> list[Any]:
+    """Return the comments carrying the approval marker, newest first.
+
+    Empty when the comments cannot be read, which every caller treats
+    as "no notice": the edit then falls back to posting one, and a
+    sweep to processing the pull request.
+    """
+    try:
+        comments = list(pr_obj.as_issue().get_comments())
+    except Exception as exc:
+        log.debug("Could not read comments for approval notice: %s", exc)
+        return []
+    return [
+        comment
+        for comment in reversed(comments)
+        if APPROVAL_MARKER in (getattr(comment, "body", "") or "")
+    ]
+
+
 def _edit_owned_marker_comment(pr_obj: Any, body: str) -> bool:
     """Replace the tool's own approval notice, if one exists.
 
@@ -695,17 +716,8 @@ def _edit_owned_marker_comment(pr_obj: Any, body: str) -> bool:
     Returns:
         ``True`` when a notice of ours was updated.
     """
-    try:
-        issue = pr_obj.as_issue()
-        comments = list(issue.get_comments())
-    except Exception as exc:
-        log.debug("Could not read comments for approval notice: %s", exc)
-        return False
-
     # Newest first: if several carry the marker, keep the most recent.
-    for comment in reversed(comments):
-        if APPROVAL_MARKER not in (getattr(comment, "body", "") or ""):
-            continue
+    for comment in _marker_comments_newest_first(pr_obj):
         try:
             comment.edit(body)
         except Exception as exc:
@@ -739,6 +751,74 @@ def _clear_fork_approval_notice(
     _edit_owned_marker_comment(
         pr_obj, render_cleared_comment(status, head_sha=head_sha)
     )
+
+
+def _record_fork_transfer(
+    pr_obj: Any | None, approved_sha: str, *, dry_run: bool
+) -> None:
+    """Note on the approval notice that the approved head transferred.
+
+    Gives a later sweep a way to tell that this head has already gone
+    to Gerrit (#419). Only a gated pull request carries an approved
+    commit and only a real run transfers one, so an ungated pull
+    request and a dry run record nothing. Called after the transfer
+    succeeds, never before: a record written ahead of a transfer that
+    then failed would have sweeps skip a pull request that still needs
+    one.
+
+    Edits the existing notice without creating one, like the
+    retraction. Best-effort: the transfer has happened, and a missing
+    record only costs a later sweep a redundant visit.
+    """
+    if not approved_sha or dry_run or pr_obj is None:
+        return
+    if env_bool("CI_TESTING", False):
+        return
+    _edit_owned_marker_comment(
+        pr_obj, render_transferred_comment(head_sha=approved_sha)
+    )
+
+
+def _sweep_can_skip(pr_obj: Any | None, gh: GitHubContext) -> bool:
+    """Report whether a sweep may pass over an already-transferred PR.
+
+    True only when the newest approval notice records the pull
+    request's current head as transferred (#419). Anything less — no
+    notice, no record, an unreadable comment list, a head that has
+    moved since — means "process it", so a record that failed to be
+    written degrades to visiting the pull request as before rather
+    than stranding it.
+
+    Sweeps alone consult this. A dispatch naming the pull request, a
+    push and a comment are each somebody asking for this pull request,
+    and must work whatever a comment says.
+
+    The record is not proof of authorship, and nothing here assumes the
+    tool wrote it: anyone may paste one into a comment. Believing a
+    forgery is safe because skipping is the harmless direction. It
+    transfers nothing and delays only the sweep, which the explicit
+    routes above still override. The record is read only for heads the
+    approval gate applies to, so a forgery cannot keep a
+    same-repository pull request out of a sweep either.
+    """
+    if gh.head_is_trusted or pr_obj is None:
+        return False
+    head_sha = str(
+        getattr(getattr(pr_obj, "head", None), "sha", "") or ""
+    ).strip()
+    if not head_sha:
+        return False
+    notices = _marker_comments_newest_first(pr_obj)
+    body = str(getattr(notices[0], "body", "") or "") if notices else ""
+    if recorded_transfer(body) != head_sha.lower():
+        return False
+    log.info(
+        "⏩ Pull request #%s already transferred at %s; nothing for a "
+        "sweep to add",
+        gh.pr_number,
+        head_sha[:7],
+    )
+    return True
 
 
 def _post_fork_approval_notice(
@@ -2115,6 +2195,10 @@ def _process_bulk_pr(
         log.debug("PR #%d rejected by automation_only check", pr_number)
         return "skipped", None, None
 
+    # A sweep has nothing to add for a head already transferred
+    if _sweep_can_skip(pr, per_ctx):
+        return "skipped", None, None
+
     # Fork PRs need a maintainer's approval before anything is fetched
     allowed, approved_sha = _check_fork_approval(pr, per_ctx, progress_tracker)
     if not allowed:
@@ -2126,9 +2210,12 @@ def _process_bulk_pr(
     if skip_result is not None:
         return skip_result
 
-    return _submit_bulk_pr(
+    result = _submit_bulk_pr(
         data, per_ctx, pr_number, progress_tracker, approved_sha
     )
+    if result[0] == "success":
+        _record_fork_transfer(pr, approved_sha, dry_run=data.dry_run)
+    return result
 
 
 def _record_bulk_success(
@@ -3539,6 +3626,7 @@ def _handle_single_pr(
 
     # Display PR information with Rich formatting
     approved_sha = ""
+    pr_obj: Any | None = None
     if gh.pr_number:
         pr_obj = _extract_and_display_pr_info(gh, data, progress_tracker)
 
@@ -3593,6 +3681,7 @@ def _handle_single_pr(
     # Run abandoned-PR and Gerrit cleanup if the pipeline was successful
     # Skip in G2G_NO_GERRIT: no Gerrit server to query
     if pipeline_success:
+        _record_fork_transfer(pr_obj, approved_sha, dry_run=data.dry_run)
         _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
 
     try:

@@ -30,6 +30,7 @@ The evaluation is deliberately conservative:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -45,8 +46,10 @@ __all__ = [
     "ApprovalStatus",
     "describe_approver_policy",
     "evaluate_fork_approval",
+    "recorded_transfer",
     "render_blocked_comment",
     "render_cleared_comment",
+    "render_transferred_comment",
 ]
 
 log = logging.getLogger("github2gerrit.pr_approval")
@@ -54,6 +57,21 @@ log = logging.getLogger("github2gerrit.pr_approval")
 APPROVAL_MARKER = "<!-- github2gerrit:fork-approval v1 -->"
 """Sentinel identifying the gate's explanatory comment, so repeated
 runs edit one comment rather than adding a new one each time."""
+
+_TRANSFER_RECORD_FORMAT = (
+    "<!-- github2gerrit:fork-approval transferred={sha} -->"
+)
+
+_TRANSFER_RECORD = re.compile(
+    r"<!-- github2gerrit:fork-approval transferred=([0-9a-fA-F]{40}) -->"
+)
+"""The head commit a notice records as transferred to Gerrit (#419).
+
+A line of its own rather than a new version of :data:`APPROVAL_MARKER`,
+so notices written before it existed are still found and edited.
+Only a full SHA matches: an abbreviation could name more than one
+commit, and a record that cannot be read as exactly one means nothing.
+"""
 
 _STATE_APPROVED = "APPROVED"
 _STATE_CHANGES_REQUESTED = "CHANGES_REQUESTED"
@@ -267,6 +285,40 @@ def render_cleared_comment(
             "an approval covers the commit it was given for.",
         ]
     )
+
+
+def render_transferred_comment(*, head_sha: str) -> str:
+    """Build the notice recording that an approved head was transferred.
+
+    Replaces the cleared notice once the transfer has succeeded, so the
+    notice states what happened rather than what is about to. The
+    machine-readable record lets a sweep recognise that this head has
+    already gone to Gerrit and has nothing to add (#419).
+    """
+    return "\n".join(
+        [
+            APPROVAL_MARKER,
+            _TRANSFER_RECORD_FORMAT.format(sha=head_sha.lower()),
+            "### Transferred",
+            "",
+            f"Commit `{head_sha[:7]}` was approved and has been transferred "
+            "to Gerrit.",
+            "",
+            "Pushing further commits requires a fresh approval, because "
+            "an approval covers the commit it was given for.",
+        ]
+    )
+
+
+def recorded_transfer(body: str) -> str:
+    """Return the head SHA a notice records as transferred, lower-cased.
+
+    Empty when the notice carries no record. Says nothing about who
+    wrote the notice: anyone may paste a record into a comment, so a
+    caller must only use it where believing a forgery is harmless.
+    """
+    match = _TRANSFER_RECORD.search(body or "")
+    return match.group(1).lower() if match else ""
 
 
 def render_blocked_comment(
