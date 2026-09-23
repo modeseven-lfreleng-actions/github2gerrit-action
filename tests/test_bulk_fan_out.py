@@ -18,12 +18,9 @@ from __future__ import annotations
 
 import copy
 import json
-import math
-import os
-import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -31,7 +28,15 @@ from unittest.mock import patch
 
 import pytest
 import typer
-import yaml
+from workflow_harness import REPO
+from workflow_harness import Page
+from workflow_harness import evaluate as _evaluate
+from workflow_harness import load_jobs
+from workflow_harness import matrix_of
+from workflow_harness import render as _render
+from workflow_harness import request_of
+from workflow_harness import run_enumeration
+from workflow_harness import truthy as _truthy
 
 from github2gerrit.cli import _check_automation_only
 from github2gerrit.cli import _check_single_pr_duplicates
@@ -45,13 +50,6 @@ from github2gerrit.models import PROperationMode
 from github2gerrit.pr_approval import render_transferred_comment
 
 
-WORKFLOW = (
-    Path(__file__).parent.parent
-    / ".github"
-    / "workflows"
-    / "github2gerrit.yaml"
-)
-REPO = "opendaylight/mdsal"
 HEAD_SHA = "0b2abdcf7bb2fb5ed6620f214968ae2b3c5e70e6"
 ACTION_STEP = "Run github2gerrit composite action"
 LEG_ONLY = {
@@ -60,172 +58,6 @@ LEG_ONLY = {
     ("env", "G2G_SWEEP_LEG"),
 }
 """The action-step keys that make a sweep leg, and all that may differ."""
-
-
-# ---------------------------------------------------------------------
-# A small evaluator for the subset of GitHub expressions the workflow's
-# conditions and concurrency groups use. Comparing the expressions as
-# strings could not tell whether two groups actually render the same.
-# ---------------------------------------------------------------------
-
-_TOKEN = re.compile(
-    r"\s*(?:(?P<op>\|\||&&|==|!=|!|\(|\)|,)"
-    r"|'(?P<str>(?:[^']|'')*)'"
-    r"|(?P<num>\d+)"
-    r"|(?P<name>[A-Za-z_][\w-]*(?:\.[\w-]+)*))"
-)
-_TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
-
-
-def _truthy(value: Any) -> bool:
-    if isinstance(value, float) and math.isnan(value):
-        return False
-    return value not in (None, False, 0, "")
-
-
-def _as_number(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).strip() or 0)
-    except ValueError:
-        return math.nan
-
-
-def _equal(left: Any, right: Any) -> bool:
-    # GitHub compares strings case-insensitively and coerces mixed types
-    # to numbers.
-    if isinstance(left, str) and isinstance(right, str):
-        return left.lower() == right.lower()
-    if type(left) is type(right):
-        return bool(left == right)
-    return _as_number(left) == _as_number(right)
-
-
-def _contains(haystack: Any, needle: Any) -> bool:
-    if isinstance(haystack, list):
-        return any(_equal(item, needle) for item in haystack)
-    return str(needle or "").lower() in str(haystack or "").lower()
-
-
-def _format(template: str, *args: Any) -> str:
-    return re.sub(
-        r"\{(\d+)\}", lambda m: _render_value(args[int(m.group(1))]), template
-    )
-
-
-_FUNCTIONS: dict[str, Callable[..., Any]] = {
-    "contains": _contains,
-    "format": _format,
-    "fromJSON": json.loads,
-}
-
-
-class _Expression:
-    """Recursive descent over ``||``, ``&&``, ``==``/``!=``, ``!``."""
-
-    def __init__(self, text: str, context: dict[str, Any]) -> None:
-        self.tokens = [m for m in _TOKEN.finditer(text) if m.group().strip()]
-        assert "".join(m.group() for m in self.tokens).strip() == text.strip()
-        self.pos = 0
-        self.context = context
-
-    def evaluate(self) -> Any:
-        value = self._or()
-        assert self.pos == len(self.tokens), "trailing tokens"
-        return value
-
-    def _peek(self, op: str) -> bool:
-        return (
-            self.pos < len(self.tokens)
-            and self.tokens[self.pos].group("op") == op
-        )
-
-    def _take(self, op: str) -> None:
-        assert self._peek(op), f"expected {op!r}"
-        self.pos += 1
-
-    def _or(self) -> Any:
-        value = self._and()
-        while self._peek("||"):
-            self._take("||")
-            right = self._and()
-            value = value if _truthy(value) else right
-        return value
-
-    def _and(self) -> Any:
-        value = self._compare()
-        while self._peek("&&"):
-            self._take("&&")
-            right = self._compare()
-            value = right if _truthy(value) else value
-        return value
-
-    def _compare(self) -> Any:
-        value = self._unary()
-        while self._peek("==") or self._peek("!="):
-            negate = self._peek("!=")
-            self.pos += 1
-            right = self._unary()
-            value = _equal(value, right) != negate
-        return value
-
-    def _unary(self) -> Any:
-        if self._peek("!"):
-            self._take("!")
-            return not _truthy(self._unary())
-        return self._primary()
-
-    def _primary(self) -> Any:
-        if self._peek("("):
-            self._take("(")
-            value = self._or()
-            self._take(")")
-            return value
-        token = self.tokens[self.pos]
-        self.pos += 1
-        if token.group("str") is not None:
-            return token.group("str").replace("''", "'")
-        if token.group("num") is not None:
-            return int(token.group("num"))
-        name = token.group("name")
-        if self._peek("("):
-            return _FUNCTIONS[name](*self._arguments())
-        literals = {"true": True, "false": False, "null": None}
-        return literals.get(name, self.context.get(name))
-
-    def _arguments(self) -> list[Any]:
-        self._take("(")
-        args = [self._or()]
-        while self._peek(","):
-            self._take(",")
-            args.append(self._or())
-        self._take(")")
-        return args
-
-
-def _evaluate(expression: str, context: dict[str, Any]) -> Any:
-    match = _TEMPLATE.fullmatch(expression.strip())
-    inner = match.group(1) if match else expression
-    return _Expression(inner, {"github.repository": REPO, **context}).evaluate()
-
-
-def _render_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _render(template: str, context: dict[str, Any]) -> str:
-    return _TEMPLATE.sub(
-        lambda m: _render_value(_evaluate(m.group(1), context)), template
-    )
 
 
 class TestTheEvaluatorItself:
@@ -257,7 +89,7 @@ class TestTheEvaluatorItself:
 
 @pytest.fixture(scope="module")
 def jobs() -> dict[str, Any]:
-    return dict(yaml.safe_load(WORKFLOW.read_text())["jobs"])
+    return load_jobs()
 
 
 def _dispatch(pr_number: str, change_url: str = "") -> dict[str, Any]:
@@ -465,97 +297,22 @@ class TestTheLegIsTheSingleJob:
 # The enumeration script, executed out of the workflow
 # ---------------------------------------------------------------------
 
-_CURL_STUB = r"""#!/usr/bin/env bash
-# Stands in for the GraphQL endpoint. Cursors here are page numbers;
-# the real ones are opaque, which the script must not rely on either way.
-python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" \
-  >> "${CURL_LOG}"
-args=("$@")
-data=''
-for ((i = 0; i < ${#args[@]}; i++)); do
-  if [[ "${args[i]}" == "--data" ]]; then data="${args[i + 1]}"; fi
-done
-if [[ -n "${CURL_FAIL:-}" ]]; then
-  echo '{"message": "Bad credentials"}'
-  exit 22
-fi
-if [[ -n "${GRAPHQL_ERRORS:-}" ]]; then
-  echo '{"data": null, "errors": [{"message": "Resource not accessible"}]}'
-  exit 0
-fi
-page=$(( $(jq -r '.variables.after // "0"' <<< "${data}") + 1 ))
-pages=$(find "${CURL_PAGES}" -name '*.json' | wc -l)
-if (( page < pages )); then next=true; else next=false; fi
-jq -nc --slurpfile nodes "${CURL_PAGES}/${page}.json" \
-  --argjson next "${next}" --arg cursor "${page}" \
-  '{data: {repository: {pullRequests: {nodes: $nodes[0],
-    pageInfo: {hasNextPage: $next, endCursor: $cursor}}}}}'
-"""
-
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="needs jq")
 class TestTheEnumeration:
     """The step that builds the sweep's matrix."""
 
-    def _script(self, jobs: dict[str, Any]) -> str:
-        return str(jobs["enumerate"]["steps"][0]["run"])
-
     def _run(
         self,
         jobs: dict[str, Any],
         tmp_path: Path,
-        pages: list[list[int]],
+        pages: Sequence[Page],
         **env: str,
     ) -> tuple[subprocess.CompletedProcess[str], str, list[list[str]]]:
-        stub_dir = tmp_path / "bin"
-        stub_dir.mkdir()
-        curl = stub_dir / "curl"
-        curl.write_text(_CURL_STUB)
-        curl.chmod(0o755)
-        page_dir = tmp_path / "pages"
-        page_dir.mkdir()
-        for index, numbers in enumerate(pages, start=1):
-            (page_dir / f"{index}.json").write_text(
-                json.dumps([{"number": n} for n in numbers])
-            )
-        output = tmp_path / "github_output"
-        output.touch()
-        log = tmp_path / "curl.log"
-        log.touch()
-        result = subprocess.run(
-            ["bash", "-c", self._script(jobs)],
-            capture_output=True,
-            text=True,
-            check=False,
-            # A cursor that never advances must fail the test, not hang it
-            timeout=60,
-            env={
-                **os.environ,
-                "PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}",
-                "GITHUB_TOKEN": "t0ken",
-                "GITHUB_GRAPHQL_URL": "https://api.github.example/graphql",
-                "GITHUB_REPOSITORY": REPO,
-                "GITHUB_OUTPUT": str(output),
-                "G2G_DISABLED": "",
-                "CURL_PAGES": str(page_dir),
-                "CURL_LOG": str(log),
-                **env,
-            },
-        )
-        calls = [json.loads(line) for line in log.read_text().splitlines()]
-        return result, output.read_text(), calls
+        return run_enumeration(jobs, tmp_path, pages, **env)
 
-    @staticmethod
-    def _matrix(output: str) -> str:
-        return next(
-            line.split("=", 1)[1]
-            for line in output.splitlines()
-            if line.startswith("matrix=")
-        )
-
-    @staticmethod
-    def _request(call: list[str]) -> dict[str, Any]:
-        return dict(json.loads(call[call.index("--data") + 1]))
+    _matrix = staticmethod(matrix_of)
+    _request = staticmethod(request_of)
 
     def test_a_leg_per_pull_request_and_one_cleanup(
         self, jobs: dict[str, Any], tmp_path: Path

@@ -195,6 +195,13 @@ def _third_party_imports() -> set[str]:
     import sys
 
     first_party = {"github2gerrit", "tests", "fixtures", "conftest"}
+    # Shared helpers beside the tests import as top-level modules
+    # (pytest puts tests/ on sys.path), so each is first-party too.
+    first_party |= {
+        Path(relative).stem
+        for relative in _tracked_python_files()
+        if Path(relative).parent == Path("tests")
+    }
     names: set[str] = set()
     for relative in _tracked_python_files():
         if not _scan_selects(relative):
