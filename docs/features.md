@@ -505,7 +505,8 @@ decides *whether* to proceed, and the tool always re-reads it from the pull
 request's reviews. So no trigger, and nobody who fires one, can grant
 anything.
 
-Of the privileged triggers, this mechanism uses `issue_comment`.
+Of the privileged triggers, this mechanism uses `issue_comment` and, through
+the reusable workflow, `schedule`.
 
 **A comment** is the privileged re-check. Subscribe to `issue_comment`:
 
@@ -531,13 +532,38 @@ This trigger needs `AUTOMATION_ONLY: false`. It defaults to `true` and closes
 a human-authored pull request before the gate sees it, which would leave
 nothing to unblock.
 
-A zero-touch variant — a periodic sweep that notices the approval without
-anyone commenting — remains open as
-[#421](https://github.com/lfreleng-actions/github2gerrit-action/issues/421).
-It can build on two pieces that bulk dispatch now uses: a job per pull
-request, so each transfer takes that pull request's own lock, and the
-transfer record described below, so an already-transferred head gets no
-second visit.
+**A schedule** removes the comment. A maintainer approves in the ordinary way
+and the next sweep transfers the change. Add a `schedule` trigger to a caller
+of the reusable workflow:
+
+```yaml
+on:
+  schedule:
+    - cron: "17 * * * *"  # hourly, off the top of the hour
+```
+
+A scheduled run lists the open pull requests and starts one job for each that
+the gate could be holding back: a head not known to be in this repository,
+with an approving review of its current commit. Same-repository pull requests
+never enter a sweep. That also covers every automation pull request, which
+the events already handle. The sweep still visits a head whose repository no
+longer exists, since the gate applies to it. The approval check only narrows
+the list; the job's own gate still decides whether that approval counts.
+
+Each job runs in its pull request's concurrency group, so it queues behind a
+comment re-check or a push for the same pull request rather than racing it.
+Once a pull request has transferred, the transfer record described below has
+later sweeps pass it over until its head moves. A pull request approved but
+not yet transferred gets a job on every run until it transfers, so pick an
+interval to match: hourly suits most projects.
+
+The same caveats apply as for comments: the trigger needs
+`AUTOMATION_ONLY: false`, and a scheduled workflow runs from the default
+branch. A composite action cannot start jobs of its own, so a scheduled run
+calling it directly fails with an error saying so, rather than sweeping every
+pull request in one job and racing the runs events start for them. GitHub
+suspends schedules in a public repository after 60 days without activity; the
+comment re-check keeps working regardless.
 
 `pull_request_review` should be **removed** from any workflow that still
 carries it. It can no longer transfer anything: on a fork pull request it runs
@@ -598,15 +624,16 @@ transferred pull request does not keep displaying a stale block. After the
 transfer succeeds it edits the comment once more to say so, recording the
 transferred commit in a hidden marker.
 
-A bulk sweep (`PR_NUMBER` of `0`) reads that marker and passes over a pull
-request whose current head it names, rather than submitting the same commit
-again. Through the reusable workflow each pull request in a sweep runs as a
-job of its own, and the marker behaves the same there. Anything less means the sweep processes the pull request as before:
-no comment, no marker, a comment it cannot read, or a head that has moved
-since. Only a run that pushes records anything: a dry run does not, nor does
-one that finds the pull request's changes already merged or abandoned and
-acts on GitHub instead. Neither does a pull request approved before its
-first run, which never had a comment to edit. Only sweeps consult
+A sweep reads that marker and passes over a pull request whose current head it
+names, rather than submitting the same commit again. Sweeps are the bulk
+dispatch (`PR_NUMBER` of `0`) and the scheduled run; through the reusable
+workflow each pull request in either runs as a job of its own, and the marker
+behaves the same there. Anything less means the sweep processes the pull
+request as before: no comment, no marker, a comment it cannot read, or a head
+that has moved since. Only a run that pushes records anything: a dry run does
+not, nor does one that finds the pull request's changes already merged or
+abandoned and acts on GitHub instead. Neither does a pull request approved
+before its first run, which never had a comment to edit. Only sweeps consult
 the marker. A dispatch naming the pull request, a push and a
 `@github2gerrit check` comment transfer whatever it says.
 

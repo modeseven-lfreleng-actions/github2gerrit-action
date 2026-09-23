@@ -293,17 +293,22 @@ runs:
         fi
 
     - name: "Validate PR_NUMBER usage"
+      # A scheduled sweep names its pull request the same way a dispatch
+      # does: the reusable workflow fans the schedule out to one job per
+      # pull request, each passing that pull request's number.
       # yamllint disable-line rule:line-length
-      if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name != 'workflow_dispatch' && inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0' }}
+      if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' && inputs.PR_NUMBER != '' && inputs.PR_NUMBER != '0' }}
       shell: bash
       run: |
         # Validate PR_NUMBER usage
         set -euo pipefail
-        echo "Error: PR_NUMBER only valid during workflow_dispatch events."
+        echo "Error: PR_NUMBER only valid during workflow_dispatch events," \
+          "or on schedule for one job of a scheduled sweep."
         exit 2
 
     - name: "Normalize PR_NUMBER"
-      if: ${{ steps.disabled-check.outputs.disabled != 'true' && github.event_name == 'workflow_dispatch' }}
+      # yamllint disable-line rule:line-length
+      if: ${{ steps.disabled-check.outputs.disabled != 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
       id: normalize
       shell: bash
       env:
@@ -347,7 +352,18 @@ runs:
         fi
 
         # Honor PR_NUMBER or sync-all from workflow_dispatch normalization
-        if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+        if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+          # One job of a scheduled sweep, which names its pull request.
+          # A schedule sweeping every pull request in one job would race
+          # the runs events start for them (#421), so it is refused.
+          if [[ -n "${DISPATCH_SYNC_ALL:-}" || -z "${DISPATCH_PR_NUMBER:-}" ]]; then
+            echo "Error: a scheduled run needs PR_NUMBER naming one pull request."
+            echo "The reusable workflow fans a schedule out to one job per pull"
+            echo "request; a composite action cannot start jobs of its own."
+            exit 2
+          fi
+          echo "pr_number=${DISPATCH_PR_NUMBER}" >> "$GITHUB_OUTPUT"
+        elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
           if [[ -n "${DISPATCH_SYNC_ALL:-}" ]]; then
             echo "Processing all open pull requests via workflow_dispatch."
             echo "sync_all=true" >> "$GITHUB_OUTPUT"

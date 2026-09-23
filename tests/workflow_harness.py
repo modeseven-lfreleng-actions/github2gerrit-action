@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 """Helpers for testing the reusable workflow as GitHub would run it.
 
-Shared by the tests of the reusable workflow's fan-out (#422). Not a
-test module: pytest collects only ``test_*.py``.
+Shared by the tests of the reusable workflow's fan-out, for bulk
+dispatch (#422) and the scheduled sweep (#421). Not a test module:
+pytest collects only ``test_*.py``.
 
 * :func:`evaluate` and :func:`render` interpret the subset of GitHub
   expressions the workflow's conditions and concurrency groups use, so
@@ -287,6 +288,7 @@ def run_enumeration(
             "GITHUB_REPOSITORY": REPO,
             "GITHUB_OUTPUT": str(output),
             "G2G_DISABLED": "",
+            "SCHEDULED": "false",
             "CURL_PAGES": str(page_dir),
             "CURL_LOG": str(log),
             **env,

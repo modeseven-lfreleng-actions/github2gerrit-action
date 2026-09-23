@@ -27,18 +27,21 @@ RECHECK_EVENTS: frozenset[str] = frozenset(
     {
         "issue_comment",
         "pull_request_review",
+        "schedule",
     }
 )
 """Events that ask the tool to look at a pull request again.
 
-Neither changes the pull request's code, so each maps to UPDATE: an
+None changes the pull request's code, so each maps to UPDATE: an
 existing Gerrit change should gain a patchset rather than a sibling.
 
 They exist because the fork approval gate needs a **privileged** run to
 notice that a maintainer has approved.  GitHub withholds secrets from
 ``pull_request_review`` on a fork pull request, so the approval itself
 cannot be the run that acts on it (see
-:func:`github2gerrit.cli._skip_unprivileged_fork_run`).
+:func:`github2gerrit.cli._skip_unprivileged_fork_run`).  A comment
+asks for the re-check; a schedule makes it without anyone asking, one
+pull request per job of the reusable workflow's sweep (#421).
 
 The important property is that these are *triggers only*.  They decide
 when to re-evaluate, never whether to proceed: authorisation is always

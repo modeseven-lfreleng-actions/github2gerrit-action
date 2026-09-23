@@ -98,6 +98,9 @@ on:
   # pull_request_review runs on fork PRs.
   issue_comment:
     types: [created]
+  # Optional: transfer approved fork PRs without anyone commenting.
+  # schedule:
+  #   - cron: "17 * * * *"
   push:
     branches: [main, master]
   workflow_dispatch:
@@ -141,6 +144,12 @@ Setting `AUTOMATION_ONLY: false` goes with it. It defaults to `true`,
 which closes a human-authored pull request before the approval gate
 sees it, so leaving it set would make the fork path unreachable. Drop
 both if the repository only ever receives automation PRs.
+
+The optional `schedule` trigger does the comment's job unattended: each
+run transfers fork pull requests whose current commit a maintainer has
+approved, one job per pull request, and leaves every other pull request
+alone. See
+[scheduled sweeps](docs/features.md#which-triggers-can-lift-the-gate).
 
 Repositories using the Gerrit-side dispatch integration should also
 declare `GERRIT_CHANGE_URL`, `GERRIT_EVENT_TYPE`, and `GERRIT_BRANCH`
@@ -216,7 +225,8 @@ A composite action cannot start jobs, so here a bulk `workflow_dispatch`
 (`PR_NUMBER` of `0`) still processes every open pull request in one job. That
 job does not serialise against the per-pull-request runs events start, so
 avoid triggering one while pull request activity is in flight, or use the
-reusable workflow, which fans the sweep out.
+reusable workflow, which fans the sweep out. For the same reason a `schedule`
+trigger works only through the reusable workflow.
 
 ### Option C: command-line tool
 
