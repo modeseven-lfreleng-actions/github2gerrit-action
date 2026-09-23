@@ -286,7 +286,9 @@ def _check_automation_only(
 
             close_pr(pr_obj, comment=comment)
 
-            sys.exit(1)
+            # A sweep leg counts this as the single bulk job did: a
+            # pull request skipped, not the sweep failed.
+            sys.exit(0 if _is_sweep_leg() else 1)
         except Exception:
             log.exception("Failed to close non-automation PR")
             raise
@@ -772,23 +774,23 @@ def _clear_fork_approval_notice(
 
 
 def _record_fork_transfer(
-    pr_obj: Any | None, approved_sha: str, *, dry_run: bool
+    pr_obj: Any | None, approved_sha: str, *, pushed: bool
 ) -> None:
     """Note on the approval notice that the approved head transferred.
 
     Gives a later sweep a way to tell that this head has already gone
     to Gerrit (#419). Only a gated pull request carries an approved
-    commit and only a real run transfers one, so an ungated pull
-    request and a dry run record nothing. Called after the transfer
-    succeeds, never before: a record written ahead of a transfer that
-    then failed would have sweeps skip a pull request that still needs
-    one.
+    commit, and only a run that pushed transferred one: a dry run, and
+    a pull request reconciled against changes already merged or
+    abandoned, both succeed without pushing, and recording either
+    would have sweeps skip a head that never reached Gerrit. Called
+    after the push, never before, for the same reason.
 
     Edits the existing notice without creating one, like the
     retraction. Best-effort: the transfer has happened, and a missing
     record only costs a later sweep a redundant visit.
     """
-    if not approved_sha or dry_run or pr_obj is None:
+    if not approved_sha or not pushed or pr_obj is None:
         return
     if env_bool("CI_TESTING", False):
         return
@@ -2231,8 +2233,9 @@ def _process_bulk_pr(
     result = _submit_bulk_pr(
         data, per_ctx, pr_number, progress_tracker, approved_sha
     )
-    if result[0] == "success":
-        _record_fork_transfer(pr, approved_sha, dry_run=data.dry_run)
+    status, submission, _exc = result
+    if status == "success" and submission is not None:
+        _record_fork_transfer(pr, approved_sha, pushed=submission.pushed)
     return result
 
 
@@ -3562,7 +3565,33 @@ def _check_single_pr_duplicates(
                 gh.pr_number,
             )
     except DuplicateChangeError as exc:
+        if _is_sweep_leg():
+            _skip_duplicate_in_sweep(exc, gh, progress_tracker)
         _handle_single_pr_duplicate_error(exc, progress_tracker)
+
+
+def _skip_duplicate_in_sweep(
+    exc: DuplicateChangeError,
+    gh: GitHubContext,
+    progress_tracker: G2GProgressTracker | DummyProgressTracker,
+) -> NoReturn:
+    """End a sweep leg cleanly on a blocked duplicate.
+
+    With ``ALLOW_DUPLICATES`` off, the single bulk job skipped a
+    duplicate and carried on; a run naming the pull request fails on
+    one, which is the answer somebody asking for it needs. A leg is a
+    sweep, so it keeps the bulk behaviour rather than marking the
+    whole sweep failed.
+    """
+    progress_tracker.duplicate_skipped()
+    progress_tracker.stop()
+    log.warning(
+        "Skipping PR #%s due to duplicate detection: %s. Use "
+        "--allow-duplicates to override this check.",
+        gh.pr_number,
+        exc,
+    )
+    sys.exit(int(ExitCode.SUCCESS))
 
 
 def _print_single_pr_summary(
@@ -3735,7 +3764,7 @@ def _handle_single_pr(
     # leaves it to the sweep's cleanup leg, rather than every leg
     # racing to close and abandon the same things.
     if pipeline_success:
-        _record_fork_transfer(pr_obj, approved_sha, dry_run=data.dry_run)
+        _record_fork_transfer(pr_obj, approved_sha, pushed=result.pushed)
         if not _is_sweep_leg():
             _run_gerrit_cleanup_tasks(data, gh, no_gerrit=no_gerrit)
 

@@ -603,8 +603,10 @@ request whose current head it names, rather than submitting the same commit
 again. Through the reusable workflow each pull request in a sweep runs as a
 job of its own, and the marker behaves the same there. Anything less means the sweep processes the pull request as before:
 no comment, no marker, a comment it cannot read, or a head that has moved
-since. A dry run records nothing, and neither does a pull request approved
-before its first run, which never had a comment to edit. Only sweeps consult
+since. Only a run that pushes records anything: a dry run does not, nor does
+one that finds the pull request's changes already merged or abandoned and
+acts on GitHub instead. Neither does a pull request approved before its
+first run, which never had a comment to edit. Only sweeps consult
 the marker. A dispatch naming the pull request, a push and a
 `@github2gerrit check` comment transfer whatever it says.
 

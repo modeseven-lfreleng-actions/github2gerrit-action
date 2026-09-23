@@ -381,6 +381,10 @@ class SubmissionResult:
     change_numbers: list[str]
     # Associated patch set commit shas in Gerrit (if available).
     commit_shas: list[str]
+    # Whether this run pushed to Gerrit. A dry run, and a pull request
+    # reconciled against changes already merged or abandoned, succeed
+    # without pushing, and must not be taken for a transfer.
+    pushed: bool = False
 
 
 @dataclass(frozen=True)
@@ -2643,7 +2647,7 @@ class Orchestrator:
 
         log.debug("Pipeline complete: %s", result)
         self._cleanup_ssh()
-        return result
+        return dataclass_replace(result, pushed=True)
 
     def _determine_operation_mode(
         self,

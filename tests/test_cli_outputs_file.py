@@ -43,6 +43,7 @@ class _DummyResult:
         self.change_urls = urls
         self.change_numbers = nums
         self.commit_shas = shas or []
+        self.pushed = False
 
 
 class _DummyOrchestratorSingle:

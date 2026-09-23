@@ -30,6 +30,8 @@ from github2gerrit.cli import _handle_single_pr
 from github2gerrit.cli import _process_bulk_pr
 from github2gerrit.cli import _record_fork_transfer
 from github2gerrit.cli import _sweep_can_skip
+from github2gerrit.core import Orchestrator
+from github2gerrit.core import SubmissionResult
 from github2gerrit.models import GitHubContext
 from github2gerrit.models import PROperationMode
 from github2gerrit.pr_approval import APPROVAL_MARKER
@@ -207,25 +209,27 @@ class TestSweepSkipsOnlyATransferredHead:
 class TestTheRecordIsWrittenAfterATransfer:
     """When, and when not, the notice records a transfer."""
 
-    def _record(self, pr: Any, approved_sha: str, *, dry_run: bool) -> None:
+    def _record(self, pr: Any, approved_sha: str, *, pushed: bool) -> None:
         with patch("github2gerrit.cli.env_bool", return_value=False):
-            _record_fork_transfer(pr, approved_sha, dry_run=dry_run)
+            _record_fork_transfer(pr, approved_sha, pushed=pushed)
 
     def test_the_notice_records_the_approved_head(self) -> None:
         notice = _comment(f"{APPROVAL_MARKER}\n### Approved")
-        self._record(_pr([notice]), HEAD_SHA, dry_run=False)
+        self._record(_pr([notice]), HEAD_SHA, pushed=True)
         notice.edit.assert_called_once()
         assert recorded_transfer(notice.edit.call_args[0][0]) == HEAD_SHA
 
-    def test_a_dry_run_records_nothing(self) -> None:
-        # Nothing went to Gerrit, so a sweep must still visit.
+    def test_a_run_that_pushed_nothing_records_nothing(self) -> None:
+        # A dry run, or a pull request reconciled against a change
+        # already merged or abandoned, succeeds without reaching
+        # Gerrit, so a sweep must still visit.
         notice = _comment(f"{APPROVAL_MARKER}\n### Approved")
-        self._record(_pr([notice]), HEAD_SHA, dry_run=True)
+        self._record(_pr([notice]), HEAD_SHA, pushed=False)
         notice.edit.assert_not_called()
 
     def test_an_ungated_pull_request_records_nothing(self) -> None:
         pr = _pr([_comment(f"{APPROVAL_MARKER}\n### Approved")])
-        self._record(pr, "", dry_run=False)
+        self._record(pr, "", pushed=True)
         pr.as_issue.assert_not_called()
 
     def test_no_notice_is_created_to_hold_it(self) -> None:
@@ -234,14 +238,103 @@ class TestTheRecordIsWrittenAfterATransfer:
         # a record; sweeps then visit it as before.
         other = _comment("unrelated chatter")
         with patch("github2gerrit.cli.create_pr_comment") as created:
-            self._record(_pr([other]), HEAD_SHA, dry_run=False)
+            self._record(_pr([other]), HEAD_SHA, pushed=True)
         other.edit.assert_not_called()
         assert created.called is False
 
     def test_a_comment_failure_does_not_raise(self) -> None:
         pr = _pr([])
         pr.as_issue.side_effect = RuntimeError("boom")
-        self._record(pr, HEAD_SHA, dry_run=False)
+        self._record(pr, HEAD_SHA, pushed=True)
+
+
+def _submission(*, pushed: bool) -> SubmissionResult:
+    return SubmissionResult(
+        change_urls=[], change_numbers=[], commit_shas=[], pushed=pushed
+    )
+
+
+class TestOnlyAPushCountsAsATransfer:
+    """The orchestrator says whether it pushed; nothing else may guess.
+
+    Several paths end in success without pushing. Taking any of them
+    for a transfer would have every later sweep skip a head that never
+    reached Gerrit, and on an open pull request that means for good.
+    """
+
+    def _orchestrator(self) -> Orchestrator:
+        return Orchestrator(workspace=MagicMock())
+
+    def test_a_result_has_not_pushed_unless_told(self) -> None:
+        assert (
+            SubmissionResult(
+                change_urls=[], change_numbers=[], commit_shas=[]
+            ).pushed
+            is False
+        )
+
+    def test_the_push_path_reports_a_push(self) -> None:
+        orch = self._orchestrator()
+        stubs = {
+            name: MagicMock()
+            for name in (
+                "_push_to_gerrit",
+                "_verify_and_sync_after_push",
+                "_add_backref_comment_in_gerrit",
+                "_comment_on_pull_request",
+                "_validate_committed_files",
+                "_post_push_supersession_sweep",
+                "_close_pull_request_if_required",
+                "_cleanup_ssh",
+                "_resolve_target_branch",
+                "_resolve_reviewers",
+            )
+        }
+        stubs["_query_gerrit_for_results"] = MagicMock(
+            return_value=_submission(pushed=False)
+        )
+        with patch.multiple(orch, **stubs):
+            result = orch._push_and_finalize(
+                inputs=MagicMock(),
+                gh=_ctx(),
+                gerrit=MagicMock(),
+                repo_names=MagicMock(),
+                prep=MagicMock(),
+                operation_mode="create",
+            )
+        assert result.pushed is True
+
+    def test_reconciling_a_merged_change_is_not_a_push(self) -> None:
+        # The case Copilot raised on #454: the pull request's changes
+        # are already merged or abandoned, the run acts on GitHub
+        # instead of pushing, and still reports success.
+        orch = self._orchestrator()
+        with patch.multiple(
+            orch,
+            _collect_change_states=MagicMock(
+                return_value=[("I1", {"status": "MERGED"})]
+            ),
+            _collect_final_change_refs=MagicMock(
+                return_value=(["https://g/c/1"], ["1"], ["abc"])
+            ),
+            _reconcile_pr_for_final_changes=MagicMock(),
+        ):
+            result = orch._reconcile_final_state_changes(
+                gh=_ctx(), gerrit=MagicMock(), change_ids=["I1"]
+            )
+        assert result is not None
+        assert result.pushed is False
+
+    def test_a_dry_run_is_not_a_push(self) -> None:
+        orch = self._orchestrator()
+        with patch.object(orch, "_dry_run_preflight"):
+            result = orch._run_dry_run(
+                gerrit=MagicMock(),
+                inputs=MagicMock(),
+                gh=_ctx(),
+                repo=MagicMock(),
+            )
+        assert result.pushed is False
 
 
 def _inputs(*, dry_run: bool = False) -> Any:
@@ -254,9 +347,9 @@ class TestTheBulkSweepConsultsTheRecord:
     """The in-tool bulk sweep (``PR_NUMBER=0``) honours the record."""
 
     def _process(
-        self, pr: Any, *, outcome: str = "success"
+        self, pr: Any, *, outcome: str = "success", pushed: bool = True
     ) -> tuple[str, MagicMock, MagicMock]:
-        result = (outcome, MagicMock(), None)
+        result = (outcome, _submission(pushed=pushed), None)
         with (
             patch("github2gerrit.cli._check_automation_only"),
             patch("github2gerrit.cli.env_bool", return_value=False),
@@ -302,6 +395,12 @@ class TestTheBulkSweepConsultsTheRecord:
         assert status == "failed"
         notice.edit.assert_not_called()
 
+    def test_a_success_without_a_push_is_not_recorded(self) -> None:
+        notice = _comment(f"{APPROVAL_MARKER}\n### Approved")
+        status, _gate, _submit = self._process(_pr([notice]), pushed=False)
+        assert status == "success"
+        notice.edit.assert_not_called()
+
 
 class TestExplicitRunsIgnoreTheRecord:
     """A run naming the pull request transfers whatever the record says.
@@ -312,9 +411,16 @@ class TestExplicitRunsIgnoreTheRecord:
     a forged one could block a deliberate request.
     """
 
-    def _run(self, pr: Any, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    def _run(
+        self,
+        pr: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        pushed: bool = True,
+    ) -> dict[str, Any]:
         monkeypatch.setenv("G2G_SHOW_PROGRESS", "false")
         monkeypatch.delenv("CI_TESTING", raising=False)
+        monkeypatch.delenv("G2G_SWEEP_LEG", raising=False)
         ctx = _ctx()
         with (
             patch(
@@ -332,7 +438,7 @@ class TestExplicitRunsIgnoreTheRecord:
             patch("github2gerrit.cli._check_single_pr_duplicates"),
             patch(
                 "github2gerrit.cli._process_single",
-                return_value=(True, MagicMock(change_urls=[])),
+                return_value=(True, _submission(pushed=pushed)),
             ) as pipeline,
             patch("github2gerrit.cli._run_gerrit_cleanup_tasks"),
             patch("github2gerrit.cli.log_api_metrics_summary"),
@@ -356,3 +462,10 @@ class TestExplicitRunsIgnoreTheRecord:
         notice = _comment(f"{APPROVAL_MARKER}\n### Approved")
         self._run(_pr([notice]), monkeypatch)
         assert recorded_transfer(notice.edit.call_args[0][0]) == HEAD_SHA
+
+    def test_a_success_without_a_push_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notice = _comment(f"{APPROVAL_MARKER}\n### Approved")
+        self._run(_pr([notice]), monkeypatch, pushed=False)
+        notice.edit.assert_not_called()

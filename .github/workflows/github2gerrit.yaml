@@ -12,6 +12,8 @@ name: "GitHub2Gerrit [R]"
 # runs it as a local action. Workflow and action therefore always
 # ship as one unit with matching input interfaces, and the Python tool
 # itself installs as the latest release from PyPI at runtime (uvx).
+# The bulk sweep's legs are the exception: they rely on tool behaviour
+# from this same commit, and install the tool from it instead.
 #
 # Supported caller trigger events:
 #
@@ -593,6 +595,12 @@ jobs:
       # fails rather than processing a subset, since dispatching again
       # would pick the same subset and never reach the rest.
       #
+      # The listing pages by GraphQL cursor, oldest first, not by REST
+      # offset. A pull request closing on a page already read shifts
+      # every later offset back by one, which would silently skip an
+      # open pull request at the page boundary; a cursor marks a
+      # position instead, and one opened meanwhile lands at the end.
+      #
       # G2G_DISABLED is honoured here too, with the action's truthy
       # set, so a disabled repository starts no legs at all.
       - name: List open pull requests
@@ -611,23 +619,50 @@ jobs:
               exit 0
               ;;
           esac
+          # The $ names are GraphQL variables, not shell ones
+          # shellcheck disable=SC2016
+          query='query($owner: String!, $name: String!, $after: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: OPEN, first: 100, after: $after,
+                           orderBy: {field: CREATED_AT, direction: ASC}) {
+                nodes { number }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }'
           numbers='[]'
-          page=1
+          after=''
           while :; do
-            # Reduce each page to its numbers straight away: a page of
-            # full pull request objects can exceed what a command-line
-            # argument may hold
-            page_numbers="$(curl --fail-with-body --silent --show-error \
+            request="$(jq -nc \
+              --arg query "${query}" \
+              --arg owner "${GITHUB_REPOSITORY%%/*}" \
+              --arg name "${GITHUB_REPOSITORY#*/}" \
+              --arg after "${after}" \
+              '{query: $query, variables: {owner: $owner, name: $name,
+                after: (if $after == "" then null else $after end)}}')"
+            response="$(curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer ${GITHUB_TOKEN}" \
-              --header "Accept: application/vnd.github+json" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100&page=${page}" \
-              | jq -c '[.[].number]')"
-            numbers="$(jq -c --argjson more "${page_numbers}" '. + $more' <<< "${numbers}")"
-            if [[ "$(jq 'length' <<< "${page_numbers}")" -lt 100 ]]; then
+              --header "Content-Type: application/json" \
+              --data "${request}" \
+              "${GITHUB_GRAPHQL_URL}")"
+            # GraphQL reports most failures in a 200 response
+            if ! jq -e '.errors == null and .data.repository.pullRequests != null' \
+                <<< "${response}" > /dev/null; then
+              echo "::error::Listing open pull requests failed:" \
+                "$(jq -c '.errors // .' <<< "${response}")"
+              exit 1
+            fi
+            connection="$(jq -c '.data.repository.pullRequests' <<< "${response}")"
+            numbers="$(jq -c --argjson page "${connection}" \
+              '. + [$page.nodes[].number]' <<< "${numbers}")"
+            if [[ "$(jq '.pageInfo.hasNextPage' <<< "${connection}")" != "true" ]]; then
               break
             fi
-            page=$((page + 1))
+            after="$(jq -r '.pageInfo.endCursor' <<< "${connection}")"
           done
+          # Defensive: a pull request should appear once, but a leg
+          # listed twice would submit its head twice. unique also sorts.
+          numbers="$(jq -c 'unique' <<< "${numbers}")"
           count="$(jq 'length' <<< "${numbers}")"
           if (( count > 255 )); then
             echo "::error::${count} open pull requests exceed the 255 one bulk" \
@@ -636,7 +671,7 @@ jobs:
             exit 1
           fi
           echo "Fanning out to ${count} pull request(s) and one cleanup leg"
-          echo "matrix=$(jq -c '{pr: (sort + [0])}' <<< "${numbers}")" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c '{pr: (. + [0])}' <<< "${numbers}")" >> "$GITHUB_OUTPUT"
 
   # One leg per open pull request from the enumerate job, each taking
   # that pull request's own lock, so a sweep and an event-driven run for
@@ -645,14 +680,18 @@ jobs:
   #
   # The steps are github2gerrit's, less its push-only seed checkout,
   # and must stay so: tests/test_bulk_fan_out.py holds the two equal
-  # apart from the two lines that make this a leg. Each leg dispatches
-  # the action with its pull request's number, and G2G_SWEEP_LEG tells
-  # the tool it is part of a sweep. A leg therefore:
+  # apart from the lines that make this a leg. Each leg dispatches the
+  # action with its pull request's number, runs the tool from this
+  # workflow's commit, and sets G2G_SWEEP_LEG to tell the tool it is
+  # part of a sweep. A leg therefore:
   #
   #   - passes over a fork pull request already transferred at its
   #     current head (#419), as the single bulk job did;
   #   - stops cleanly if its pull request closed after enumeration,
   #     rather than failing as a dispatch naming a closed one does;
+  #   - counts an AUTOMATION_ONLY rejection, or a duplicate that
+  #     ALLOW_DUPLICATES=false blocks, as a skip, as the single bulk
+  #     job did, rather than failing the sweep;
   #   - leaves the repository-wide cleanup to the pr 0 leg, which runs
   #     only that. Parallel copies of it would race to close and
   #     abandon the same things.
@@ -748,8 +787,8 @@ jobs:
         # As in github2gerrit: $/ is unavailable on Enterprise Server
         uses: ./.g2g-action  # zizmor: ignore[self-repository]
         env:
-          # The two lines that make this a leg; everything else below
-          # matches the github2gerrit job's step
+          # The lines that make this a leg (with USE_LOCAL_ACTION and
+          # PR_NUMBER below); everything else matches github2gerrit's
           G2G_SWEEP_LEG: "true"
           GERRIT_CHANGE_URL: ${{ inputs.GERRIT_CHANGE_URL }}
           GERRIT_EVENT_TYPE: ${{ inputs.GERRIT_EVENT_TYPE }}
@@ -766,6 +805,13 @@ jobs:
           # yamllint enable rule:line-length
         with:
           PR_NUMBER: ${{ matrix.pr }}
+          # A leg depends on G2G_SWEEP_LEG, which a tool older than this
+          # workflow ignores: the pr 0 leg would then sweep every pull
+          # request in one job alongside the legs doing the same, the
+          # race this job exists to remove. So legs run the tool from
+          # this workflow's own commit rather than the latest PyPI
+          # release, which can lag it; github2gerrit keeps the release.
+          USE_LOCAL_ACTION: "true"
           SUBMIT_SINGLE_COMMITS: ${{ inputs.SUBMIT_SINGLE_COMMITS }}
           USE_PR_AS_COMMIT: ${{ inputs.USE_PR_AS_COMMIT }}
           FETCH_DEPTH: ${{ inputs.FETCH_DEPTH }}

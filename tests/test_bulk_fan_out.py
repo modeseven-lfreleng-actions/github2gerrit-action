@@ -33,9 +33,13 @@ import pytest
 import typer
 import yaml
 
+from github2gerrit.cli import _check_automation_only
+from github2gerrit.cli import _check_single_pr_duplicates
 from github2gerrit.cli import _handle_bulk_mode
 from github2gerrit.cli import _handle_single_pr
 from github2gerrit.cli import _stop_for_pr_state
+from github2gerrit.core import SubmissionResult
+from github2gerrit.duplicate_detection import DuplicateChangeError
 from github2gerrit.models import GitHubContext
 from github2gerrit.models import PROperationMode
 from github2gerrit.pr_approval import render_transferred_comment
@@ -50,7 +54,11 @@ WORKFLOW = (
 REPO = "opendaylight/mdsal"
 HEAD_SHA = "0b2abdcf7bb2fb5ed6620f214968ae2b3c5e70e6"
 ACTION_STEP = "Run github2gerrit composite action"
-LEG_ONLY = {("with", "PR_NUMBER"), ("env", "G2G_SWEEP_LEG")}
+LEG_ONLY = {
+    ("with", "PR_NUMBER"),
+    ("with", "USE_LOCAL_ACTION"),
+    ("env", "G2G_SWEEP_LEG"),
+}
 """The action-step keys that make a sweep leg, and all that may differ."""
 
 
@@ -436,25 +444,52 @@ class TestTheLegIsTheSingleJob:
         assert step["with"]["PR_NUMBER"] == "${{ matrix.pr }}"
         assert step["env"]["G2G_SWEEP_LEG"] == "true"
 
+    def test_a_leg_runs_the_tool_from_this_workflows_commit(
+        self, jobs: dict[str, Any]
+    ) -> None:
+        # A tool older than the workflow ignores G2G_SWEEP_LEG, and the
+        # pr 0 leg would then sweep every pull request in one job while
+        # the other legs do the same. The PyPI release can lag.
+        step = _action_step(jobs["github2gerrit-sweep"])
+        assert step["with"]["USE_LOCAL_ACTION"] == "true"
+
     def test_the_single_job_is_never_a_leg(self, jobs: dict[str, Any]) -> None:
-        assert "G2G_SWEEP_LEG" not in _action_step(jobs["github2gerrit"]).get(
-            "env", {}
-        )
+        step = _action_step(jobs["github2gerrit"])
+        assert "G2G_SWEEP_LEG" not in step.get("env", {})
+        # Nor does it change where the tool comes from; that remains
+        # the published release for every other run.
+        assert "USE_LOCAL_ACTION" not in step.get("with", {})
 
 
 # ---------------------------------------------------------------------
 # The enumeration script, executed out of the workflow
 # ---------------------------------------------------------------------
 
-_CURL_STUB = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "${CURL_LOG}"
+_CURL_STUB = r"""#!/usr/bin/env bash
+# Stands in for the GraphQL endpoint. Cursors here are page numbers;
+# the real ones are opaque, which the script must not rely on either way.
+python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@" \
+  >> "${CURL_LOG}"
+args=("$@")
+data=''
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [[ "${args[i]}" == "--data" ]]; then data="${args[i + 1]}"; fi
+done
 if [[ -n "${CURL_FAIL:-}" ]]; then
   echo '{"message": "Bad credentials"}'
   exit 22
 fi
-url="${@: -1}"
-page="${url##*page=}"
-cat "${CURL_PAGES}/${page}.json" 2>/dev/null || echo '[]'
+if [[ -n "${GRAPHQL_ERRORS:-}" ]]; then
+  echo '{"data": null, "errors": [{"message": "Resource not accessible"}]}'
+  exit 0
+fi
+page=$(( $(jq -r '.variables.after // "0"' <<< "${data}") + 1 ))
+pages=$(find "${CURL_PAGES}" -name '*.json' | wc -l)
+if (( page < pages )); then next=true; else next=false; fi
+jq -nc --slurpfile nodes "${CURL_PAGES}/${page}.json" \
+  --argjson next "${next}" --arg cursor "${page}" \
+  '{data: {repository: {pullRequests: {nodes: $nodes[0],
+    pageInfo: {hasNextPage: $next, endCursor: $cursor}}}}}'
 """
 
 
@@ -471,7 +506,7 @@ class TestTheEnumeration:
         tmp_path: Path,
         pages: list[list[int]],
         **env: str,
-    ) -> tuple[subprocess.CompletedProcess[str], str, list[str]]:
+    ) -> tuple[subprocess.CompletedProcess[str], str, list[list[str]]]:
         stub_dir = tmp_path / "bin"
         stub_dir.mkdir()
         curl = stub_dir / "curl"
@@ -481,7 +516,7 @@ class TestTheEnumeration:
         page_dir.mkdir()
         for index, numbers in enumerate(pages, start=1):
             (page_dir / f"{index}.json").write_text(
-                json.dumps([{"number": n, "title": "t"} for n in numbers])
+                json.dumps([{"number": n} for n in numbers])
             )
         output = tmp_path / "github_output"
         output.touch()
@@ -492,11 +527,13 @@ class TestTheEnumeration:
             capture_output=True,
             text=True,
             check=False,
+            # A cursor that never advances must fail the test, not hang it
+            timeout=60,
             env={
                 **os.environ,
                 "PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}",
                 "GITHUB_TOKEN": "t0ken",
-                "GITHUB_API_URL": "https://api.github.example",
+                "GITHUB_GRAPHQL_URL": "https://api.github.example/graphql",
                 "GITHUB_REPOSITORY": REPO,
                 "GITHUB_OUTPUT": str(output),
                 "G2G_DISABLED": "",
@@ -505,7 +542,8 @@ class TestTheEnumeration:
                 **env,
             },
         )
-        return result, output.read_text(), log.read_text().splitlines()
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        return result, output.read_text(), calls
 
     @staticmethod
     def _matrix(output: str) -> str:
@@ -514,6 +552,10 @@ class TestTheEnumeration:
             for line in output.splitlines()
             if line.startswith("matrix=")
         )
+
+    @staticmethod
+    def _request(call: list[str]) -> dict[str, Any]:
+        return dict(json.loads(call[call.index("--data") + 1]))
 
     def test_a_leg_per_pull_request_and_one_cleanup(
         self, jobs: dict[str, Any], tmp_path: Path
@@ -543,22 +585,65 @@ class TestTheEnumeration:
                     jobs["github2gerrit"], event
                 )
 
-    def test_every_page_is_read(
+    def test_every_page_is_read_by_following_the_cursor(
         self, jobs: dict[str, Any], tmp_path: Path
     ) -> None:
-        pages = [list(range(1, 101)), [101, 102]]
+        # Offsets shift when a pull request on a page already read
+        # closes, skipping one at the boundary; a cursor does not.
+        pages = [list(range(1, 101)), list(range(101, 201)), [201, 202]]
         result, output, calls = self._run(jobs, tmp_path, pages)
         assert result.returncode == 0, result.stderr
-        assert len(json.loads(self._matrix(output))["pr"]) == 103
-        assert len(calls) == 2
+        assert len(json.loads(self._matrix(output))["pr"]) == 203
+        cursors = [self._request(c)["variables"]["after"] for c in calls]
+        assert cursors == [None, "1", "2"]
 
-    def test_a_full_last_page_asks_once_more(
+    def test_the_listing_stops_when_github_says_it_is_done(
         self, jobs: dict[str, Any], tmp_path: Path
     ) -> None:
+        # A full page is not a sign of more; hasNextPage is.
         result, output, calls = self._run(jobs, tmp_path, [list(range(1, 101))])
         assert result.returncode == 0, result.stderr
         assert len(json.loads(self._matrix(output))["pr"]) == 101
-        assert len(calls) == 2
+        assert len(calls) == 1
+
+    def test_the_request_asks_for_open_pull_requests_oldest_first(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        _result, _output, calls = self._run(jobs, tmp_path, [[29]])
+        call = calls[0]
+        assert "Authorization: Bearer t0ken" in call
+        assert call[-1] == "https://api.github.example/graphql"
+        request = self._request(call)
+        owner, name = REPO.split("/")
+        assert request["variables"]["owner"] == owner
+        assert request["variables"]["name"] == name
+        query = " ".join(request["query"].split())
+        assert "states: OPEN" in query
+        # Oldest first, so one opened meanwhile lands after the cursor
+        assert "orderBy: {field: CREATED_AT, direction: ASC}" in query
+
+    def test_a_pull_request_listed_twice_gets_one_leg(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        # Defensive: a second leg would queue behind the first and
+        # submit the same head again.
+        pages = [list(range(1, 101)), [100, 101]]
+        result, output, _ = self._run(jobs, tmp_path, pages)
+        assert result.returncode == 0, result.stderr
+        legs = json.loads(self._matrix(output))["pr"]
+        assert legs == [*range(1, 102), 0]
+
+    def test_the_limit_counts_pull_requests_not_listings(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        pages = [
+            list(range(1, 101)),
+            list(range(101, 201)),
+            [*range(201, 256), 1],
+        ]
+        result, output, _ = self._run(jobs, tmp_path, pages)
+        assert result.returncode == 0, result.stderr
+        assert len(json.loads(self._matrix(output))["pr"]) == 256
 
     def test_no_open_pull_requests_still_cleans_up(
         self, jobs: dict[str, Any], tmp_path: Path
@@ -568,16 +653,6 @@ class TestTheEnumeration:
         result, output, _ = self._run(jobs, tmp_path, [[]])
         assert result.returncode == 0, result.stderr
         assert json.loads(self._matrix(output)) == {"pr": [0]}
-
-    def test_the_request_is_authenticated_and_scoped(
-        self, jobs: dict[str, Any], tmp_path: Path
-    ) -> None:
-        _result, _output, calls = self._run(jobs, tmp_path, [[29]])
-        assert "Authorization: Bearer t0ken" in calls[0]
-        assert (
-            f"https://api.github.example/repos/{REPO}/pulls?state=open"
-            in calls[0]
-        )
 
     def test_the_largest_matrix_github_allows(
         self, jobs: dict[str, Any], tmp_path: Path
@@ -617,11 +692,23 @@ class TestTheEnumeration:
         assert self._matrix(output) == ""
         assert calls == []
 
-    def test_an_api_failure_fails_the_sweep(
+    def test_an_http_failure_fails_the_sweep(
         self, jobs: dict[str, Any], tmp_path: Path
     ) -> None:
         result, output, _ = self._run(jobs, tmp_path, [[29]], CURL_FAIL="1")
         assert result.returncode != 0
+        assert "matrix=" not in output
+
+    def test_a_graphql_error_fails_the_sweep(
+        self, jobs: dict[str, Any], tmp_path: Path
+    ) -> None:
+        # GraphQL reports most failures in a 200 response, which
+        # --fail-with-body alone would take for an empty listing.
+        result, output, _ = self._run(
+            jobs, tmp_path, [[29]], GRAPHQL_ERRORS="1"
+        )
+        assert result.returncode == 1
+        assert "Resource not accessible" in result.stdout
         assert "matrix=" not in output
 
 
@@ -667,6 +754,87 @@ class TestAClosedPullRequestEndsALegCleanly:
         assert exc.value.exit_code != 0
 
 
+class TestAnAutomationOnlyRejectionIsASkip:
+    """``AUTOMATION_ONLY`` closing a pull request must not fail a sweep.
+
+    It defaults to true, so an ordinary human-authored pull request in
+    a mirror is closed and the run ends. The single bulk job counted
+    that pull request as skipped; a leg must too, or one such pull
+    request marks the whole sweep failed.
+    """
+
+    def _reject(self, monkeypatch: pytest.MonkeyPatch, *, leg: bool) -> Any:
+        monkeypatch.setenv("AUTOMATION_ONLY", "true")
+        monkeypatch.setenv("G2G_SWEEP_LEG", "true" if leg else "false")
+        pr = MagicMock()
+        pr.user.login = "a-human"
+        with (
+            patch("github2gerrit.github_api.close_pr") as close,
+            pytest.raises(SystemExit) as exc,
+        ):
+            _check_automation_only(pr, _ctx())
+        close.assert_called_once()
+        return exc.value.code
+
+    def test_a_leg_closes_it_and_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._reject(monkeypatch, leg=True) == 0
+
+    def test_a_run_naming_it_still_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._reject(monkeypatch, leg=False) == 1
+
+
+class TestABlockedDuplicateIsASkip:
+    """``ALLOW_DUPLICATES=false`` blocking a pull request is no failure.
+
+    The single bulk job skipped a duplicate and carried on. A leg takes
+    the single-PR path, which fails on one, as a run naming the pull
+    request should; a leg must keep the bulk behaviour instead.
+    """
+
+    def _check(self, monkeypatch: pytest.MonkeyPatch, *, leg: bool) -> Any:
+        monkeypatch.setenv("G2G_SWEEP_LEG", "true" if leg else "false")
+        data = MagicMock()
+        data.allow_duplicates = False
+        data.duplicates_filter = ""
+        tracker = MagicMock()
+        with (
+            patch(
+                "github2gerrit.cli.check_for_duplicates",
+                side_effect=DuplicateChangeError("duplicate of #28", [28]),
+            ),
+            patch(
+                "github2gerrit.cli.DuplicateDetector._generate_github_change_hash",
+                return_value="hash",
+            ),
+            pytest.raises((SystemExit, typer.Exit)) as exc,
+        ):
+            _check_single_pr_duplicates(
+                data, _ctx(), PROperationMode.UNKNOWN, tracker
+            )
+        return exc.value, tracker
+
+    def test_a_leg_skips_it_and_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stop, tracker = self._check(monkeypatch, leg=True)
+        assert isinstance(stop, SystemExit)
+        assert stop.code == 0
+        tracker.duplicate_skipped.assert_called_once()
+        # A clean stop must release the progress display too.
+        tracker.stop.assert_called_once()
+
+    def test_a_run_naming_it_still_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stop, _tracker = self._check(monkeypatch, leg=False)
+        assert isinstance(stop, typer.Exit)
+        assert stop.exit_code != 0
+
+
 class TestTheCleanupLeg:
     """The pr 0 leg runs the repository-wide part and nothing else."""
 
@@ -696,6 +864,12 @@ class TestTheCleanupLeg:
         bulk, cleanup = self._handle(monkeypatch, leg=False)
         bulk.assert_called_once()
         cleanup.assert_called_once()
+
+
+def _pushed() -> SubmissionResult:
+    return SubmissionResult(
+        change_urls=[], change_numbers=[], commit_shas=[], pushed=True
+    )
 
 
 def _notice_pr(body: str) -> Any:
@@ -738,7 +912,7 @@ class TestAPullRequestLeg:
             patch("github2gerrit.cli._check_single_pr_duplicates"),
             patch(
                 "github2gerrit.cli._process_single",
-                return_value=(True, MagicMock(change_urls=[])),
+                return_value=(True, _pushed()),
             ) as pipeline,
             patch("github2gerrit.cli._run_gerrit_cleanup_tasks") as cleanup,
             patch("github2gerrit.cli.log_api_metrics_summary"),
