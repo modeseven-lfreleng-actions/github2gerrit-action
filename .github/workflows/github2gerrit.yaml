@@ -25,6 +25,10 @@ name: "GitHub2Gerrit [R]"
 #     0 sweeps all open PRs, fanned out to one job per PR) and
 #     Gerrit-event dispatches (GERRIT_CHANGE_URL/GERRIT_EVENT_TYPE
 #     close the source PR of a merged or abandoned Gerrit change)
+#   - issue_comment: '@github2gerrit check' re-checks a fork PR's
+#     approval and transfers it once approved
+#   - schedule: sweeps fork PRs whose current head a maintainer has
+#     approved, transferring them without anyone commenting
 #
 # Callers with a workflow_dispatch trigger should forward their
 # dispatch inputs, for example:
@@ -563,7 +567,8 @@ jobs:
 
   # A bulk workflow_dispatch (PR_NUMBER of 0 or unset) fans out: this
   # job lists the open pull requests, and github2gerrit-sweep below
-  # runs one leg per pull request (#422).
+  # runs one leg per pull request (#422). A schedule fans out the same
+  # way, over a narrower list (#421); see the listing step.
   #
   # One job processing every pull request cannot serialise against the
   # runs events start for each of them. GitHub concurrency is per job
@@ -573,12 +578,13 @@ jobs:
   # ALLOW_DUPLICATES defaults to true, so nothing downstream stops
   # them. A leg per pull request can take that pull request's own lock.
   #
-  # The condition is the exact complement of the dispatch clause in
-  # github2gerrit's: a bulk dispatch that names no Gerrit change.
+  # The dispatch clause is the exact complement of the one in
+  # github2gerrit's condition: a bulk dispatch that names no Gerrit
+  # change. github2gerrit admits no schedule at all.
   enumerate:
     name: "Enumerate open pull requests"
     # yamllint disable-line rule:line-length
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.PR_NUMBER == '' || inputs.PR_NUMBER == '0') && inputs.GERRIT_CHANGE_URL == '' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.PR_NUMBER == '' || inputs.PR_NUMBER == '0') && inputs.GERRIT_CHANGE_URL == '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -603,12 +609,16 @@ jobs:
       #
       # G2G_DISABLED is honoured here too, with the action's truthy
       # set, so a disabled repository starts no legs at all.
+      #
+      # A scheduled sweep (#421) lists a narrower set and has no cleanup
+      # leg; the script explains the filter where it applies it.
       - name: List open pull requests
         id: list
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
           G2G_DISABLED: ${{ vars.G2G_DISABLED }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
         run: |
           # List open pull requests
           set -euo pipefail
@@ -625,11 +635,49 @@ jobs:
             repository(owner: $owner, name: $name) {
               pullRequests(states: OPEN, first: 100, after: $after,
                            orderBy: {field: CREATED_AT, direction: ASC}) {
-                nodes { number }
+                nodes {
+                  number
+                  headRefOid
+                  headRepository { nameWithOwner }
+                  reviews(states: [APPROVED], last: 100) {
+                    totalCount
+                    nodes { commit { oid } }
+                  }
+                }
                 pageInfo { hasNextPage endCursor }
               }
             }
           }'
+          # A scheduled sweep exists to notice fork approvals nobody
+          # commented on (#421), so it keeps only pull requests the gate
+          # could be holding back; anything more would re-run the
+          # pipeline for every open pull request on every interval. It
+          # keeps a pull request when both hold:
+          #
+          #   - its head is not known to be in this repository. That is
+          #     head_repo_is_trusted's rule, name for name and ignoring
+          #     case, so a head whose repository no longer exists (a
+          #     deleted fork) stays: the gate applies to unresolved
+          #     provenance, and dropping it would strand the pull request.
+          #   - some approving review covers its current head. The gate
+          #     cannot authorise without one, so this drops only pull
+          #     requests it would block anyway. Whether the approval
+          #     counts (who gave it, whether changes are requested) is
+          #     the leg's gate to decide. A truncated review list keeps
+          #     the pull request rather than guessing.
+          #
+          # A pull request already transferred at its head still gets a
+          # leg, which reads the transfer record and stops (#419).
+          #
+          # The $ names are jq variables.
+          # shellcheck disable=SC2016
+          keep='if $scheduled then map(select(
+              ((.headRepository.nameWithOwner // "") | ascii_downcase)
+                != ($repo | ascii_downcase)
+              and (.headRefOid as $head
+                | .reviews.totalCount > (.reviews.nodes | length)
+                  or any(.reviews.nodes[]; .commit.oid == $head))))
+            else . end | map(.number)'
           numbers='[]'
           after=''
           while :; do
@@ -653,8 +701,11 @@ jobs:
               exit 1
             fi
             connection="$(jq -c '.data.repository.pullRequests' <<< "${response}")"
-            numbers="$(jq -c --argjson page "${connection}" \
-              '. + [$page.nodes[].number]' <<< "${numbers}")"
+            page_numbers="$(jq -c --argjson scheduled "${SCHEDULED}" \
+              --arg repo "${GITHUB_REPOSITORY}" ".nodes | ${keep}" \
+              <<< "${connection}")"
+            numbers="$(jq -c --argjson more "${page_numbers}" \
+              '. + $more' <<< "${numbers}")"
             if [[ "$(jq '.pageInfo.hasNextPage' <<< "${connection}")" != "true" ]]; then
               break
             fi
@@ -664,6 +715,22 @@ jobs:
           # listed twice would submit its head twice. unique also sorts.
           numbers="$(jq -c 'unique' <<< "${numbers}")"
           count="$(jq 'length' <<< "${numbers}")"
+          if [[ "${SCHEDULED}" == "true" ]]; then
+            # No cleanup leg: GitHub's 256-job cap is all pull requests
+            if (( count > 256 )); then
+              echo "::error::${count} pull requests await a scheduled transfer," \
+                "more than the 256 jobs GitHub allows one matrix."
+              exit 1
+            fi
+            if (( count == 0 )); then
+              echo "No approved pull request is awaiting transfer"
+              echo "matrix=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Fanning out to ${count} approved pull request(s)"
+            echo "matrix=$(jq -c '{pr: .}' <<< "${numbers}")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if (( count > 255 )); then
             echo "::error::${count} open pull requests exceed the 255 one bulk" \
               "dispatch can fan out to (GitHub caps a matrix at 256 jobs, one" \
