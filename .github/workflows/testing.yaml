@@ -44,7 +44,7 @@ jobs:
       contents: read  # Checkout for the mirror job and bundled action
       pull-requests: write  # Comment on and update mirrored PRs
       issues: write  # Post status/back-reference comments on issues
-    uses: ./.github/workflows/github2gerrit.yaml
+    uses: $/.github/workflows/github2gerrit.yaml
     with:
       G2G_NO_GERRIT: true
       AUTOMATION_ONLY: false
@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
 
       - name: "Running local action: ${{ github.repository }}"
-        uses: ./
+        uses: $/
         with:
           GERRIT_KNOWN_HOSTS: 'dummy-host ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC...'
           GERRIT_SSH_PRIVKEY_G2G: 'dummy-key'
@@ -77,7 +77,7 @@ jobs:
 
       # yamllint disable-line rule:line-length
       - name: "Running local action: ${{ github.repository }} [Failure]"
-        uses: ./
+        uses: $/
         id: failure
         continue-on-error: true
         env:
