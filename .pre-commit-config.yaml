@@ -109,7 +109,7 @@ repos:
       - id: mypy
         files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
         additional_dependencies:
-          - mypy==2.3.1
+          - mypy==2.4.0
           - click==8.5.0
           - pytest==9.1.1
           - responses==0.26.3
