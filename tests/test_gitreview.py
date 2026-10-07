@@ -88,14 +88,6 @@ INDENTED_GITREVIEW = (
     "        "
 )
 
-INDENT_IS_A_GAP = pytest.mark.xfail(
-    strict=True, reason="keys indented by whitespace are not matched yet"
-)
-
-UNSCOPED_IS_A_GAP = pytest.mark.xfail(
-    strict=True, reason="keys are not yet scoped to the [gerrit] section"
-)
-
 
 # -----------------------------------------------------------------------
 # GitReviewInfo data model
@@ -283,7 +275,6 @@ class TestParseGitreview:
         assert info is not None
         assert info.host == "gerrit.example.org"
 
-    @INDENT_IS_A_GAP
     def test_space_indented_keys(self) -> None:
         info = parse_gitreview(INDENTED_GITREVIEW)
         assert info is not None
@@ -292,7 +283,6 @@ class TestParseGitreview:
         assert info.port_given is True
         assert info.project == "cps"
 
-    @INDENT_IS_A_GAP
     def test_tab_indented_keys(self) -> None:
         text = (
             "[gerrit]\n\thost=gerrit.example.org\n\tport=29419\n\tproject=a/b\n"
@@ -363,21 +353,18 @@ class TestParseGitreview:
 # hold; the parser is lenient beyond this, but never contrary to it.
 CONFIGPARSER_LAYOUTS = [
     pytest.param(TYPICAL_GITREVIEW, id="flat"),
-    pytest.param(INDENTED_GITREVIEW, id="all-indented", marks=INDENT_IS_A_GAP),
+    pytest.param(INDENTED_GITREVIEW, id="all-indented"),
     pytest.param(
         "[gerrit]\n\thost=h.example.org\n\tport=29419\n\tproject=p\n",
         id="tab-indented",
-        marks=INDENT_IS_A_GAP,
     ),
     pytest.param(
         "[gerrit]\n    host=h.example.org\n",
         id="indented-under-flat-header",
-        marks=INDENT_IS_A_GAP,
     ),
     pytest.param(
         "[gerrit]\n    host=h.example.org\nport=29419\n",
         id="dedent-after-indent",
-        marks=INDENT_IS_A_GAP,
     ),
     pytest.param(
         "[gerrit]\nnote = x\n    host=wrong.example.org\n", id="continuation"
@@ -392,7 +379,6 @@ CONFIGPARSER_LAYOUTS = [
     pytest.param(
         "[gerrit]\n  note = x\n    port=1\n  host=h.example.org\n",
         id="deeper-option-ends-run",
-        marks=INDENT_IS_A_GAP,
     ),
     pytest.param(
         "[other]\n    host=wrong.example.org\n    port=1\n    project=wrong\n"
@@ -403,12 +389,10 @@ CONFIGPARSER_LAYOUTS = [
         "[other]\nhost=wrong.example.org\nport=1\nproject=wrong\n"
         "[gerrit]\nhost=right.example.org\nport=29419\nproject=right\n",
         id="flat-keys-in-earlier-section",
-        marks=UNSCOPED_IS_A_GAP,
     ),
     pytest.param(
         "[gerrit]\nhost=right.example.org\n[other]\nport=1\nproject=wrong\n",
         id="flat-keys-in-later-section",
-        marks=UNSCOPED_IS_A_GAP,
     ),
     pytest.param(
         "[DEFAULT]\nhost=default.example.org\nport=29419\n[gerrit]\nproject=p\n",
@@ -418,7 +402,6 @@ CONFIGPARSER_LAYOUTS = [
         "[DEFAULT]\nhost=default.example.org\nport=1\n"
         "[gerrit]\nhost=right.example.org\nport=29419\n",
         id="gerrit-overrides-earlier-default",
-        marks=UNSCOPED_IS_A_GAP,
     ),
     pytest.param(
         "[gerrit]\nhost=right.example.org\n[DEFAULT]\nhost=default.example.org\n",
@@ -427,17 +410,14 @@ CONFIGPARSER_LAYOUTS = [
     pytest.param(
         "[DEFAULT]\nhost=default.example.org\n[gerrit]\nhost=\n",
         id="empty-host-overrides-default",
-        marks=UNSCOPED_IS_A_GAP,
     ),
     pytest.param(
         "[DEFAULT]\nport=1\n[gerrit]\nhost=h.example.org\nport=\n",
         id="empty-port-overrides-default",
-        marks=UNSCOPED_IS_A_GAP,
     ),
     pytest.param(
         "[DEFAULT]\nproject=wrong\n[gerrit]\nhost=h.example.org\nproject=\n",
         id="empty-project-overrides-default",
-        marks=UNSCOPED_IS_A_GAP,
     ),
 ]
 
@@ -492,7 +472,6 @@ class TestReadLocalGitreview:
         p.write_text("garbage\n", encoding="utf-8")
         assert read_local_gitreview(p) is None
 
-    @INDENT_IS_A_GAP
     def test_reads_indented_file(self, tmp_path: Path) -> None:
         p = tmp_path / ".gitreview"
         p.write_text(INDENTED_GITREVIEW, encoding="utf-8")
