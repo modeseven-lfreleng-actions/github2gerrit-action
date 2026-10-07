@@ -19,15 +19,17 @@ Design goals
   ``config.py`` (host-only), ``core.py`` (host+port+project), and
   ``duplicate_detection.py`` (host+project) is supported, plus the
   ``base_path`` field used by the sister ``dependamerge`` project.
-* **Consistent regex** — a single set of precompiled patterns that
-  tolerates optional whitespace around ``=`` and is case-insensitive on
-  keys (both forms seen in the wild).
+* **Consistent parsing** — a file with a ``[gerrit]`` section is read
+  with ``configparser``, as git-review reads it. Any other file falls
+  back to a single set of precompiled patterns that tolerates optional
+  whitespace around ``=`` and is case-insensitive on keys.
 * **Bug-free fetching** — URL-encodes branch names, deduplicates the
   branch list, and validates raw URLs before opening them.
 """
 
 from __future__ import annotations
 
+import configparser
 import logging
 import os
 import re
@@ -45,9 +47,54 @@ log = logging.getLogger(__name__)
 DEFAULT_GERRIT_PORT: int = 29418
 """Default Gerrit SSH port when the ``port=`` line is absent."""
 
+# Fallback scan for files configparser cannot read (see
+# _read_gerrit_section): keys at the start of a line, anywhere in the file.
 _HOST_RE = re.compile(r"(?mi)^host[ \t]*=[ \t]*(.+?)[ \t\r]*$")
 _PORT_RE = re.compile(r"(?mi)^port[ \t]*=[ \t]*(\d+)[ \t\r]*$")
 _PROJECT_RE = re.compile(r"(?mi)^project[ \t]*=[ \t]*(.+?)[ \t\r]*$")
+_PORT_VALUE_RE = re.compile(r"\d+")
+
+_Fields = tuple[str | None, str | None, str | None]
+"""Raw ``host``, ``port`` and ``project`` values; ``None`` when absent."""
+
+
+def _read_gerrit_section(text: str) -> _Fields | None:
+    """Read the fields as git-review does, through ``configparser``.
+
+    That settles indentation, continuation lines, other sections and
+    ``[DEFAULT]`` inheritance (an empty ``[gerrit]`` value included)
+    exactly as git-review sees them. Returns ``None`` when the text has
+    no ``[gerrit]`` section or ``configparser`` rejects it; git-review
+    cannot read such a file either, so the caller falls back to the
+    lenient scan.
+    """
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        log.debug(".gitreview: not readable as INI (%s); scanning lines", exc)
+        return None
+    if not parser.has_section("gerrit"):
+        return None
+    section = parser["gerrit"]
+
+    def first_line(key: str) -> str | None:
+        # A continuation makes a multi-line value; a field is one line.
+        value = section.get(key)
+        return None if value is None else value.strip().split("\n", 1)[0]
+
+    return first_line("host"), first_line("port"), first_line("project")
+
+
+def _scan_fields(text: str) -> _Fields:
+    """Find the fields by line pattern anywhere in *text*."""
+    matches = (
+        _HOST_RE.search(text),
+        _PORT_RE.search(text),
+        _PROJECT_RE.search(text),
+    )
+    host, port, project = (m.group(1) if m else None for m in matches)
+    return host, port, project
 
 
 @dataclass(frozen=True)
@@ -144,10 +191,14 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
 
     This parser is intentionally lenient:
 
-    * Keys are matched case-insensitively.
-    * Optional whitespace around ``=`` is tolerated.
-    * The ``[gerrit]`` section header itself is **not** required —
-      the parser matches the key lines directly.
+    * A file with a ``[gerrit]`` section is read with ``configparser``,
+      as git-review reads it: keys are case-insensitive and may be
+      indented, continuation lines and other sections are ignored, and
+      ``[DEFAULT]`` supplies any field ``[gerrit]`` does not set.
+    * The ``[gerrit]`` header itself is **not** required. A file without
+      one, or one ``configparser`` rejects, is scanned for ``host=``,
+      ``port=`` and ``project=`` lines anywhere, with optional
+      whitespace around ``=``.
 
     Args:
         text: Raw text content of a ``.gitreview`` file.
@@ -156,23 +207,24 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
         A :class:`GitReviewInfo` if at least ``host`` is present and
         non-empty, otherwise ``None``.
     """
-    host_match = _HOST_RE.search(text)
-    if not host_match:
+    fields = _read_gerrit_section(text)
+    host, port_text, project_text = (
+        fields if fields is not None else _scan_fields(text)
+    )
+    if host is None:
         log.debug(".gitreview: no host= line found")
         return None
 
-    host = host_match.group(1).strip()
+    host = host.strip()
     if not host:
         log.debug(".gitreview: host= line is empty")
         return None
 
-    port_match = _PORT_RE.search(text)
-    port = int(port_match.group(1)) if port_match else DEFAULT_GERRIT_PORT
+    port_text = (port_text or "").strip()
+    port_given = _PORT_VALUE_RE.fullmatch(port_text) is not None
+    port = int(port_text) if port_given else DEFAULT_GERRIT_PORT
 
-    project = ""
-    project_match = _PROJECT_RE.search(text)
-    if project_match:
-        project = project_match.group(1).strip().removesuffix(".git")
+    project = (project_text or "").strip().removesuffix(".git")
 
     base_path = derive_base_path(host)
 
@@ -181,7 +233,7 @@ def parse_gitreview(text: str) -> GitReviewInfo | None:
         port=port,
         project=project,
         base_path=base_path,
-        port_given=port_match is not None,
+        port_given=port_given,
     )
     log.debug(
         "Parsed .gitreview: host=%s, port=%d, project=%s, base_path=%s",

@@ -75,6 +75,19 @@ NON_DEFAULT_PORT = (
     "[gerrit]\nhost=gerrit.acme.org\nport=29419\nproject=acme/widgets.git\n"
 )
 
+# The form LF automation wrote into ONAP repositories in 2020, as found in
+# onap/cps: a leading blank line and every line indented by eight spaces.
+# git-review reads it, since configparser ignores leading whitespace.
+INDENTED_GITREVIEW = (
+    "\n"
+    "        [gerrit]\n"
+    "        host=gerrit.onap.org\n"
+    "        port=29418\n"
+    "        project=cps\n"
+    "        defaultbranch=master\n"
+    "        "
+)
+
 
 # -----------------------------------------------------------------------
 # GitReviewInfo data model
@@ -223,6 +236,15 @@ class TestParseGitreview:
         assert info.port == 29419
         assert info.port_given is True
 
+    def test_unicode_decimal_port(self) -> None:
+        # int() accepts any Unicode decimal digits, as the \d in the port
+        # pattern does; Arabic-Indic "٢٩٤١٩" is 29419.
+        text = "[gerrit]\nhost=h.example.org\nport=\u0662\u0669\u0664\u0661\u0669\n"
+        info = parse_gitreview(text)
+        assert info is not None
+        assert info.port == 29419
+        assert info.port_given is True
+
     def test_empty_string(self) -> None:
         assert parse_gitreview("") is None
 
@@ -253,6 +275,181 @@ class TestParseGitreview:
         assert info is not None
         assert info.host == "gerrit.example.org"
 
+    def test_space_indented_keys(self) -> None:
+        info = parse_gitreview(INDENTED_GITREVIEW)
+        assert info is not None
+        assert info.host == "gerrit.onap.org"
+        assert info.port == 29418
+        assert info.port_given is True
+        assert info.project == "cps"
+
+    def test_tab_indented_keys(self) -> None:
+        text = (
+            "[gerrit]\n\thost=gerrit.example.org\n\tport=29419\n\tproject=a/b\n"
+        )
+        info = parse_gitreview(text)
+        assert info is not None
+        assert info.host == "gerrit.example.org"
+        assert info.port == 29419
+        assert info.project == "a/b"
+
+    def test_key_inside_a_line_is_not_matched(self) -> None:
+        text = "[gerrit]\nnote = set host=wrong.example.org\nxhost=wrong\n"
+        assert parse_gitreview(text) is None
+
+    def test_headerless_file_is_searched_whole(self) -> None:
+        info = parse_gitreview("host=h.example.org\nport=29419\nproject=p\n")
+        assert info is not None
+        assert (info.host, info.port, info.project) == (
+            "h.example.org",
+            29419,
+            "p",
+        )
+
+    def test_file_configparser_rejects_is_searched_whole(self) -> None:
+        # A duplicate section makes configparser raise, so git-review
+        # cannot read this file at all; the lenient scan still serves it.
+        text = "[gerrit]\nhost=a.example.org\n[gerrit]\nhost=b.example.org\n"
+        info = parse_gitreview(text)
+        assert info is not None
+        assert info.host == "a.example.org"
+
+    @pytest.mark.parametrize("key", ["host", "port", "project"])
+    def test_continuation_line_is_not_a_key(self, key: str) -> None:
+        # configparser folds a line indented deeper than the option
+        # above it into that option's value; git-review never sees it
+        # as a key, so neither may this parser.
+        value = {"host": "wrong.example.org", "port": "1", "project": "wrong"}
+        text = (
+            "[gerrit]\n"
+            "host=right.example.org\n"
+            "port=29419\n"
+            "project=right\n"
+            "note = explanation\n"
+            f"    {key}={value[key]}\n"
+        )
+        info = parse_gitreview(text)
+        assert info is not None
+        assert (info.host, info.port, info.project) == (
+            "right.example.org",
+            29419,
+            "right",
+        )
+
+    @pytest.mark.parametrize(
+        "gap",
+        ["\n", "# comment\n", "; comment\n"],
+        ids=["blank", "hash", "semi"],
+    )
+    def test_continuation_survives_blank_and_comment_lines(
+        self, gap: str
+    ) -> None:
+        text = f"[gerrit]\nnote = x\n{gap}    host=wrong.example.org\n"
+        assert parse_gitreview(text) is None
+
+
+# Layouts on which parse_gitreview must agree with configparser, the
+# reader git-review uses. Each is a valid .gitreview a repository could
+# hold; the parser is lenient beyond this, but never contrary to it.
+CONFIGPARSER_LAYOUTS = [
+    pytest.param(TYPICAL_GITREVIEW, id="flat"),
+    pytest.param(INDENTED_GITREVIEW, id="all-indented"),
+    pytest.param(
+        "[gerrit]\n\thost=h.example.org\n\tport=29419\n\tproject=p\n",
+        id="tab-indented",
+    ),
+    pytest.param(
+        "[gerrit]\n    host=h.example.org\n",
+        id="indented-under-flat-header",
+    ),
+    pytest.param(
+        "[gerrit]\n    host=h.example.org\nport=29419\n",
+        id="dedent-after-indent",
+    ),
+    pytest.param(
+        "[gerrit]\nnote = x\n    host=wrong.example.org\n", id="continuation"
+    ),
+    pytest.param(
+        "[gerrit]\nnote = x\n    host=wrong.example.org\nhost=h.example.org\n",
+        id="continuation-then-key",
+    ),
+    pytest.param(
+        "[gerrit]\nhost=h.example.org\n    port=1\n", id="continuation-of-host"
+    ),
+    pytest.param(
+        "[gerrit]\n  note = x\n    port=1\n  host=h.example.org\n",
+        id="deeper-option-ends-run",
+    ),
+    pytest.param(
+        "[other]\n    host=wrong.example.org\n    port=1\n    project=wrong\n"
+        "[gerrit]\nhost=right.example.org\nport=29419\nproject=right\n",
+        id="indented-keys-in-other-section",
+    ),
+    pytest.param(
+        "[other]\nhost=wrong.example.org\nport=1\nproject=wrong\n"
+        "[gerrit]\nhost=right.example.org\nport=29419\nproject=right\n",
+        id="flat-keys-in-earlier-section",
+    ),
+    pytest.param(
+        "[gerrit]\nhost=right.example.org\n[other]\nport=1\nproject=wrong\n",
+        id="flat-keys-in-later-section",
+    ),
+    pytest.param(
+        "[DEFAULT]\nhost=default.example.org\nport=29419\n[gerrit]\nproject=p\n",
+        id="default-section-fills-gerrit",
+    ),
+    pytest.param(
+        "[DEFAULT]\nhost=default.example.org\nport=1\n"
+        "[gerrit]\nhost=right.example.org\nport=29419\n",
+        id="gerrit-overrides-earlier-default",
+    ),
+    pytest.param(
+        "[gerrit]\nhost=right.example.org\n[DEFAULT]\nhost=default.example.org\n",
+        id="gerrit-overrides-later-default",
+    ),
+    pytest.param(
+        "[DEFAULT]\nhost=default.example.org\n[gerrit]\nhost=\n",
+        id="empty-host-overrides-default",
+    ),
+    pytest.param(
+        "[DEFAULT]\nport=1\n[gerrit]\nhost=h.example.org\nport=\n",
+        id="empty-port-overrides-default",
+    ),
+    pytest.param(
+        "[DEFAULT]\nproject=wrong\n[gerrit]\nhost=h.example.org\nproject=\n",
+        id="empty-project-overrides-default",
+    ),
+]
+
+
+def _first_line(value: str) -> str:
+    """Return the first line of a configparser value, stripped.
+
+    configparser joins continuation lines into the value; a .gitreview
+    field is single-line, so only the first line is comparable.
+    """
+    return value.strip().split("\n", 1)[0].strip()
+
+
+@pytest.mark.parametrize("text", CONFIGPARSER_LAYOUTS)
+def test_agrees_with_configparser(text: str) -> None:
+    import configparser
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(text)
+    section = parser["gerrit"]
+    info = parse_gitreview(text)
+    expected_host = _first_line(section.get("host", ""))
+    if not expected_host:
+        assert info is None
+        return
+    assert info is not None
+    assert info.host == expected_host
+    port = _first_line(section.get("port", "")) or str(DEFAULT_GERRIT_PORT)
+    assert info.port == int(port)
+    project = _first_line(section.get("project", "")).removesuffix(".git")
+    assert info.project == project
+
 
 # -----------------------------------------------------------------------
 # read_local_gitreview — local file reader
@@ -274,6 +471,14 @@ class TestReadLocalGitreview:
         p = tmp_path / ".gitreview"
         p.write_text("garbage\n", encoding="utf-8")
         assert read_local_gitreview(p) is None
+
+    def test_reads_indented_file(self, tmp_path: Path) -> None:
+        p = tmp_path / ".gitreview"
+        p.write_text(INDENTED_GITREVIEW, encoding="utf-8")
+        info = read_local_gitreview(p)
+        assert info is not None
+        assert info.host == "gerrit.onap.org"
+        assert info.project == "cps"
 
     def test_returns_none_for_unreadable(self, tmp_path: Path) -> None:
         p = tmp_path / ".gitreview"
