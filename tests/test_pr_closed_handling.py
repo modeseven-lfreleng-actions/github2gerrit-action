@@ -158,6 +158,41 @@ class TestCloseHandlerDiagnostics:
         assert "still open" not in warnings[0]
         assert "'multicloud/openstack'" in warnings[0]
 
+    @pytest.mark.xfail(
+        strict=True, reason="the URL fallback discards the exception"
+    )
+    def test_an_unbuildable_change_url_logs_the_cause(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The change was abandoned; only its URL is missing. The
+        # fallback still reports the abandon by number, and must say
+        # why the URL could not be built, or a misconfigured server or
+        # project leaves no trace.
+        with (
+            patch(
+                "github2gerrit.cli.abandon_gerrit_change_for_closed_pr",
+                return_value="12345",
+            ),
+            patch(
+                "github2gerrit.gerrit_urls.create_gerrit_url_builder",
+                side_effect=ValueError("no base path for gerrit.onap.org"),
+            ),
+            caplog.at_level(logging.DEBUG, logger="github2gerrit"),
+        ):
+            _abandon_change_for_closed_pr(
+                _inputs(project="multicloud/openstack"),
+                _ctx("pull_request_target", "closed"),
+            )
+        abandoned = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("Successfully abandoned")
+        ]
+        assert len(abandoned) == 1
+        assert "12345" in abandoned[0]
+        assert "#19" in abandoned[0]
+        assert "no base path for gerrit.onap.org" in abandoned[0]
+
     def test_missing_repository_is_a_warning_not_a_silent_skip(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
