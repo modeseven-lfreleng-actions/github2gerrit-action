@@ -3182,11 +3182,13 @@ def _log_abandoned_change_url(
             gerrit_change_url,
             gh.pr_number,
         )
-    except Exception:
+    except Exception as exc:
         log.debug(
-            "Successfully abandoned Gerrit change %s for pull request #%s",
+            "Successfully abandoned Gerrit change %s for pull request #%s "
+            "(could not build its URL: %s)",
             change_number,
             gh.pr_number,
+            exc,
         )
 
 

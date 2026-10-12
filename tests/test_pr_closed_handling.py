@@ -158,9 +158,6 @@ class TestCloseHandlerDiagnostics:
         assert "still open" not in warnings[0]
         assert "'multicloud/openstack'" in warnings[0]
 
-    @pytest.mark.xfail(
-        strict=True, reason="the URL fallback discards the exception"
-    )
     def test_an_unbuildable_change_url_logs_the_cause(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
