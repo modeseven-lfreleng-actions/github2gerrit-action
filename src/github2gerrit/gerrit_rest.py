@@ -53,12 +53,8 @@ log = logging.getLogger("github2gerrit.gerrit_rest")
 
 # Optional pygerrit2 import
 try:  # pragma: no cover - exercised indirectly by tests that monkeypatch
-    from pygerrit2 import (
-        GerritRestAPI as _PygerritRestApi,  # type: ignore[import-not-found, unused-ignore]
-    )
-    from pygerrit2 import (
-        HTTPBasicAuth as _PygerritHttpAuth,  # type: ignore[import-not-found, unused-ignore]
-    )
+    from pygerrit2 import GerritRestAPI as _PygerritRestApi
+    from pygerrit2 import HTTPBasicAuth as _PygerritHttpAuth
 except Exception:  # pragma: no cover - absence path
     _PygerritRestApi = None
     _PygerritHttpAuth = None
