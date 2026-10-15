@@ -9,7 +9,7 @@ paths:
   .github/workflows/openssf-scorecard.yaml:
     ignore:
       # yamllint disable-line rule:line-length
-      - 'reusable workflow call "lfit/releng-reusable-workflows/\.github/workflows/reuse-openssf-scorecard\.yaml@[0-9a-f]{40}" has no explicit cache access limit'
+      - 'reusable workflow call "lfreleng-actions/security-workflows/\.github/workflows/openssf-scorecard\.yaml@[0-9a-f]{40}" has no explicit cache access limit'
   .github/workflows/testing.yaml:
     ignore:
       - 'input "invalid_input" is not defined in action .+'
