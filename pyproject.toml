@@ -192,9 +192,10 @@ no_implicit_optional = true
 show_error_codes = true
 pretty = true
 # exclude skips directory discovery only; files named explicitly on the
-# command line are still checked. The pre-commit hook passes filenames,
-# so anything listed here would be checked there regardless -- keep this
-# to paths that hold no first-party Python.
+# command line are still checked. The pre-commit hook passes the src,
+# scripts and tests directories and sitecustomize.py, so these patterns
+# filter discovery beneath those directories -- keep this to paths that
+# hold no first-party Python.
 exclude = ["build/", "dist/", "docs/"]
 
 # The shipped package is held to full strict-mode annotation rules.
