@@ -6,6 +6,7 @@ ci:
   autofix_prs: false
   skip:
     - pytest
+    - mypy
     - gha-workflow-linter
     - aislop
     - eslint
@@ -94,29 +95,20 @@ repos:
       - id: ruff-format
         files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
 
+  # mypy runs from the uv project environment, so uv.lock is the only
+  # record of its version and of every stub it reads. pre-commit.ci runs
+  # offline and cannot build that environment, hence ci.skip; the
+  # type-check workflow runs this hook instead.
   - repo: local
     hooks:
-      - id: sync-mypy-pins
-        name: sync mypy hook pins with uv.lock
-        entry: python3 scripts/sync_mypy_pins.py
-        language: system
-        files: ^(\.pre-commit-config\.yaml|uv\.lock)$
-        pass_filenames: false
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: 2834ec6639549dd6796205c8f011dedcd587288b  # frozen: v2.4.0
-    hooks:
       - id: mypy
-        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$
-        additional_dependencies:
-          - mypy==2.4.0
-          - click==8.5.0
-          - pytest==9.1.1
-          - responses==0.26.3
-          - rich==15.0.0
-          - typer==0.27.2
-          - types-PyYAML==6.0.12.20260906
-          - types-requests==2.33.0.20260906
+        name: mypy
+        entry: uv run --locked mypy
+        args: [src, scripts, tests, sitecustomize.py]
+        language: system
+        files: ^(src|scripts|tests)/.+\.py$|^sitecustomize\.py$|^pyproject\.toml$|^uv\.lock$
+        pass_filenames: false
+        require_serial: true
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1  # frozen: v1.0.8

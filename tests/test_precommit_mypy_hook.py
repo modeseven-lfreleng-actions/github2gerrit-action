@@ -87,9 +87,6 @@ def mypy_hook(config) -> tuple[str, Hook]:
     return matches[0]
 
 
-@pytest.mark.xfail(
-    strict=True, reason="mypy still runs from the mirrors-mypy hook"
-)
 class TestPrecommitMypyHook:
     """Check that mypy runs from the project's locked environment."""
 
