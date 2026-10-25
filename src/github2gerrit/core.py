@@ -5220,13 +5220,12 @@ class Orchestrator:
             "-t",
             topic,
         ]
+        base_args = list(args)
         log.debug("Building git review command with topic: %s", topic)
         collected_change_ids = self._collect_push_change_ids(prepared)
 
         try:
-            args.extend(self._reviewer_args(reviewers, branch))
-            # Don't pass branch as positional argument to git-review
-            # Instead, infer the target branch from the git configuration
+            args.extend(self._push_target_args(reviewers, branch))
 
             if env_bool("CI_TESTING", False):
                 log.debug(
@@ -5266,7 +5265,7 @@ class Orchestrator:
             )
             if account_not_found_emails and (
                 self._retry_push_with_normalized_emails(
-                    args, reviewers, branch, env, account_not_found_emails
+                    base_args, reviewers, branch, env, account_not_found_emails
                 )
             ):
                 # On success, emit mapping comment before return
@@ -5321,27 +5320,41 @@ class Orchestrator:
         return collected_change_ids
 
     @staticmethod
-    def _reviewer_args(reviewers: str, branch: str) -> list[str]:
-        """Build --reviewer arguments from a comma-separated reviewer list."""
+    def _push_target_args(reviewers: str, branch: str) -> list[str]:
+        """Build the trailing git-review arguments: branch, then reviewers.
+
+        Order matters. git-review declares ``branch`` as a trailing positional
+        and ``--reviewers`` with ``nargs='+'``, so reviewers emitted before the
+        branch swallow it. The change then lands on the ``.gitreview``
+        ``defaultbranch`` -- always ``master`` on Gerrit-mirrored stable
+        branches -- and the branch name leaks in as a reviewer. Repeating the
+        flag is no good either: argparse keeps only the last occurrence.
+        """
+        args: list[str] = []
+        if branch:
+            args.append(branch)
         revs = [
             r.strip()
             for r in (reviewers or "").split(",")
             if r.strip() and "@" in r and r.strip() != branch
         ]
-        args: list[str] = []
-        for r in revs:
-            args.extend(["--reviewer", r])
+        if revs:
+            args.append("--reviewers")
+            args.extend(revs)
         return args
 
     def _retry_push_with_normalized_emails(
         self,
-        args: list[str],
+        base_args: list[str],
         reviewers: str,
         branch: str,
         env: dict[str, str],
         account_not_found_emails: list[str],
     ) -> bool:
         """Retry the push using case-normalized reviewer emails.
+
+        ``base_args`` is the git-review command without its branch/reviewer
+        tail, so the retry rebuilds that tail rather than unpicking it.
 
         Returns True only when a retry was attempted and succeeded.
         """
@@ -5353,24 +5366,10 @@ class Orchestrator:
 
         log.debug("Retrying with case-normalized email addresses...")
         try:
-            # Rebuild args with normalized reviewers
-            retry_args = args[:-1]  # Remove branch (last arg)
-            # Clear previous reviewer args and add normalized ones
-            retry_args = [arg for arg in retry_args if arg != "--reviewer"]
             retry_args = [
-                retry_args[i]
-                for i in range(len(retry_args))
-                if i == 0 or retry_args[i - 1] != "--reviewer"
+                *base_args,
+                *self._push_target_args(normalized_reviewers, branch),
             ]
-
-            norm_revs = [
-                r.strip()
-                for r in (normalized_reviewers or "").split(",")
-                if r.strip() and "@" in r and r.strip() != branch
-            ]
-            for r in norm_revs:
-                retry_args.extend(["--reviewer", r])
-            retry_args.append(branch)
 
             log.debug(
                 "Retrying git review command with normalized emails: %s",
