@@ -605,6 +605,7 @@ def close_pr_with_status(
     dry_run: bool = False,
     progress_tracker: Any = None,
     close_merged_prs: bool = True,
+    change_branch: str = "",
 ) -> bool:
     """
     Close a GitHub PR based on Gerrit change status.
@@ -620,6 +621,9 @@ def close_pr_with_status(
         progress_tracker: Optional progress tracker for display management
         close_merged_prs: If True, close PRs; if False, only comment on
             abandoned
+        change_branch: Branch of the Gerrit change, when known.  A change
+            on another branch than the PR's base is a cherry-pick or a
+            misroute carrying the PR's trailer, and leaves the PR open.
 
     Returns:
         True if PR was closed (or would be closed in dry-run), False otherwise
@@ -640,6 +644,17 @@ def close_pr_with_status(
 
         pr_obj = _fetch_open_pr_for_status(repo_obj, owner, repo, pr_number)
         if pr_obj is None:
+            return False
+
+        base_ref = _pr_base_ref(pr_obj)
+        if change_branch and base_ref and change_branch != base_ref:
+            log.info(
+                "Leaving PR #%d open: the Gerrit change targets %s, not "
+                "the pull request's base branch %s",
+                pr_number,
+                change_branch,
+                base_ref,
+            )
             return False
 
         pr_info = extract_pr_info_for_display(pr_obj, owner, repo, pr_number)
@@ -697,6 +712,7 @@ def close_github_pr_for_merged_gerrit_change(
     dry_run: bool = False,
     progress_tracker: Any = None,
     close_merged_prs: bool = True,
+    change_branch: str = "",
 ) -> bool:
     """
     Close a GitHub PR when its corresponding Gerrit change has been
@@ -714,6 +730,8 @@ def close_github_pr_for_merged_gerrit_change(
         progress_tracker: Optional progress tracker for display management
         close_merged_prs: If True, close PRs; if False, only comment on
             abandoned
+        change_branch: Branch the commit was merged to, when known (see
+            :func:`close_pr_with_status`)
 
     Returns:
         True if PR was closed (or would be closed in dry-run), False otherwise
@@ -767,6 +785,7 @@ def close_github_pr_for_merged_gerrit_change(
         dry_run=dry_run,
         progress_tracker=progress_tracker,
         close_merged_prs=close_merged_prs,
+        change_branch=change_branch,
     )
 
 
@@ -939,6 +958,7 @@ def process_recent_commits_for_pr_closure(
     dry_run: bool = False,
     progress_tracker: Any = None,
     close_merged_prs: bool = True,
+    change_branch: str = "",
 ) -> int:
     """
     Process a list of recent commits and close any associated GitHub PRs.
@@ -951,6 +971,8 @@ def process_recent_commits_for_pr_closure(
         progress_tracker: Optional progress tracker for display management
         close_merged_prs: If True, close PRs; if False, only comment on
             abandoned
+        change_branch: Branch the commits were pushed to, when known (see
+            :func:`close_pr_with_status`)
 
     Returns:
         Number of PRs closed (or that would be closed in dry-run)
@@ -970,6 +992,7 @@ def process_recent_commits_for_pr_closure(
             dry_run=dry_run,
             progress_tracker=progress_tracker,
             close_merged_prs=close_merged_prs,
+            change_branch=change_branch,
         ):
             closed_count += 1
 
@@ -1008,7 +1031,7 @@ def cleanup_abandoned_prs_single(
     safe_console_print("⛔️ Checking for abandoned Gerrit changes")
     log.debug("Checking Gerrit change: %s", gerrit_change_url)
 
-    status = check_gerrit_change_status(gerrit_change_url)
+    status, branch = check_gerrit_change_state(gerrit_change_url)
 
     if status != "ABANDONED":
         log.debug(
@@ -1035,6 +1058,7 @@ def cleanup_abandoned_prs_single(
         dry_run=dry_run,
         progress_tracker=progress_tracker,
         close_merged_prs=close_merged_prs,
+        change_branch=branch,
     )
 
 

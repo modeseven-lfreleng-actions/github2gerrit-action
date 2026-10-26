@@ -24,9 +24,6 @@ from github2gerrit.models import GitHubContext
 PR_URL = "https://github.com/opendaylight/mdsal/pull/31"
 CHANGE_URL = "https://gerrit.example.org/c/mdsal/+/126368"
 MODULE = "github2gerrit.gerrit_pr_closer"
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="closers ignore the change's branch (#502)"
-)
 
 
 @pytest.fixture
@@ -76,7 +73,6 @@ class TestPushEvent:
             f"{MODULE}.extract_pr_url_from_commit", lambda _sha: PR_URL
         )
 
-    @_PENDING
     def test_backport_merged_on_another_branch_leaves_the_pr_open(
         self, tmp_path: Path, close_pr: MagicMock
     ) -> None:
@@ -106,7 +102,6 @@ class TestGerritDispatch:
             lambda _url: "MERGED",
         )
 
-    @_PENDING
     def test_change_on_another_branch_leaves_the_pr_open(
         self,
         tmp_path: Path,
@@ -140,7 +135,6 @@ class TestGerritDispatch:
         close_pr.assert_called_once()
 
 
-@_PENDING
 def test_single_abandon_on_another_branch_leaves_the_pr_open(
     close_pr: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2984,7 +2984,8 @@ def _process_close_gerrit_change(
         log.debug("Auto-discovered organization from PR URL: %s", owner)
         os.environ["ORGANIZATION"] = owner
 
-    # Use consolidated helper function to close the PR
+    # Use consolidated helper function to close the PR; GERRIT_BRANCH
+    # names the change's branch in a Gerrit-side dispatch
     try:
         close_pr_with_status(
             pr_url=pr_url,
@@ -2993,12 +2994,21 @@ def _process_close_gerrit_change(
             dry_run=data.dry_run,
             progress_tracker=None,
             close_merged_prs=close_merged_prs,
+            change_branch=os.getenv("GERRIT_BRANCH", "").strip(),
         )
     # log.exception records the caught error and traceback; keep
     # processing so one PR failure cannot abort the remaining closures.
     # aislop-ignore-next-line silent-recovery
     except Exception:
         log.exception("Failed to close GitHub PR #%d", pr_number)
+
+
+def _branch_of_ref(ref: Any) -> str:
+    """Return the branch a ``refs/heads/`` ref names, or empty."""
+    prefix = "refs/heads/"
+    if isinstance(ref, str) and ref.startswith(prefix):
+        return ref[len(prefix) :]
+    return ""
 
 
 def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
@@ -3036,12 +3046,15 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
         log.debug("Fetching commits from push event for GitHub PR trailers")
 
         commit_shas = []
+        pushed_branch = ""
 
         # Try to read commits from the GitHub push event payload
         if gh.event_path and gh.event_path.exists():
             try:
                 with gh.event_path.open() as f:
                     event_payload = json.load(f)
+
+                pushed_branch = _branch_of_ref(event_payload.get("ref"))
 
                 if "commits" in event_payload:
                     commit_shas = [
@@ -3103,6 +3116,7 @@ def _process_close_merged_prs(data: Inputs, gh: GitHubContext) -> None:
             dry_run=dry_run,
             progress_tracker=progress_tracker,
             close_merged_prs=close_merged_prs,
+            change_branch=pushed_branch,
         )
 
         progress_tracker.stop()
