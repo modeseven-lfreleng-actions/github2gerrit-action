@@ -89,6 +89,22 @@ def branch_term(branch: str) -> str:
     return f'branch:"{_gerrit_quote(branch)}"'
 
 
+def target_branch(base_ref: str, pull_request: Any = None) -> str:
+    """Return the branch a pull request's change goes to, or empty.
+
+    ``GERRIT_BRANCH`` overrides, as it does for the push; otherwise the
+    context's *base_ref*, then the base of *pull_request* itself.
+    """
+    override = os.getenv("GERRIT_BRANCH", "").strip()
+    if override:
+        return override
+    base = getattr(pull_request, "base", None)
+    for ref in (base_ref, getattr(base, "ref", "")):
+        if isinstance(ref, str) and ref.strip():
+            return ref.strip()
+    return ""
+
+
 @dataclass
 class GerritChange:
     """Represents a Gerrit change from query results."""

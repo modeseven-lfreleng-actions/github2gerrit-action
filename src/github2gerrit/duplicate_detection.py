@@ -23,6 +23,8 @@ from datetime import timedelta
 from typing import Any
 from typing import NamedTuple
 
+from .gerrit_query import branch_term
+from .gerrit_query import target_branch
 from .gerrit_urls import create_gerrit_url_builder
 from .github_api import GhPullRequest
 from .github_api import GhRepository
@@ -404,7 +406,7 @@ class DuplicateDetector:
 
         # Build query: limit to recent changes, exclude abandoned; prefer open
         query_path, dup_filter, cutoff_date = self._build_duplicate_query_path(
-            gerrit_project
+            gerrit_project, target_branch(gh.base_ref, target_pr)
         )
 
         log.debug(
@@ -459,7 +461,7 @@ class DuplicateDetector:
         )
 
     def _build_duplicate_query_path(
-        self, gerrit_project: str
+        self, gerrit_project: str, branch: str = ""
     ) -> tuple[str, str, str]:
         """Build the Gerrit REST query path for duplicate detection.
 
@@ -467,9 +469,8 @@ class DuplicateDetector:
         latter two are reused for diagnostic logging.
         """
         cutoff_date = self._cutoff_date.date().isoformat()
-        q_parts = []
-        if gerrit_project:
-            q_parts.append(f"project:{gerrit_project}")
+        q_parts = [f"project:{gerrit_project}"] if gerrit_project else []
+        q_parts += [branch_term(branch)] if branch else []
         # Build status clause from DUPLICATE_TYPES filter (default: open)
         dup_filter = (self.duplicates_filter or "open").strip().lower()
         selected = [s.strip() for s in dup_filter.split(",") if s.strip()]

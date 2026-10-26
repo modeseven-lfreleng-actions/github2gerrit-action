@@ -23,13 +23,11 @@ import responses
 
 from github2gerrit.duplicate_detection import DuplicateChangeError
 from github2gerrit.duplicate_detection import DuplicateDetector
+from github2gerrit.gerrit_query import target_branch
 from github2gerrit.models import GitHubContext
 
 
 STABLE = "stable/vanadium"
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="duplicate query ignores the branch (#502)"
-)
 
 
 def _ctx(base_ref: str = STABLE) -> GitHubContext:
@@ -104,7 +102,6 @@ def _no_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GERRIT_BRANCH", raising=False)
 
 
-@_PENDING
 def test_same_update_on_another_branch_is_not_a_duplicate() -> None:
     _check(
         _ctx(STABLE),
@@ -120,7 +117,6 @@ def test_same_update_on_the_same_branch_is_a_duplicate() -> None:
         )
 
 
-@_PENDING
 def test_gerrit_branch_override_picks_the_compared_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,3 +125,25 @@ def test_gerrit_branch_override_picks_the_compared_branch(
         _ctx(STABLE),
         [_open_change(127193, STABLE, "Bump foo from 1.2.0 to 1.2.1")],
     )
+
+
+class TestTargetBranch:
+    def test_context_base_ref_comes_first(self) -> None:
+        pr = Mock()
+        pr.base.ref = "master"
+        assert target_branch(STABLE, pr) == STABLE
+
+    def test_falls_back_to_the_pull_requests_base(self) -> None:
+        pr = Mock()
+        pr.base.ref = "master"
+        assert target_branch("", pr) == "master"
+
+    def test_unknown_without_either(self) -> None:
+        assert target_branch("", Mock(base=Mock(ref=None))) == ""
+        assert target_branch("") == ""
+
+    def test_gerrit_branch_overrides_both(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GERRIT_BRANCH", " release-1.2 ")
+        assert target_branch(STABLE) == "release-1.2"
