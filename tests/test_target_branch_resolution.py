@@ -30,9 +30,6 @@ STABLE = "stable/vanadium"
 GERRIT = GerritInfo(
     host="gerrit.example.org", port=29418, project="example/project"
 )
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="target branch ignores the PR context (#502)"
-)
 
 
 class _Stop(Exception):
@@ -75,8 +72,27 @@ def _dispatched_bulk_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("G2G_TMP_BRANCH", "")
 
 
+class TestResolver:
+    def test_uses_the_pull_request_base_ref(self, tmp_path: Path) -> None:
+        orch = Orchestrator(workspace=tmp_path)
+        assert orch._resolve_target_branch(_ctx()) == STABLE
+
+    def test_gerrit_branch_still_overrides_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GERRIT_BRANCH", "release-1.2")
+        orch = Orchestrator(workspace=tmp_path)
+        assert orch._resolve_target_branch(_ctx()) == "release-1.2"
+
+    def test_falls_back_to_github_base_ref(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GITHUB_BASE_REF", "feature/x")
+        orch = Orchestrator(workspace=tmp_path)
+        assert orch._resolve_target_branch(_ctx(base_ref="")) == "feature/x"
+
+
 class TestCallSites:
-    @_PENDING
     def test_squash_is_based_on_the_pull_request_branch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -97,7 +113,6 @@ class TestCallSites:
         assert ["git", "fetch", "origin", STABLE] in calls
         assert ["git", "rev-parse", f"origin/{STABLE}"] in calls
 
-    @_PENDING
     def test_commit_range_ends_at_the_pull_request_branch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -111,7 +126,6 @@ class TestCallSites:
             calls
         )
 
-    @_PENDING
     def test_push_and_backref_target_the_pull_request_branch(
         self, tmp_path: Path
     ) -> None:
@@ -149,7 +163,6 @@ class TestCallSites:
         assert push.call_args.kwargs["branch"] == STABLE
         assert backref.call_args.kwargs["branch"] == STABLE
 
-    @_PENDING
     def test_supersession_sweep_stays_on_the_pull_request_branch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -172,7 +185,6 @@ class TestCallSites:
         )
         assert sweep.call_args.kwargs["target_branch"] == STABLE
 
-    @_PENDING
     @pytest.mark.parametrize(
         ("env", "base_ref", "expected"),
         [

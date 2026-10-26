@@ -1240,7 +1240,7 @@ class Orchestrator:
             open_changes = query_open_changes_by_project(
                 dep_client,
                 gerrit.project,
-                branch=gh.base_ref,
+                branch=self._resolve_target_branch(gh),
                 max_results=200,
                 github_repository=gh.repository,
             )
@@ -2068,7 +2068,7 @@ class Orchestrator:
             List of LocalCommit objects representing local commits to be
             submitted
         """
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
         base_ref = f"origin/{branch}"
 
         try:
@@ -2603,10 +2603,11 @@ class Orchestrator:
         is_edit_operation = operation_mode == "edit"
         # Store context for downstream push/comment emission (Phase 2)
         self._gh_context_for_push = gh
+        branch = self._resolve_target_branch(gh)
         self._push_to_gerrit(
             gerrit=gerrit,
             repo=repo_names,
-            branch=self._resolve_target_branch(),
+            branch=branch,
             reviewers=self._resolve_reviewers(inputs),
             single_commits=inputs.submit_single_commits,
             prepared=prep,
@@ -2631,7 +2632,7 @@ class Orchestrator:
         self._add_backref_comment_in_gerrit(
             gerrit=gerrit,
             repo=repo_names,
-            branch=self._resolve_target_branch(),
+            branch=branch,
             commit_shas=result.commit_shas,
             gh=gh,
         )
@@ -2884,7 +2885,7 @@ class Orchestrator:
                     current_subject=push_subject,
                     exclude_change_ids=prep.change_ids,
                     dry_run=False,
-                    target_branch=self._resolve_target_branch(),
+                    target_branch=self._resolve_target_branch(gh),
                     github_repository=gh.repository,
                 )
         except Exception as exc:
@@ -4448,7 +4449,7 @@ class Orchestrator:
     ) -> PreparedChange:
         """Cherry-pick commits one-by-one and ensure Change-Id is present."""
         log.info("Preparing single-commit submission for PR #%s", gh.pr_number)
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
         # Determine commit range: commits in HEAD not in base branch
         base_ref = f"origin/{branch}"
         # Use our SSH command for git operations that might need SSH
@@ -4589,7 +4590,7 @@ class Orchestrator:
     ) -> PreparedChange:
         """Squash PR commits into a single commit and handle Change-Id."""
         log.debug("Preparing squashed commit for PR #%s", gh.pr_number)
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
 
         # Ensure workspace is prepared (consolidated git fetch)
         self._ensure_workspace_prepared(branch)
@@ -7240,7 +7241,7 @@ class Orchestrator:
                 "Dry-run targets: Gerrit project=%s branch=%s "
                 "topic_prefix=GH-%s",
                 repo.project_gerrit,
-                self._resolve_target_branch(),
+                self._resolve_target_branch(gh),
                 repo.project_github,
             )
             if inputs.reviewers_email:
@@ -7306,7 +7307,7 @@ class Orchestrator:
         log.debug(
             "Dry-run targets: Gerrit project=%s branch=%s topic_prefix=GH-%s",
             repo.project_gerrit,
-            self._resolve_target_branch(),
+            self._resolve_target_branch(gh),
             repo.project_github,
         )
         if inputs.reviewers_email:
@@ -7354,14 +7355,25 @@ class Orchestrator:
             api_url = url_builder.api_url()
             log.warning("Gerrit REST probe failed for %s: %s", api_url, exc)
 
-    def _resolve_target_branch(self) -> str:
-        # Preference order:
-        # 1) GERRIT_BRANCH (explicit override)
-        # 2) GITHUB_BASE_REF (provided in Actions PR context)
-        # 3) origin/HEAD default (if available)
-        # 4) 'main' as a common default
-        # 5) 'master' as a legacy default
+    def _resolve_target_branch(self, gh: GitHubContext | None = None) -> str:
+        """Return the Gerrit branch the pull request targets.
+
+        Preference order:
+
+        1. ``GERRIT_BRANCH``, an explicit override.
+        2. The base ref of the pull request in *gh*.  Bulk mode processes
+           pull requests on parallel threads, where a process-wide
+           variable cannot describe each of them (as with the topic in
+           ``_resolve_push_topic``).
+        3. ``GITHUB_BASE_REF``, set by pull request events and by the
+           CLI when it recovers a pull request's refs.
+        4. ``origin/HEAD``, then ``master`` or ``main`` when fetched.
+        5. ``master`` as the legacy default.
+        """
         b = os.getenv("GERRIT_BRANCH", "").strip()
+        if b:
+            return b
+        b = (gh.base_ref or "").strip() if gh is not None else ""
         if b:
             return b
         b = os.getenv("GITHUB_BASE_REF", "").strip()
