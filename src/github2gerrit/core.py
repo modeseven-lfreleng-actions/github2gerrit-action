@@ -5387,7 +5387,7 @@ class Orchestrator:
         Order matters. git-review declares ``branch`` as a trailing positional
         and ``--reviewers`` with ``nargs='+'``, so reviewers emitted before the
         branch swallow it. The change then lands on the ``.gitreview``
-        ``defaultbranch`` -- always ``master`` on Gerrit-mirrored stable
+        ``defaultbranch`` -- often ``master`` on Gerrit-mirrored stable
         branches -- and the branch name leaks in as a reviewer. Repeating the
         flag is no good either: argparse keeps only the last occurrence.
         """

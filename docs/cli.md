@@ -214,7 +214,7 @@ forwarded setting treats blank as unset and keeps its documented default.
 | `GH_TOKEN`                       | unset                                       | Fallback source for `GITHUB_TOKEN` when the latter is unset                       |
 | `GERRIT_CHANGE_URL`              | unset                                       | Gerrit change URL for Gerrit-event dispatch mode (close the source PR)            |
 | `GERRIT_EVENT_TYPE`              | unset                                       | Gerrit event type for dispatch mode (`change-merged` or `change-abandoned`)       |
-| `GERRIT_BRANCH`                  | unset                                       | Gerrit branch for dispatch mode change queries                                    |
+| `GERRIT_BRANCH`                  | unset                                       | Target branch override; in dispatch mode, the dispatched change's branch          |
 | `G2G_DRYRUN_DISABLE_NETWORK`     | `false`                                     | Skip DNS/network checks in dry-run; set automatically by `G2G_NO_GERRIT`          |
 | `G2G_ANON_SUPERSEDE_FALLBACK`    | `true`                                      | Allow anonymous supersession queries when Gerrit credentials are unavailable      |
 | `VERIFY_DIGEST_STRICT`           | `true`                                      | Fail (rather than warn) on reconciliation digest mismatch after push              |
