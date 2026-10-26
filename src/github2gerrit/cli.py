@@ -3217,6 +3217,7 @@ def _abandon_change_for_closed_pr(data: Inputs, gh: GitHubContext) -> None:
             repository=gh.repository,
             dry_run=data.dry_run,
             progress_tracker=None,
+            base_ref=gh.base_ref,
         )
     except Exception as exc:
         log.warning(

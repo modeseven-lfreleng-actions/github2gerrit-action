@@ -1215,46 +1215,85 @@ def _abandoned_change_of_pr(pr: Any, automation_login: str = "") -> str | None:
 def _find_matching_gerrit_change(
     changes_data: list[Any],
     pr_url: str,
+    base_ref: str = "",
 ) -> dict[str, Any] | None:
-    """Return the first open change whose GitHub-PR trailer matches.
+    """Return the open change that is the pull request's own.
 
-    Scans ``changes_data`` and returns the change dict whose current
-    commit message carries a ``GitHub-PR`` trailer equal to ``pr_url``.
+    Of the changes whose current commit carries a ``GitHub-PR`` trailer
+    equal to ``pr_url``, skip those that are not the pull request's (see
+    :func:`_change_belongs_to_pr`) and prefer one on *base_ref*.
     """
-    for change_data in changes_data:
-        try:
-            current_revision = change_data.get("current_revision", "")
-            if not current_revision:
-                continue
-
-            revisions = change_data.get("revisions", {})
-            revision_data = revisions.get(current_revision, {})
-            commit_data = revision_data.get("commit", {})
-            commit_message = commit_data.get("message", "")
-
-            if not commit_message:
-                continue
-
-            trailers = parse_trailers(commit_message)
-            pr_urls = trailers.get(GITHUB_PR_TRAILER, [])
-
-            # Check if this change matches our PR
-            if pr_url in pr_urls:
-                log.info(
-                    "Found matching Gerrit change: %s",
-                    change_data.get("_number", ""),
-                )
-                return cast("dict[str, Any]", change_data)
-
-        except Exception as exc:
-            log.debug(
-                "Error checking change %s: %s",
-                change_data.get("_number", "unknown"),
-                exc,
-            )
-            continue
-
+    matches = [
+        change_data
+        for change_data in changes_data
+        if _carries_pr_trailer(change_data, pr_url)
+        and _change_belongs_to_pr(change_data, base_ref)
+    ]
+    on_base = [c for c in matches if base_ref and c.get("branch") == base_ref]
+    for change_data in on_base or matches[:1]:
+        log.info(
+            "Found matching Gerrit change: %s",
+            change_data.get("_number", ""),
+        )
+        return cast("dict[str, Any]", change_data)
     return None
+
+
+def _carries_pr_trailer(change_data: Any, pr_url: str) -> bool:
+    """Report whether the change's current commit names ``pr_url``."""
+    try:
+        current_revision = change_data.get("current_revision", "")
+        if not current_revision:
+            return False
+
+        revisions = change_data.get("revisions", {})
+        revision_data = revisions.get(current_revision, {})
+        commit_data = revision_data.get("commit", {})
+        commit_message = commit_data.get("message", "")
+
+        if not commit_message:
+            return False
+
+        trailers = parse_trailers(commit_message)
+        return pr_url in trailers.get(GITHUB_PR_TRAILER, [])
+
+    except Exception as exc:
+        log.debug(
+            "Error checking change %s: %s",
+            change_data.get("_number", "unknown"),
+            exc,
+        )
+        return False
+
+
+def _created_by_github2gerrit(change_data: dict[str, Any]) -> bool | None:
+    """Report whether GitHub2Gerrit's own account owns the change.
+
+    ``None`` when unknown: no account is configured in
+    ``GERRIT_SSH_USER_G2G``, or the server did not report the owner's
+    username.
+    """
+    account = os.getenv("GERRIT_SSH_USER_G2G", "").strip().lower()
+    owner = change_data.get("owner") or {}
+    username = str(owner.get("username") or "").strip().lower()
+    if not (account and username):
+        return None
+    return username == account
+
+
+def _change_belongs_to_pr(change_data: dict[str, Any], base_ref: str) -> bool:
+    """Report whether a change naming a pull request is that PR's own.
+
+    Gerrit cherry-picks copy the ``GitHub-PR`` trailer, so a maintainer's
+    backport names the pull request it came from. A change is the pull
+    request's when GitHub2Gerrit's account owns it; where ownership is
+    unknown, when it targets the pull request's base branch.
+    """
+    created = _created_by_github2gerrit(change_data)
+    if created is not None:
+        return created
+    branch = str(change_data.get("branch") or "")
+    return not (branch and base_ref) or branch == base_ref
 
 
 def _collect_pr_closure_comments(pr_obj: Any) -> list[str]:
@@ -1485,6 +1524,7 @@ def abandon_gerrit_change_for_closed_pr(
     *,
     dry_run: bool = False,
     progress_tracker: Any = None,
+    base_ref: str = "",
 ) -> str | None:
     """
     Abandon a Gerrit change when its corresponding GitHub PR is closed.
@@ -1500,6 +1540,8 @@ def abandon_gerrit_change_for_closed_pr(
         repository: GitHub repository (owner/repo format)
         dry_run: If True, only display info without abandoning
         progress_tracker: Optional progress tracker for display management
+        base_ref: The PR's base branch. Picks its change over
+            cherry-picks carrying the same trailer.
 
     Returns:
         Change number as string if Gerrit change was abandoned
@@ -1523,10 +1565,12 @@ def abandon_gerrit_change_for_closed_pr(
     pr_url = f"https://github.com/{repository}/pull/{pr_number}"
 
     # Query for open changes with this PR URL in the commit message
-    # We search for the GitHub-PR trailer value
+    # We search for the GitHub-PR trailer value; DETAILED_ACCOUNTS
+    # reports owners, telling GitHub2Gerrit's changes from cherry-picks
     query = f"project:{gerrit_project} status:open"
     query_path = (
-        f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT&n=100"
+        f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT"
+        "&o=DETAILED_ACCOUNTS&n=100"
     )
 
     log.debug("Querying Gerrit for changes in %s", gerrit_project)
@@ -1551,7 +1595,9 @@ def abandon_gerrit_change_for_closed_pr(
         return None
 
     # Find the change with matching PR URL
-    matching_change = _find_matching_gerrit_change(changes_data, pr_url)
+    matching_change = _find_matching_gerrit_change(
+        changes_data, pr_url, base_ref
+    )
 
     if not matching_change:
         log.debug(
@@ -1666,7 +1712,7 @@ def _perform_cleanup_abandon(
 
 def _abandon_change_if_pr_closed(
     target: _GerritTarget,
-    change_number: Any,
+    change_data: dict[str, Any],
     pr_url: str,
     repo_full: str,
     pr_number: int,
@@ -1676,8 +1722,9 @@ def _abandon_change_if_pr_closed(
     """Abandon the change when its GitHub PR is closed.
 
     Returns True when the change was abandoned (or would be in dry-run),
-    False when the PR is still open.
+    False when the PR is still open or the change is not the PR's own.
     """
+    change_number = change_data.get("_number", "")
     client = build_client()
     repo_obj = client.get_repo(repo_full)
     pr_obj = get_pull(repo_obj, pr_number)
@@ -1689,6 +1736,15 @@ def _abandon_change_if_pr_closed(
             "GitHub PR #%d is %s - no action needed",
             pr_number,
             pr_state,
+        )
+        return False
+
+    if not _change_belongs_to_pr(change_data, _pr_base_ref(pr_obj)):
+        log.info(
+            "Leaving Gerrit change %s open: it names closed PR #%d but is "
+            "not that PR's own change (cherry-pick or other owner)",
+            change_number,
+            pr_number,
         )
         return False
 
@@ -1744,7 +1800,7 @@ def _process_change_for_pr_cleanup(
     try:
         return _abandon_change_if_pr_closed(
             target,
-            change_number,
+            change_data,
             pr_url,
             f"{owner}/{repo}",
             pr_number,
@@ -1800,10 +1856,11 @@ def cleanup_closed_github_prs(
 
         gerrit_client = build_client_for_host(gerrit_server)
 
-        # Query for all open changes in the project
+        # Query for all open changes in the project, with owners
         query = f"project:{gerrit_project} status:open"
         query_path = (
-            f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT&n=100"
+            f"/changes/?q={query}&o=CURRENT_REVISION&o=CURRENT_COMMIT"
+            "&o=DETAILED_ACCOUNTS&n=100"
         )
 
         log.debug("Querying Gerrit: %s", query)

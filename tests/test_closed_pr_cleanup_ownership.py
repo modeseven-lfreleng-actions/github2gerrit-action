@@ -21,9 +21,6 @@ from github2gerrit.gerrit_pr_closer import cleanup_closed_github_prs
 
 REPOSITORY = "opendaylight/mdsal"
 MODULE = "github2gerrit.gerrit_pr_closer"
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="cleanup abandons changes it did not create (#502)"
-)
 
 
 def _change(
@@ -83,7 +80,6 @@ def _serve(
     monkeypatch.setattr(f"{MODULE}.get_pull", lambda _repo, number: prs[number])
 
 
-@_PENDING
 def test_sweep_spares_a_maintainers_cherry_pick(
     monkeypatch: pytest.MonkeyPatch, abandoned: list[str]
 ) -> None:
@@ -100,7 +96,6 @@ def test_sweep_spares_a_maintainers_cherry_pick(
     assert abandoned == ["127190"]
 
 
-@_PENDING
 def test_sweep_without_ownership_spares_other_branches(
     monkeypatch: pytest.MonkeyPatch, abandoned: list[str]
 ) -> None:
@@ -130,7 +125,6 @@ def test_sweep_still_abandons_its_own_change(
     assert abandoned == ["126300"]
 
 
-@_PENDING
 def test_closed_pr_abandons_its_own_change_not_a_backport(
     monkeypatch: pytest.MonkeyPatch, abandoned: list[str]
 ) -> None:
@@ -151,3 +145,26 @@ def test_closed_pr_abandons_its_own_change_not_a_backport(
     )
     assert result == "126300"
     assert abandoned == ["126300"]
+
+
+def test_closed_pr_prefers_its_change_on_the_base_branch(
+    monkeypatch: pytest.MonkeyPatch, abandoned: list[str]
+) -> None:
+    """Of two GitHub2Gerrit changes, the misrouted one waits for the sweep."""
+    monkeypatch.setenv("GERRIT_SSH_USER_G2G", "gh2gerrit")
+    _serve(
+        monkeypatch,
+        [
+            _change(127186, 37, "master", "gh2gerrit"),
+            _change(127300, 37, "stable/titanium", "gh2gerrit"),
+        ],
+        {37: _closed_pr(37, "stable/titanium")},
+    )
+    result = abandon_gerrit_change_for_closed_pr(
+        pr_number=37,
+        gerrit_server="gerrit.example.org",
+        gerrit_project="openflowplugin",
+        repository=REPOSITORY,
+        base_ref="stable/titanium",
+    )
+    assert result == "127300"
