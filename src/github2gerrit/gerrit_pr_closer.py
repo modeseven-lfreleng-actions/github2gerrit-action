@@ -61,6 +61,14 @@ def _env_bool(key: str, default: bool = True) -> bool:
 FORCE_ABANDONED_CLEANUP = _env_bool("CLEANUP_ABANDONED", True)
 FORCE_GERRIT_CLEANUP = _env_bool("CLEANUP_GERRIT", True)
 
+# The comment GitHub2Gerrit posts on a pull request for each change it
+# pushes (Orchestrator._comment_on_pull_request); the newest names the
+# pull request's current change.
+_CHANGE_RECORD_PATTERN = re.compile(
+    r"Change (?:raised|updated|synchronized) in Gerrit by GitHub2Gerrit: "
+    rf"(?P<url>{GERRIT_CHANGE_URL_PATTERN})"
+)
+
 
 @dataclass(frozen=True)
 class _GerritTarget:
@@ -152,13 +160,30 @@ def check_gerrit_change_status(
         This function logs warnings but does not raise exceptions on
         API failures. Returns "UNKNOWN" if status cannot be determined.
     """
+    return check_gerrit_change_state(gerrit_change_url)[0]
+
+
+def check_gerrit_change_state(
+    gerrit_change_url: str,
+) -> tuple[Literal["MERGED", "ABANDONED", "NEW", "UNKNOWN"], str]:
+    """Return the status and target branch of a Gerrit change.
+
+    The branch tells whether the change belongs to a pull request: a
+    change on another branch than the pull request's base was
+    misrouted or cherry-picked, and its fate is not the pull request's.
+
+    Returns:
+        ``(status, branch)``, where status is as for
+        :func:`check_gerrit_change_status` and branch is empty when
+        unknown.  Like that function, logs failures without raising.
+    """
     parsed = extract_change_number_from_url(gerrit_change_url)
     if not parsed:
         log.warning(
             "Cannot extract change number from URL: %s",
             gerrit_change_url,
         )
-        return "UNKNOWN"
+        return "UNKNOWN", ""
 
     host, change_number = parsed
 
@@ -170,6 +195,7 @@ def check_gerrit_change_status(
         change_data = client.get(f"/changes/{change_number}")
 
         status = change_data.get("status", "UNKNOWN")
+        branch = str(change_data.get("branch") or "")
         log.debug("Gerrit change %s status: %s", change_number, status)
     except GerritRestError as exc:
         log.warning(
@@ -177,14 +203,14 @@ def check_gerrit_change_status(
             change_number,
             exc,
         )
-        return "UNKNOWN"
+        return "UNKNOWN", ""
     except Exception as exc:
         log.warning(
             "Unexpected error querying Gerrit change %s: %s",
             change_number,
             exc,
         )
-        return "UNKNOWN"
+        return "UNKNOWN", ""
     else:
         allowed_statuses = ("MERGED", "ABANDONED", "NEW", "UNKNOWN")
         result: Literal["MERGED", "ABANDONED", "NEW", "UNKNOWN"] = (
@@ -197,7 +223,7 @@ def check_gerrit_change_status(
                 status,
                 change_number,
             )
-        return result
+        return result, branch
 
 
 def extract_pr_url_from_commit(commit_sha: str) -> str | None:
@@ -1061,67 +1087,33 @@ def cleanup_abandoned_prs_bulk(
         log.debug("Found %d open pull request(s) to check", len(open_prs))
 
         closed_count = 0
+        automation_login = _automation_login(client)
 
         for pr in open_prs:
             pr_number = pr.number
             log.debug("Checking PR #%d for Gerrit change status", pr_number)
 
             try:
-                issue = pr.as_issue()
-                comments = list(issue.get_comments())
-
-                # Look for Gerrit change URL in comments
-                gerrit_change_url = None
-                for comment in comments:
-                    body = getattr(comment, "body", "") or ""
-                    # Look for Gerrit change URL pattern in comment
-                    match = re.search(GERRIT_CHANGE_URL_PATTERN, body)
-                    if match:
-                        gerrit_change_url = match.group(0)
-                        log.debug(
-                            "Found Gerrit change URL in PR #%d: %s",
-                            pr_number,
-                            gerrit_change_url,
-                        )
-                        break
-
+                gerrit_change_url = _abandoned_change_of_pr(
+                    pr, automation_login
+                )
                 if not gerrit_change_url:
-                    log.debug(
-                        "No Gerrit change URL found in PR #%d comments - "
-                        "skipping",
-                        pr_number,
-                    )
                     continue
 
-                # Check if the Gerrit change is abandoned
-                status = check_gerrit_change_status(gerrit_change_url)
-
-                if status == "ABANDONED":
-                    log.debug(
-                        "PR #%d has an abandoned Gerrit change, will close",
-                        pr_number,
-                    )
-
-                    pr_url = (
-                        f"https://github.com/{owner}/{repo}/pull/{pr_number}"
-                    )
-
-                    # Close the PR
-                    if close_pr_with_status(
-                        pr_url=pr_url,
-                        gerrit_change_url=gerrit_change_url,
-                        gerrit_status="ABANDONED",
-                        dry_run=dry_run,
-                        progress_tracker=progress_tracker,
-                        close_merged_prs=close_merged_prs,
-                    ):
-                        closed_count += 1
-                else:
-                    log.debug(
-                        "PR #%d Gerrit change status is %s - no action needed",
-                        pr_number,
-                        status,
-                    )
+                log.debug(
+                    "PR #%d has an abandoned Gerrit change, will close",
+                    pr_number,
+                )
+                pr_url = f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+                if close_pr_with_status(
+                    pr_url=pr_url,
+                    gerrit_change_url=gerrit_change_url,
+                    gerrit_status="ABANDONED",
+                    dry_run=dry_run,
+                    progress_tracker=progress_tracker,
+                    close_merged_prs=close_merged_prs,
+                ):
+                    closed_count += 1
 
             except Exception as exc:
                 log.warning(
@@ -1139,6 +1131,85 @@ def cleanup_abandoned_prs_bulk(
             "Abandoned PR cleanup complete: closed %d PR(s)", closed_count
         )
         return closed_count
+
+
+def _pr_base_ref(pr: Any) -> str:
+    """Return the pull request's base branch, or empty when unknown."""
+    ref = getattr(getattr(pr, "base", None), "ref", "")
+    return ref.strip() if isinstance(ref, str) else ""
+
+
+def _latest_recorded_change_url(
+    pr: Any, automation_login: str = ""
+) -> str | None:
+    """Return the URL of the newest change GitHub2Gerrit recorded on *pr*.
+
+    Only GitHub2Gerrit's own record counts: a whole comment, posted by a
+    bot or by the account the GitHub token acts as (*automation_login*).  A
+    comment that mentions, quotes or copies a record says nothing about
+    this pull request, and anyone may post one.
+    """
+    for comment in reversed(list(pr.as_issue().get_comments())):
+        body = (getattr(comment, "body", "") or "").strip()
+        match = _CHANGE_RECORD_PATTERN.fullmatch(body)
+        if match and _posted_by_automation(comment, automation_login):
+            return match.group("url")
+    return None
+
+
+def _posted_by_automation(comment: Any, automation_login: str) -> bool:
+    """Report whether a bot or the token's own account wrote *comment*."""
+    user = getattr(comment, "user", None)
+    if getattr(user, "type", "") == "Bot":
+        return True
+    return (
+        bool(automation_login)
+        and getattr(user, "login", "") == automation_login
+    )
+
+
+def _automation_login(client: Any) -> str:
+    """Return the login the GitHub token acts as, or empty when unknown.
+
+    An Actions installation token cannot read its own user; its comments
+    come from a bot account, which the record check trusts anyway.
+    """
+    try:
+        login = client.get_user().login
+    except Exception as exc:
+        log.debug("Could not read the GitHub token's login: %s", exc)
+        return ""
+    return login if isinstance(login, str) else ""
+
+
+def _abandoned_change_of_pr(pr: Any, automation_login: str = "") -> str | None:
+    """Return the URL of *pr*'s change when that change is abandoned.
+
+    The pull request's change is the newest one recorded on it, and it
+    counts only on the pull request's base branch: a change abandoned on
+    another branch was misrouted or cherry-picked, and abandoning it does
+    not reject the pull request.
+    """
+    url = _latest_recorded_change_url(pr, automation_login)
+    if not url:
+        log.debug("No Gerrit change recorded on PR #%d - skipping", pr.number)
+        return None
+    status, branch = check_gerrit_change_state(url)
+    if status != "ABANDONED":
+        log.debug("PR #%d Gerrit change is %s - no action", pr.number, status)
+        return None
+    base = _pr_base_ref(pr)
+    if branch and base and branch != base:
+        log.info(
+            "Leaving PR #%d open: its abandoned Gerrit change %s targets "
+            "%s, not the pull request's base branch %s",
+            pr.number,
+            url,
+            branch,
+            base,
+        )
+        return None
+    return url
 
 
 def _find_matching_gerrit_change(
