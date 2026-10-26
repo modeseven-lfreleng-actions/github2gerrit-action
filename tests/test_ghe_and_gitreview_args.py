@@ -45,14 +45,14 @@ def test_ghe_url_parsing_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_git_review_args_include_branch_and_repeated_reviewer_flags(
+def test_git_review_args_include_branch_before_reviewers_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     _push_to_gerrit should:
-      - include branch as positional argument at the end
-      - expand comma-separated reviewers into repeated '--reviewer' flags
+      - include branch as a positional argument before the reviewers
+      - expand comma-separated reviewers into one '--reviewers' flag
       - include a topic derived from env and repo name (PR_NUMBER and
       G2G_TOPIC_PREFIX)
     """
@@ -107,19 +107,101 @@ def test_git_review_args_include_branch_and_repeated_reviewer_flags(
     t_idx = args.index("-t")
     assert args[t_idx + 1] == "GH-my-repo-42"
 
-    # Branch is no longer passed as positional argument to avoid git-review bug
-    # where it adds the branch name as a reviewer. Git-review infers target branch.
+    # Branch is passed as a positional argument *before* the reviewers, so
+    # git-review's nargs='+' '--reviewers' cannot swallow it.
+    assert branch in args
+    assert "--reviewers" in args
+    assert args.index(branch) < args.index("--reviewers")
 
-    # Reviewers are passed via repeated --reviewer flags; no '--reviewers'
-    # aggregate flag
-    assert "--reviewers" not in args
-    # Collect reviewer values in order
-    rev_vals: list[str] = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--reviewer" and i + 1 < len(args):
-            rev_vals.append(args[i + 1])
-            i += 2
-            continue
-        i += 1
-    assert rev_vals == ["alice@example.org", "bob@example.org"]
+    # A single '--reviewers' flag carries every reviewer; repeating the flag
+    # would make argparse keep only the last occurrence.
+    assert args.count("--reviewers") == 1
+    assert "--reviewer" not in args
+    rev_idx = args.index("--reviewers")
+    assert args[rev_idx + 1 :] == ["alice@example.org", "bob@example.org"]
+
+
+def _parse_like_git_review(args: list[str]) -> Any:
+    """Parse argv with git-review's own grammar (see git_review/cmd.py)."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reviewers", nargs="+", default=[])
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("-v", action="store_true")
+    parser.add_argument("-t", "--topic")
+    parser.add_argument("branch", nargs="?")
+    return parser.parse_args(args[2:])
+
+
+def test_git_review_args_parse_back_to_the_intended_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The emitted argv must survive git-review's own argparse grammar.
+
+    Regression guard for Gerrit changes raised from stable/* pull requests
+    landing on master: git-review declares 'branch' as a trailing positional
+    and '--reviewers' with nargs='+', so argument order alone decides which
+    branch the change is pushed to.
+    """
+    orch = Orchestrator(workspace=tmp_path)
+    branch = "stable/vanadium"
+
+    monkeypatch.setenv("PR_NUMBER", "39")
+    monkeypatch.setenv("G2G_TOPIC_PREFIX", "GH")
+    recorded_cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        "github2gerrit.core.run_cmd",
+        lambda cmd, **kwargs: recorded_cmds.append(list(cmd)),
+        raising=True,
+    )
+
+    orch._push_to_gerrit(
+        gerrit=GerritInfo(
+            host="git.opendaylight.org", port=29418, project="openflowplugin"
+        ),
+        repo=RepoNames(
+            project_gerrit="openflowplugin", project_github="openflowplugin"
+        ),
+        branch=branch,
+        reviewers="alice@example.org, bob@example.org",
+        single_commits=False,
+    )
+
+    args = next(c for c in recorded_cmds if c[0:2] == ["git", "review"])
+    parsed = _parse_like_git_review(args)
+
+    assert parsed.branch == branch
+    assert parsed.topic == "GH-openflowplugin-39"
+    assert parsed.reviewers == ["alice@example.org", "bob@example.org"]
+    assert branch not in parsed.reviewers
+
+
+def test_git_review_retry_keeps_the_target_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The normalized-email retry must target the same branch as the push."""
+    orch = Orchestrator(workspace=tmp_path)
+    branch = "stable/vanadium"
+
+    recorded_cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        "github2gerrit.core.run_cmd",
+        lambda cmd, **kwargs: recorded_cmds.append(list(cmd)),
+        raising=True,
+    )
+
+    assert orch._retry_push_with_normalized_emails(
+        ["git", "review", "--yes", "-v", "-t", "GH-openflowplugin-39"],
+        "Alice@Example.ORG, bob@example.org",
+        branch,
+        {},
+        ["Alice@Example.ORG"],
+    )
+
+    parsed = _parse_like_git_review(recorded_cmds[-1])
+    assert parsed.branch == branch
+    assert parsed.topic == "GH-openflowplugin-39"
+    assert branch not in parsed.reviewers
