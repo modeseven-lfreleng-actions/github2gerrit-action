@@ -27,6 +27,7 @@ from .constants import GERRIT_CHANGE_URL_PATTERN
 from .constants import GITHUB_PR_URL_PATTERN
 from .error_codes import ExitCode
 from .error_codes import GitHub2GerritError
+from .gerrit_query import target_branch
 from .gerrit_rest import GerritRestError
 from .gerrit_rest import build_client_for_host
 from .github_api import build_client
@@ -646,14 +647,14 @@ def close_pr_with_status(
         if pr_obj is None:
             return False
 
-        base_ref = _pr_base_ref(pr_obj)
-        if change_branch and base_ref and change_branch != base_ref:
+        target = target_branch("", pr_obj)
+        if change_branch and target and change_branch != target:
             log.info(
                 "Leaving PR #%d open: the Gerrit change targets %s, not "
-                "the pull request's base branch %s",
+                "the pull request's target branch %s",
                 pr_number,
                 change_branch,
-                base_ref,
+                target,
             )
             return False
 
@@ -1157,12 +1158,6 @@ def cleanup_abandoned_prs_bulk(
         return closed_count
 
 
-def _pr_base_ref(pr: Any) -> str:
-    """Return the pull request's base branch, or empty when unknown."""
-    ref = getattr(getattr(pr, "base", None), "ref", "")
-    return ref.strip() if isinstance(ref, str) else ""
-
-
 def _latest_recorded_change_url(
     pr: Any, automation_login: str = ""
 ) -> str | None:
@@ -1210,9 +1205,9 @@ def _abandoned_change_of_pr(pr: Any, automation_login: str = "") -> str | None:
     """Return the URL of *pr*'s change when that change is abandoned.
 
     The pull request's change is the newest one recorded on it, and it
-    counts only on the pull request's base branch: a change abandoned on
-    another branch was misrouted or cherry-picked, and abandoning it does
-    not reject the pull request.
+    counts only on the pull request's target branch: a change abandoned
+    on another branch was misrouted or cherry-picked, and abandoning it
+    does not reject the pull request.
     """
     url = _latest_recorded_change_url(pr, automation_login)
     if not url:
@@ -1222,15 +1217,15 @@ def _abandoned_change_of_pr(pr: Any, automation_login: str = "") -> str | None:
     if status != "ABANDONED":
         log.debug("PR #%d Gerrit change is %s - no action", pr.number, status)
         return None
-    base = _pr_base_ref(pr)
-    if branch and base and branch != base:
+    target = target_branch("", pr)
+    if branch and target and branch != target:
         log.info(
             "Leaving PR #%d open: its abandoned Gerrit change %s targets "
-            "%s, not the pull request's base branch %s",
+            "%s, not the pull request's target branch %s",
             pr.number,
             url,
             branch,
-            base,
+            target,
         )
         return None
     return url
@@ -1311,7 +1306,7 @@ def _change_belongs_to_pr(change_data: dict[str, Any], base_ref: str) -> bool:
     Gerrit cherry-picks copy the ``GitHub-PR`` trailer, so a maintainer's
     backport names the pull request it came from. A change is the pull
     request's when GitHub2Gerrit's account owns it; where ownership is
-    unknown, when it targets the pull request's base branch.
+    unknown, when it targets the pull request's target branch.
     """
     created = _created_by_github2gerrit(change_data)
     if created is not None:
@@ -1564,7 +1559,8 @@ def abandon_gerrit_change_for_closed_pr(
         repository: GitHub repository (owner/repo format)
         dry_run: If True, only display info without abandoning
         progress_tracker: Optional progress tracker for display management
-        base_ref: The PR's base branch. Picks its change over
+        base_ref: The PR's base branch, which ``GERRIT_BRANCH``
+            overrides as for the push. Picks the PR's change over
             cherry-picks carrying the same trailer.
 
     Returns:
@@ -1620,7 +1616,7 @@ def abandon_gerrit_change_for_closed_pr(
 
     # Find the change with matching PR URL
     matching_change = _find_matching_gerrit_change(
-        changes_data, pr_url, base_ref
+        changes_data, pr_url, target_branch(base_ref)
     )
 
     if not matching_change:
@@ -1763,7 +1759,7 @@ def _abandon_change_if_pr_closed(
         )
         return False
 
-    if not _change_belongs_to_pr(change_data, _pr_base_ref(pr_obj)):
+    if not _change_belongs_to_pr(change_data, target_branch("", pr_obj)):
         log.info(
             "Leaving Gerrit change %s open: it names closed PR #%d but is "
             "not that PR's own change (cherry-pick or other owner)",

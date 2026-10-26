@@ -99,7 +99,8 @@ def _check(gh: GitHubContext, changes: list[dict[str, Any]]) -> None:
 
 @pytest.fixture(autouse=True)
 def _no_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GERRIT_BRANCH", raising=False)
+    for name in ("GERRIT_BRANCH", "GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_same_update_on_another_branch_is_not_a_duplicate() -> None:
@@ -147,3 +148,14 @@ class TestTargetBranch:
     ) -> None:
         monkeypatch.setenv("GERRIT_BRANCH", " release-1.2 ")
         assert target_branch(STABLE) == "release-1.2"
+
+    @pytest.mark.parametrize(
+        "dispatch", ["GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL"]
+    )
+    def test_a_dispatch_branch_is_no_override(
+        self, monkeypatch: pytest.MonkeyPatch, dispatch: str
+    ) -> None:
+        """A dispatch names its change's branch in GERRIT_BRANCH."""
+        monkeypatch.setenv("GERRIT_BRANCH", "14.0.x")
+        monkeypatch.setenv(dispatch, "https://gerrit.example.org/c/x/+/1")
+        assert target_branch(STABLE) == STABLE

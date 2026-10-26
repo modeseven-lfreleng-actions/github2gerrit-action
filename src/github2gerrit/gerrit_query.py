@@ -93,10 +93,16 @@ def target_branch(base_ref: str, pull_request: Any = None) -> str:
     """Return the branch a pull request's change goes to, or empty.
 
     ``GERRIT_BRANCH`` overrides, as it does for the push; otherwise the
-    context's *base_ref*, then the base of *pull_request* itself.
+    context's *base_ref*, then the base of *pull_request* itself.  A
+    Gerrit-event dispatch sets ``GERRIT_BRANCH`` to the dispatched
+    change's branch instead, so during one it overrides nothing.
     """
     override = os.getenv("GERRIT_BRANCH", "").strip()
-    if override:
+    dispatch = any(
+        os.getenv(name, "").strip()
+        for name in ("GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL")
+    )
+    if override and not dispatch:
         return override
     base = getattr(pull_request, "base", None)
     for ref in (base_ref, getattr(base, "ref", "")):

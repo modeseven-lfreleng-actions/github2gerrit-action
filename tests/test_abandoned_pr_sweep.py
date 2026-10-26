@@ -23,6 +23,12 @@ STABLE = "stable/vanadium"
 HOST = "gerrit.example.org"
 
 
+@pytest.fixture(autouse=True)
+def _no_branch_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("GERRIT_BRANCH", "GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _url(number: int) -> str:
     return f"https://{HOST}/c/project/+/{number}"
 
@@ -114,6 +120,16 @@ def test_abandoned_change_on_the_pr_branch_closes_the_pr(
     closer = _sweep(monkeypatch, pr, {202: ("ABANDONED", STABLE)})
     closer.assert_called_once()
     assert closer.call_args.kwargs["gerrit_change_url"] == _url(202)
+
+
+def test_abandoned_change_on_the_override_branch_closes_the_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GERRIT_BRANCH sent the PR's change to another branch."""
+    monkeypatch.setenv("GERRIT_BRANCH", "release/1.2")
+    pr = _pull_request("master", _raised(202))
+    closer = _sweep(monkeypatch, pr, {202: ("ABANDONED", "release/1.2")})
+    closer.assert_called_once()
 
 
 def test_a_mention_of_another_change_is_not_the_prs_change(

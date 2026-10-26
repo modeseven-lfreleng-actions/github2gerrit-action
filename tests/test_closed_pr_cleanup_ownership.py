@@ -23,6 +23,12 @@ REPOSITORY = "opendaylight/mdsal"
 MODULE = "github2gerrit.gerrit_pr_closer"
 
 
+@pytest.fixture(autouse=True)
+def _no_branch_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("GERRIT_BRANCH", "GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _change(
     number: int, pr: int, branch: str, owner: str | None
 ) -> dict[str, Any]:
@@ -168,3 +174,18 @@ def test_closed_pr_prefers_its_change_on_the_base_branch(
         base_ref="stable/titanium",
     )
     assert result == "127300"
+
+
+def test_override_branch_identifies_the_closed_prs_change(
+    monkeypatch: pytest.MonkeyPatch, abandoned: list[str]
+) -> None:
+    """GERRIT_BRANCH sent the PR's change to another branch."""
+    monkeypatch.delenv("GERRIT_SSH_USER_G2G", raising=False)
+    monkeypatch.setenv("GERRIT_BRANCH", "release/1.2")
+    _serve(
+        monkeypatch,
+        [_change(126400, 31, "release/1.2", None)],
+        {31: _closed_pr(31, "master")},
+    )
+    cleanup_closed_github_prs("gerrit.example.org", "mdsal")
+    assert abandoned == ["126400"]

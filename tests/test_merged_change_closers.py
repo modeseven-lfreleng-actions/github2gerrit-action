@@ -26,6 +26,12 @@ CHANGE_URL = "https://gerrit.example.org/c/mdsal/+/126368"
 MODULE = "github2gerrit.gerrit_pr_closer"
 
 
+@pytest.fixture(autouse=True)
+def _no_branch_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("GERRIT_BRANCH", "GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def close_pr(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Serve PR #31, open against master; record closures."""
@@ -89,10 +95,26 @@ class TestPushEvent:
         )
         close_pr.assert_called_once()
 
+    def test_merge_on_the_override_branch_closes_it(
+        self,
+        tmp_path: Path,
+        close_pr: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GERRIT_BRANCH sent the PR's change to another branch."""
+        monkeypatch.setenv("GERRIT_BRANCH", "release/1.2")
+        cli._process_close_merged_prs(
+            MagicMock(dry_run=False), _push_event(tmp_path, "release/1.2")
+        )
+        close_pr.assert_called_once()
+
 
 class TestGerritDispatch:
     @pytest.fixture(autouse=True)
     def _merged_change(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A dispatch passes the change in GERRIT_CHANGE_URL, which is
+        # what tells GERRIT_BRANCH apart from a push override
+        monkeypatch.setenv("GERRIT_CHANGE_URL", CHANGE_URL)
         monkeypatch.setattr(
             "github2gerrit.cli.extract_pr_url_from_gerrit_change",
             lambda _url: PR_URL,

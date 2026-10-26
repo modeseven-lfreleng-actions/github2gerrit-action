@@ -1157,7 +1157,9 @@ updates configured with `target-branch` reach the matching stable branch.
 
 The tool picks the branch in this order:
 
-1. `GERRIT_BRANCH`, an explicit override for every PR in the run.
+1. `GERRIT_BRANCH`, an explicit override for every PR in the run. A
+   Gerrit-event dispatch reuses `GERRIT_BRANCH` for the dispatched
+   change's branch, so during a dispatch it overrides nothing.
 2. The PR's base branch.
 3. `GITHUB_BASE_REF`.
 4. The checked-out repository's default branch (`origin/HEAD`), then
