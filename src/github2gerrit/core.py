@@ -2175,6 +2175,9 @@ class Orchestrator:
         # Track workspace preparation state to avoid redundant fetches
         self._workspace_prepared: bool = False
         self._prepared_branch: str | None = None
+        # Temporary branch named by commit preparation, for the push and
+        # its cleanup. Per instance: bulk runs share one process.
+        self._tmp_branch: str = ""
         # Track git-review setup state to avoid redundant setup
         self._git_review_initialized: bool = False
         # Resolved repository names (set during execute) used for
@@ -2438,7 +2441,8 @@ class Orchestrator:
 
         Note: This method is "pure" with respect to external outputs (no direct
         GitHub output writes), but does perform internal environment mutations
-        (e.g., G2G_TMP_BRANCH) for subprocess coordination within the workflow.
+        (e.g., G2G_OPERATION_MODE) for subprocess coordination within the
+        workflow.
         """
         log.debug("Starting PR -> Gerrit pipeline")
         self._inputs = inputs  # Store for access by helper methods
@@ -2565,6 +2569,7 @@ class Orchestrator:
         # Reset workspace preparation state for this execution
         self._workspace_prepared = False
         self._prepared_branch = None
+        self._tmp_branch = ""
         self._git_review_initialized = False
 
         # Capture the system SSH_AUTH_SOCK before the non-interactive
@@ -4464,12 +4469,12 @@ class Orchestrator:
         if not commit_list:
             log.info("No commits to submit; returning empty PreparedChange")
             return PreparedChange(change_ids=[], commit_shas=[])
-        # Create temp branch from base sha; export for downstream
+        # Create temp branch from base sha; recorded for the push
         base_sha = run_cmd(
             ["git", "rev-parse", base_ref], cwd=self.workspace
         ).stdout.strip()
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
-        os.environ["G2G_TMP_BRANCH"] = tmp_branch
+        self._tmp_branch = tmp_branch
         self._checkout_with_unshallow_fallback(
             branch_name=tmp_branch,
             start_point=base_sha,
@@ -4603,7 +4608,7 @@ class Orchestrator:
         ).stdout.strip()
 
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
-        os.environ["G2G_TMP_BRANCH"] = tmp_branch
+        self._tmp_branch = tmp_branch
 
         log.debug(
             "Git merge preparation: base_sha=%s, head_sha=%s, tmp_branch=%s",
@@ -5205,7 +5210,7 @@ class Orchestrator:
         )
         log.debug("Starting git review push operation...")
         if single_commits:
-            tmp_branch = os.getenv("G2G_TMP_BRANCH", "tmp_branch")
+            tmp_branch = self._tmp_branch or "tmp_branch"
             run_cmd(["git", "checkout", tmp_branch], cwd=self.workspace)
 
         topic = self._resolve_push_topic(repo, gh)
@@ -5464,7 +5469,7 @@ class Orchestrator:
 
     def _cleanup_tmp_branch(self, branch: str, env: dict[str, str]) -> None:
         """Switch back to the target branch and delete the temp branch."""
-        tmp_branch = (os.getenv("G2G_TMP_BRANCH", "") or "").strip()
+        tmp_branch = self._tmp_branch
         if not tmp_branch:
             return
         # Switch back to the target branch, then delete the temp branch

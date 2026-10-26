@@ -28,9 +28,6 @@ from github2gerrit.models import GitHubContext
 GERRIT = GerritInfo(
     host="gerrit.example.org", port=29418, project="example/project"
 )
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="temporary branch name is process-wide (#502)"
-)
 
 
 class _Stop(Exception):
@@ -61,9 +58,8 @@ def _tmp_branch(pr_number: int) -> str:
 def _environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CI_TESTING", raising=False)
     monkeypatch.delenv("GERRIT_BRANCH", raising=False)
-    # Registering the variable makes the fixture remove it afterwards,
-    # whatever the code under test writes to it.
-    monkeypatch.setenv("G2G_TMP_BRANCH", "")
+    # A stale value must not reach the code under test.
+    monkeypatch.delenv("G2G_TMP_BRANCH", raising=False)
 
 
 @pytest.fixture
@@ -104,7 +100,6 @@ def _prepared(tmp_path: Path, pr_number: int, mode: str) -> Orchestrator:
 
 @pytest.mark.parametrize("mode", ["single", "squash"])
 class TestTemporaryBranchIsolation:
-    @_PENDING
     def test_cleanup_deletes_its_own_branch(
         self, tmp_path: Path, git_calls: list[list[str]], mode: str
     ) -> None:
@@ -115,7 +110,6 @@ class TestTemporaryBranchIsolation:
         assert ["git", "branch", "-D", _tmp_branch(39)] in git_calls
         assert ["git", "branch", "-D", _tmp_branch(40)] not in git_calls
 
-    @_PENDING
     def test_single_commit_push_checks_out_its_own_branch(
         self, tmp_path: Path, git_calls: list[list[str]], mode: str
     ) -> None:
@@ -135,3 +129,9 @@ class TestTemporaryBranchIsolation:
                 gh=_ctx(39),
             )
         assert git_calls[0] == ["git", "checkout", _tmp_branch(39)]
+
+    def test_preparation_leaves_the_environment_alone(
+        self, tmp_path: Path, git_calls: list[list[str]], mode: str
+    ) -> None:
+        _prepared(tmp_path, 39, mode)
+        assert "G2G_TMP_BRANCH" not in os.environ

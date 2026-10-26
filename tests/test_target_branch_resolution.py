@@ -67,9 +67,6 @@ def _dispatched_bulk_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """Match a bulk run: dispatched, so no event names a base ref."""
     monkeypatch.delenv("GERRIT_BRANCH", raising=False)
     monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
-    # Squash preparation records its temp branch in the environment;
-    # registering the variable here makes the fixture remove it again.
-    monkeypatch.setenv("G2G_TMP_BRANCH", "")
 
 
 class TestResolver:
