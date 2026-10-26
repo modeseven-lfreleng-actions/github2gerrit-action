@@ -84,6 +84,11 @@ def _gerrit_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def branch_term(branch: str) -> str:
+    """Return a Gerrit search predicate matching one branch exactly."""
+    return f'branch:"{_gerrit_quote(branch)}"'
+
+
 @dataclass
 class GerritChange:
     """Represents a Gerrit change from query results."""
@@ -249,7 +254,7 @@ def query_open_changes_by_project(
     """
     base_query = f'project:"{_gerrit_quote(project)}" status:open'
     if branch:
-        base_query += f' branch:"{_gerrit_quote(branch)}"'
+        base_query += f" {branch_term(branch)}"
 
     repo_filter: str | None = None
     if client.is_authenticated:

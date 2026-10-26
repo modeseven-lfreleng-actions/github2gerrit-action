@@ -36,9 +36,6 @@ from github2gerrit.models import GitHubContext
 PROJECT = "example/project"
 CHANGE_ID = "I" + "a" * 40
 GERRIT = GerritInfo(host="gerrit.example.org", port=29418, project=PROJECT)
-_PENDING = pytest.mark.xfail(
-    strict=True, reason="lookups ignore the target branch (#502)"
-)
 
 
 def _change(number: int, branch: str, status: str) -> dict[str, Any]:
@@ -148,7 +145,6 @@ def _serve(monkeypatch: pytest.MonkeyPatch, gerrit: FakeGerrit) -> None:
     )
 
 
-@_PENDING
 @pytest.mark.parametrize(
     ("target", "elsewhere"),
     [
@@ -174,7 +170,6 @@ def test_final_state_is_read_from_the_target_branch(
     close.assert_not_called()
 
 
-@_PENDING
 def test_push_results_report_the_target_branch_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -215,7 +210,6 @@ def test_push_results_report_the_target_branch_change(
     ]
 
 
-@_PENDING
 def test_patchset_verification_finds_the_target_branch_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -240,7 +234,6 @@ def test_patchset_verification_finds_the_target_branch_change(
     assert record["change_number"] == 200
 
 
-@_PENDING
 def test_metadata_sync_updates_the_target_branch_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -266,7 +259,6 @@ def test_metadata_sync_updates_the_target_branch_change(
     assert gerrit.puts == [f"/changes/{triplet}/message"]
 
 
-@_PENDING
 def test_topic_lookup_lists_a_shared_change_id_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
