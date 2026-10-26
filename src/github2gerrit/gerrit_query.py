@@ -84,6 +84,33 @@ def _gerrit_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def branch_term(branch: str) -> str:
+    """Return a Gerrit search predicate matching one branch exactly."""
+    return f'branch:"{_gerrit_quote(branch)}"'
+
+
+def target_branch(base_ref: str, pull_request: Any = None) -> str:
+    """Return the branch a pull request's change goes to, or empty.
+
+    ``GERRIT_BRANCH`` overrides, as it does for the push; otherwise the
+    context's *base_ref*, then the base of *pull_request* itself.  A
+    Gerrit-event dispatch sets ``GERRIT_BRANCH`` to the dispatched
+    change's branch instead, so during one it overrides nothing.
+    """
+    override = os.getenv("GERRIT_BRANCH", "").strip()
+    dispatch = any(
+        os.getenv(name, "").strip()
+        for name in ("GERRIT_CHANGE_URL", "G2G_GERRIT_CHANGE_URL")
+    )
+    if override and not dispatch:
+        return override
+    base = getattr(pull_request, "base", None)
+    for ref in (base_ref, getattr(base, "ref", "")):
+        if isinstance(ref, str) and ref.strip():
+            return ref.strip()
+    return ""
+
+
 @dataclass
 class GerritChange:
     """Represents a Gerrit change from query results."""
@@ -249,7 +276,7 @@ def query_open_changes_by_project(
     """
     base_query = f'project:"{_gerrit_quote(project)}" status:open'
     if branch:
-        base_query += f' branch:"{_gerrit_quote(branch)}"'
+        base_query += f" {branch_term(branch)}"
 
     repo_filter: str | None = None
     if client.is_authenticated:

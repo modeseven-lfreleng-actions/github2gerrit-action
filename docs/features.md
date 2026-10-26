@@ -22,6 +22,7 @@ action in detail. For a quick start and the full inputs table, see the
 - [Change-ID Reconciliation](#change-id-reconciliation)
 - [Repository and Project Names](#repository-and-project-names)
 - [Configuration](#configuration)
+- [Non-Default Branches](#non-default-branches)
 - [Behavior Details](#behavior-details)
 
 ## PR Update Handling
@@ -271,6 +272,8 @@ Notes:
 - The operation is non-fatal: the tool logs missing or already-closed PRs as
   informational messages, not errors.
 - The tool skips commits with no `GitHub-PR` URL trailer.
+- A change merged on another branch than the PR's base, such as a
+  cherry-picked backport carrying the PR's trailer, leaves the PR open.
 
 ## Automatic Cleanup
 
@@ -283,9 +286,9 @@ removing orphaned or stale changes.
 Closes GitHub PRs for abandoned Gerrit changes. Default: `"true"`.
 
 - Scans open GitHub PRs in the repository.
-- Finds the associated Gerrit change via the `GitHub-PR` trailer.
-- If the Gerrit change has `ABANDONED` status, closes the GitHub PR with a
-  comment explaining the abandonment.
+- Takes each PR's change from the newest change link the tool posted on it.
+- If that change has `ABANDONED` status on the PR's base branch, closes the
+  GitHub PR with a comment explaining the abandonment.
 - Respects the `CLOSE_MERGED_PRS` setting for whether to close or comment.
 
 ### CLEANUP_GERRIT
@@ -299,13 +302,18 @@ Abandons Gerrit changes for closed GitHub PRs. Default: `"true"`.
   and attribution to github2gerrit.
 - Detects Dependabot supersession ("Superseded by #X" comments) and includes
   that context in the abandon message.
+- Abandons only changes the tool's own account (`GERRIT_SSH_USER_G2G`)
+  owns. A maintainer's cherry-pick copies the `GitHub-PR` trailer but keeps
+  its own owner, and stays open. Where Gerrit reports no owner, the tool
+  abandons only changes on the PR's base branch.
 
 ### PR Close Event Handling
 
 When a GitHub PR closes, the tool performs these actions in order:
 
-1. Abandons the specific Gerrit change for the closed PR, capturing the last
-   3 PR comments to preserve closure context.
+1. Abandons the closed PR's own Gerrit change, preferring the one on the
+   PR's base branch, and captures the last 3 PR comments to preserve
+   closure context.
 2. Runs `CLEANUP_ABANDONED` to close any other GitHub PRs with abandoned
    Gerrit changes.
 3. Runs `CLEANUP_GERRIT` to abandon any other Gerrit changes with closed
@@ -714,6 +722,10 @@ DUPLICATE_TYPES=open,merged,abandoned github2gerrit https://github.com/org/repo
 ```
 
 Valid change states are `open`, `merged`, and `abandoned`.
+
+The detector compares only changes on the branch the PR pushes to, so the
+same Dependabot update raised against each target branch does not count as
+a duplicate.
 
 ## Commit Message Normalization
 
@@ -1136,10 +1148,58 @@ Lookup logic:
 3. If the lookup fails or the JSON is invalid, the action logs a warning and
    skips the Issue ID. Invalid JSON does not fail the workflow.
 
+## Non-Default Branches
+
+The tool pushes each PR to the Gerrit branch the PR targets, so Dependabot
+updates configured with `target-branch` reach the matching stable branch.
+
+### Target Branch
+
+The tool picks the branch in this order:
+
+1. `GERRIT_BRANCH`, an explicit override for every PR in the run. A
+   Gerrit-event dispatch reuses `GERRIT_BRANCH` for the dispatched
+   change's branch, so during a dispatch it overrides nothing.
+2. The PR's base branch.
+3. `GITHUB_BASE_REF`.
+4. The checked-out repository's default branch (`origin/HEAD`), then
+   `master` or `main` where fetched, then `master`.
+
+The tool passes this branch to git-review explicitly. The `defaultbranch` in
+`.gitreview` does not decide the target: Gerrit-mirrored repositories often
+keep it at `master` on every branch.
+
+### One Change per Branch
+
+Gerrit identifies a change by project, branch and Change-Id, and a
+cherry-pick keeps the Change-Id. The tool treats a PR's change as the one on
+the PR's target branch:
+
+- Status checks, push results and metadata updates address that change, and
+  a merged or abandoned copy on another branch cannot close the PR.
+- Merge, abandon and cleanup handling skip changes on other branches.
+  `CLEANUP_GERRIT` abandons only changes the tool's own account created.
+- Duplicate detection compares only changes on the same branch.
+
+### Caller Workflow
+
+GitHub runs `pull_request_target` workflows from the default branch, so the
+caller workflow there decides which target branches reach the tool. Omit its
+`branches` filter, or list every branch to convert, for example `stable/*`
+or `"[0-9]*.x"`.
+
+### Moving a Change to Its Branch
+
+A change can sit on another branch than its PR targets, for example after
+the PR's base branch changed. Move it with Gerrit's Move Change action, or
+the `POST /changes/{change-id}/move` REST endpoint, to the PR's base branch.
+Moving keeps the change number, Change-Id and topic, so later updates to the
+PR reach the moved change. Abandoning the change works too: the tool then
+pushes a new change to the PR's base branch on the PR's next update.
+
 ## Behavior Details
 
-- Branch resolution: uses `GITHUB_BASE_REF` as the target branch for Gerrit,
-  defaulting to `master` when unset.
+- Branch resolution: see [Non-Default Branches](#non-default-branches).
 - Topic naming: pushes and change recovery queries use
   `<prefix>-<project>-<pr-number>`, where `<prefix>` comes from
   `G2G_TOPIC_PREFIX` (default `GH`) and `<project>` is the Gerrit

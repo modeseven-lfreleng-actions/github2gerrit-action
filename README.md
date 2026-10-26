@@ -382,7 +382,7 @@ Input defaults match the composite action defaults.
 | `REVIEWERS_EMAIL`              | string  | `""`             | Comma-separated reviewer emails                  |
 | `GERRIT_CHANGE_URL`            | string  | `""`             | Gerrit change URL from a Gerrit event dispatch¹  |
 | `GERRIT_EVENT_TYPE`            | string  | `""`             | Gerrit event type (e.g. `change-merged`)¹        |
-| `GERRIT_BRANCH`                | string  | `""`             | Target branch override (Gerrit event dispatch)¹  |
+| `GERRIT_BRANCH`                | string  | `""`             | Target branch override; dispatch change branch¹  |
 
 | Secret                   | Required | Description                                    |
 | ------------------------ | -------- | ---------------------------------------------- |

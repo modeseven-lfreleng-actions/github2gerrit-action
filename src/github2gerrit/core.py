@@ -326,6 +326,24 @@ def _match_first_group(pattern: str, text: str) -> str | None:
     return m.group(0)
 
 
+def _change_api_id(project: str, branch: str | None, change_id: str) -> str:
+    """Return the REST identifier of one change on one branch.
+
+    A bare Change-Id stops naming a single change once the change also
+    exists on another branch, as cherry-picks make routine, and Gerrit
+    then answers 404 "Multiple changes found".  The
+    ``project~branch~Change-Id`` form always names one change; each part
+    is URL-encoded so a ``/`` in the project or branch cannot split the
+    path.
+    """
+    quote = urllib.parse.quote
+    if not (project and branch):
+        return quote(change_id, safe="")
+    return "~".join(
+        quote(part, safe="") for part in (project, branch, change_id)
+    )
+
+
 def _is_valid_change_id(value: str) -> bool:
     # Gerrit Change-Id should match I<40-hex-chars> format
     # Be more strict to avoid accepting invalid Change-IDs
@@ -425,6 +443,7 @@ class Orchestrator:
         self,
         gerrit: GerritInfo,
         change_id: str,
+        branch: str | None = None,
     ) -> dict[str, Any] | None:
         """
         Get detailed information about a Gerrit change.
@@ -432,6 +451,8 @@ class Orchestrator:
         Args:
             gerrit: Gerrit connection information
             change_id: The Change-Id to query
+            branch: Branch the change targets; addresses it unambiguously
+                when the Change-Id also exists on other branches
 
         Returns:
             Change details dict or None if not found
@@ -442,8 +463,7 @@ class Orchestrator:
             # Use centralized URL builder
             client = build_client_for_host(gerrit.host)
 
-            # Query by change_id
-            encoded_id = urllib.parse.quote(change_id, safe="")
+            encoded_id = _change_api_id(gerrit.project, branch, change_id)
             query_path = (
                 f"/changes/{encoded_id}?o=CURRENT_REVISION&o=CURRENT_COMMIT"
             )
@@ -470,6 +490,7 @@ class Orchestrator:
         change_id: str,
         title: str | None = None,
         description: str | None = None,
+        branch: str | None = None,
     ) -> bool:
         """
         Update Gerrit change metadata (title/description) via REST API.
@@ -482,6 +503,8 @@ class Orchestrator:
             change_id: The Change-Id to update
             title: New commit subject/title (optional)
             description: New commit message body (optional)
+            branch: Branch the change targets (see
+                ``_get_gerrit_change_details``)
 
         Returns:
             True if update succeeded, False otherwise
@@ -510,10 +533,12 @@ class Orchestrator:
                 )
                 return False
 
-            encoded_id = urllib.parse.quote(change_id, safe="")
+            encoded_id = _change_api_id(gerrit.project, branch, change_id)
 
             # Get current commit message to preserve G2G metadata and trailers
-            current_change = self._get_gerrit_change_details(gerrit, change_id)
+            current_change = self._get_gerrit_change_details(
+                gerrit, change_id, branch
+            )
             existing_g2g_metadata = ""
             existing_trailers = ""
 
@@ -687,8 +712,11 @@ class Orchestrator:
             )
 
             # Check each change and update if needed
+            branch = self._resolve_target_branch(gh)
             for change_id in change_ids:
-                change = self._get_gerrit_change_details(gerrit, change_id)
+                change = self._get_gerrit_change_details(
+                    gerrit, change_id, branch
+                )
                 if not change:
                     log.warning(
                         "Could not retrieve change details for %s",
@@ -711,6 +739,7 @@ class Orchestrator:
                         change_id=change_id,
                         title=pr_title,
                         description=pr_body,
+                        branch=branch,
                     )
                 else:
                     log.debug(
@@ -726,6 +755,8 @@ class Orchestrator:
         gerrit: GerritInfo,
         change_ids: list[str],
         expected_operation: str = "update",
+        *,
+        branch: str | None = None,
     ) -> None:
         """
         Verify that patchsets were created/updated correctly in Gerrit.
@@ -739,6 +770,8 @@ class Orchestrator:
             gerrit: Gerrit connection information
             change_ids: List of Change-IDs that should have been updated
             expected_operation: "update" or "edit" for logging purposes
+            branch: Branch the changes target (see
+                ``_get_gerrit_change_details``)
 
         Raises:
             OrchestratorError: If verification fails critically
@@ -758,7 +791,10 @@ class Orchestrator:
             for change_id in change_ids:
                 verification_results.append(
                     self._verify_single_change(
-                        client, change_id, expected_operation
+                        client,
+                        change_id,
+                        expected_operation,
+                        _change_api_id(gerrit.project, branch, change_id),
                     )
                 )
 
@@ -792,10 +828,15 @@ class Orchestrator:
         client: Any,
         change_id: str,
         expected_operation: str,
+        api_id: str = "",
     ) -> dict[str, Any]:
-        """Verify a single Gerrit change and return its result record."""
+        """Verify a single Gerrit change and return its result record.
+
+        *api_id* addresses the change in REST paths; the bare Change-Id
+        is used when it is empty.
+        """
         try:
-            encoded_id = urllib.parse.quote(change_id, safe="")
+            encoded_id = api_id or urllib.parse.quote(change_id, safe="")
             query_path = f"/changes/{encoded_id}?o=CURRENT_REVISION"
 
             change = client.get(query_path)
@@ -1004,7 +1045,10 @@ class Orchestrator:
             )
 
             if changes:
-                change_ids = [c.change_id for c in changes if c.change_id]
+                # A Change-Id shared across branches is still one identity
+                change_ids = list(
+                    dict.fromkeys(c.change_id for c in changes if c.change_id)
+                )
                 log.info(
                     "✅ Found %d existing change(s) by topic: %s",
                     len(change_ids),
@@ -1240,7 +1284,7 @@ class Orchestrator:
             open_changes = query_open_changes_by_project(
                 dep_client,
                 gerrit.project,
-                branch=gh.base_ref,
+                branch=self._resolve_target_branch(gh),
                 max_results=200,
                 github_repository=gh.repository,
             )
@@ -2068,7 +2112,7 @@ class Orchestrator:
             List of LocalCommit objects representing local commits to be
             submitted
         """
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
         base_ref = f"origin/{branch}"
 
         try:
@@ -2175,6 +2219,9 @@ class Orchestrator:
         # Track workspace preparation state to avoid redundant fetches
         self._workspace_prepared: bool = False
         self._prepared_branch: str | None = None
+        # Temporary branch named by commit preparation, for the push and
+        # its cleanup. Per instance: bulk runs share one process.
+        self._tmp_branch: str = ""
         # Track git-review setup state to avoid redundant setup
         self._git_review_initialized: bool = False
         # Resolved repository names (set during execute) used for
@@ -2217,23 +2264,29 @@ class Orchestrator:
         self,
         gerrit: GerritInfo,
         change_id: str,
+        branch: str | None = None,
     ) -> dict[str, str] | None:
         """Query Gerrit for the current state of a change by Change-Id.
 
-        Scopes the query to the Gerrit project to avoid ambiguous
-        Change-Id lookups across projects.
+        Scopes the query to the Gerrit project, and to *branch* when
+        given: one Change-Id can name changes on several branches, and
+        a one-result search would otherwise report whichever was updated
+        last.
 
         Returns:
             Dict with 'status', 'number' and 'current_revision' keys,
             or None when the change cannot be found or queried.
         """
         try:
+            from .gerrit_query import branch_term
             from .gerrit_rest import build_client_for_host
 
             client = build_client_for_host(
                 gerrit.host, timeout=8.0, max_attempts=3
             )
             query = f"change:{change_id} project:{gerrit.project}"
+            if branch:
+                query += f" {branch_term(branch)}"
             encoded_q = urllib.parse.quote(query, safe="")
             data = client.get(f"/changes/?q={encoded_q}&n=1&o=CURRENT_REVISION")
             if isinstance(data, list) and data:
@@ -2277,7 +2330,9 @@ class Orchestrator:
         if not change_ids or not gh.pr_number:
             return None
 
-        states = self._collect_change_states(gerrit, change_ids)
+        states = self._collect_change_states(
+            gerrit, change_ids, self._resolve_target_branch(gh)
+        )
         if states is None:
             # Fail open: unknown state must not block submission
             return None
@@ -2321,11 +2376,12 @@ class Orchestrator:
         self,
         gerrit: GerritInfo,
         change_ids: list[str],
+        branch: str | None = None,
     ) -> list[tuple[str, dict[str, str]]] | None:
         """Look up Gerrit state for each change; None if any is unknown."""
         states: list[tuple[str, dict[str, str]]] = []
         for cid in change_ids:
-            info = self._lookup_change_state(gerrit, cid)
+            info = self._lookup_change_state(gerrit, cid, branch)
             if info is None:
                 return None
             states.append((cid, info))
@@ -2438,7 +2494,8 @@ class Orchestrator:
 
         Note: This method is "pure" with respect to external outputs (no direct
         GitHub output writes), but does perform internal environment mutations
-        (e.g., G2G_TMP_BRANCH) for subprocess coordination within the workflow.
+        (e.g., G2G_OPERATION_MODE) for subprocess coordination within the
+        workflow.
         """
         log.debug("Starting PR -> Gerrit pipeline")
         self._inputs = inputs  # Store for access by helper methods
@@ -2565,6 +2622,7 @@ class Orchestrator:
         # Reset workspace preparation state for this execution
         self._workspace_prepared = False
         self._prepared_branch = None
+        self._tmp_branch = ""
         self._git_review_initialized = False
 
         # Capture the system SSH_AUTH_SOCK before the non-interactive
@@ -2603,10 +2661,11 @@ class Orchestrator:
         is_edit_operation = operation_mode == "edit"
         # Store context for downstream push/comment emission (Phase 2)
         self._gh_context_for_push = gh
+        branch = self._resolve_target_branch(gh)
         self._push_to_gerrit(
             gerrit=gerrit,
             repo=repo_names,
-            branch=self._resolve_target_branch(),
+            branch=branch,
             reviewers=self._resolve_reviewers(inputs),
             single_commits=inputs.submit_single_commits,
             prepared=prep,
@@ -2617,6 +2676,7 @@ class Orchestrator:
             gerrit=gerrit,
             repo=repo_names,
             change_ids=prep.change_ids,
+            branch=branch,
         )
 
         # Verify patchset creation and sync metadata for UPDATE/EDIT
@@ -2631,7 +2691,7 @@ class Orchestrator:
         self._add_backref_comment_in_gerrit(
             gerrit=gerrit,
             repo=repo_names,
-            branch=self._resolve_target_branch(),
+            branch=branch,
             commit_shas=result.commit_shas,
             gh=gh,
         )
@@ -2828,6 +2888,7 @@ class Orchestrator:
                 gerrit=gerrit,
                 change_ids=prep.change_ids,
                 expected_operation="update" if is_update_operation else "edit",
+                branch=self._resolve_target_branch(gh),
             )
 
         # Sync metadata for UPDATE and EDIT operations
@@ -2884,7 +2945,7 @@ class Orchestrator:
                     current_subject=push_subject,
                     exclude_change_ids=prep.change_ids,
                     dry_run=False,
-                    target_branch=self._resolve_target_branch(),
+                    target_branch=self._resolve_target_branch(gh),
                     github_repository=gh.repository,
                 )
         except Exception as exc:
@@ -4448,7 +4509,7 @@ class Orchestrator:
     ) -> PreparedChange:
         """Cherry-pick commits one-by-one and ensure Change-Id is present."""
         log.info("Preparing single-commit submission for PR #%s", gh.pr_number)
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
         # Determine commit range: commits in HEAD not in base branch
         base_ref = f"origin/{branch}"
         # Use our SSH command for git operations that might need SSH
@@ -4463,12 +4524,12 @@ class Orchestrator:
         if not commit_list:
             log.info("No commits to submit; returning empty PreparedChange")
             return PreparedChange(change_ids=[], commit_shas=[])
-        # Create temp branch from base sha; export for downstream
+        # Create temp branch from base sha; recorded for the push
         base_sha = run_cmd(
             ["git", "rev-parse", base_ref], cwd=self.workspace
         ).stdout.strip()
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
-        os.environ["G2G_TMP_BRANCH"] = tmp_branch
+        self._tmp_branch = tmp_branch
         self._checkout_with_unshallow_fallback(
             branch_name=tmp_branch,
             start_point=base_sha,
@@ -4589,7 +4650,7 @@ class Orchestrator:
     ) -> PreparedChange:
         """Squash PR commits into a single commit and handle Change-Id."""
         log.debug("Preparing squashed commit for PR #%s", gh.pr_number)
-        branch = self._resolve_target_branch()
+        branch = self._resolve_target_branch(gh)
 
         # Ensure workspace is prepared (consolidated git fetch)
         self._ensure_workspace_prepared(branch)
@@ -4602,7 +4663,7 @@ class Orchestrator:
         ).stdout.strip()
 
         tmp_branch = f"g2g_tmp_{gh.pr_number or 'pr'!s}_{os.getpid()}"
-        os.environ["G2G_TMP_BRANCH"] = tmp_branch
+        self._tmp_branch = tmp_branch
 
         log.debug(
             "Git merge preparation: base_sha=%s, head_sha=%s, tmp_branch=%s",
@@ -5204,7 +5265,7 @@ class Orchestrator:
         )
         log.debug("Starting git review push operation...")
         if single_commits:
-            tmp_branch = os.getenv("G2G_TMP_BRANCH", "tmp_branch")
+            tmp_branch = self._tmp_branch or "tmp_branch"
             run_cmd(["git", "checkout", tmp_branch], cwd=self.workspace)
 
         topic = self._resolve_push_topic(repo, gh)
@@ -5326,7 +5387,7 @@ class Orchestrator:
         Order matters. git-review declares ``branch`` as a trailing positional
         and ``--reviewers`` with ``nargs='+'``, so reviewers emitted before the
         branch swallow it. The change then lands on the ``.gitreview``
-        ``defaultbranch`` -- always ``master`` on Gerrit-mirrored stable
+        ``defaultbranch`` -- often ``master`` on Gerrit-mirrored stable
         branches -- and the branch name leaks in as a reviewer. Repeating the
         flag is no good either: argparse keeps only the last occurrence.
         """
@@ -5463,7 +5524,7 @@ class Orchestrator:
 
     def _cleanup_tmp_branch(self, branch: str, env: dict[str, str]) -> None:
         """Switch back to the target branch and delete the temp branch."""
-        tmp_branch = (os.getenv("G2G_TMP_BRANCH", "") or "").strip()
+        tmp_branch = self._tmp_branch
         if not tmp_branch:
             return
         # Switch back to the target branch, then delete the temp branch
@@ -6058,8 +6119,14 @@ class Orchestrator:
         gerrit: GerritInfo,
         repo: RepoNames,
         change_ids: Sequence[str],
+        branch: str | None = None,
     ) -> SubmissionResult:
-        """Query Gerrit for change URL/number and patchset sha via REST."""
+        """Query Gerrit for change URL/number and patchset sha via REST.
+
+        *branch* restricts each lookup to the change on that branch: a
+        Change-Id shared across branches would otherwise return
+        whichever change was updated last.
+        """
         log.debug("Querying Gerrit for submitted change(s) via REST")
 
         # pygerrit2 netrc filter is already applied in execute() unless
@@ -6077,10 +6144,15 @@ class Orchestrator:
         for cid in change_ids:
             if not cid:
                 continue
-            # Limit results to 1, filter by project and open status,
-            # include current revision
+            # Limit results to 1, filter by project, branch and open
+            # status, include current revision
+            from .gerrit_query import branch_term
+
             query = f"limit:1 is:open project:{repo.project_gerrit} {cid}"
-            path = f"/changes/?q={query}&o=CURRENT_REVISION&n=1"
+            if branch:
+                query += f" {branch_term(branch)}"
+            encoded_q = urllib.parse.quote(query, safe="")
+            path = f"/changes/?q={encoded_q}&o=CURRENT_REVISION&n=1"
             api_base_url = url_builder.api_url()
             from .gerrit_rest import build_client_for_host
 
@@ -7240,7 +7312,7 @@ class Orchestrator:
                 "Dry-run targets: Gerrit project=%s branch=%s "
                 "topic_prefix=GH-%s",
                 repo.project_gerrit,
-                self._resolve_target_branch(),
+                self._resolve_target_branch(gh),
                 repo.project_github,
             )
             if inputs.reviewers_email:
@@ -7306,7 +7378,7 @@ class Orchestrator:
         log.debug(
             "Dry-run targets: Gerrit project=%s branch=%s topic_prefix=GH-%s",
             repo.project_gerrit,
-            self._resolve_target_branch(),
+            self._resolve_target_branch(gh),
             repo.project_github,
         )
         if inputs.reviewers_email:
@@ -7354,14 +7426,25 @@ class Orchestrator:
             api_url = url_builder.api_url()
             log.warning("Gerrit REST probe failed for %s: %s", api_url, exc)
 
-    def _resolve_target_branch(self) -> str:
-        # Preference order:
-        # 1) GERRIT_BRANCH (explicit override)
-        # 2) GITHUB_BASE_REF (provided in Actions PR context)
-        # 3) origin/HEAD default (if available)
-        # 4) 'main' as a common default
-        # 5) 'master' as a legacy default
+    def _resolve_target_branch(self, gh: GitHubContext | None = None) -> str:
+        """Return the Gerrit branch the pull request targets.
+
+        Preference order:
+
+        1. ``GERRIT_BRANCH``, an explicit override.
+        2. The base ref of the pull request in *gh*.  Bulk mode processes
+           pull requests on parallel threads, where a process-wide
+           variable cannot describe each of them (as with the topic in
+           ``_resolve_push_topic``).
+        3. ``GITHUB_BASE_REF``, set by pull request events and by the
+           CLI when it recovers a pull request's refs.
+        4. ``origin/HEAD``, then ``master`` or ``main`` when fetched.
+        5. ``master`` as the legacy default.
+        """
         b = os.getenv("GERRIT_BRANCH", "").strip()
+        if b:
+            return b
+        b = (gh.base_ref or "").strip() if gh is not None else ""
         if b:
             return b
         b = os.getenv("GITHUB_BASE_REF", "").strip()
